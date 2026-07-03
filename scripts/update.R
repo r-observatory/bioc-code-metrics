@@ -213,7 +213,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     todo_pkgs
   }
 
-  # ---- 6. Analyze the shard ------------------------------------------------
+  # ---- 6. Analyze the shard (parallel) -------------------------------------
   shard_summary_list <- list()
   shard_churn_list   <- list()
   shard_api_list     <- list()
@@ -221,20 +221,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
-  for (pkg in shard_pkgs) {
+  # Worker: clone + analyze one package. No database access.
+  # Returns list(package, ok, [summary, churn, api]).
+  .pkg_worker <- function(pkg) {
     dest <- file.path(WORK_DIR, pkg)
-
-    # Attempt clone. Return value of FALSE (or any error) means failure.
+    on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
-
-    if (!isTRUE(ok)) {
-      unlink(dest, recursive = TRUE, force = TRUE)
-      shard_failures <- c(shard_failures, pkg)
-      .record_failure(con, pkg)
-      next
-    }
-
-    # Analyze; wrap in tryCatch so one package failure never aborts the shard.
+    if (!isTRUE(ok)) return(list(package = pkg, ok = FALSE))
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
@@ -243,17 +236,28 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
         NULL
       }
     )
+    if (is.null(res)) return(list(package = pkg, ok = FALSE))
+    list(package = pkg, ok = TRUE,
+         summary = res$summary, churn = res$churn, api = res$api)
+  }
 
-    # Always delete the clone directory, even when analysis failed.
-    unlink(dest, recursive = TRUE, force = TRUE)
+  results <- parallel::mclapply(shard_pkgs, .pkg_worker,
+                                mc.cores       = ANALYSIS_CORES,
+                                mc.preschedule = FALSE)
 
-    if (is.null(res)) {
+  # Collect results in input order (shard_pkgs is sorted, so DB is deterministic).
+  # All DB writes happen here in the parent process.
+  for (i in seq_along(results)) {
+    r   <- results[[i]]
+    pkg <- shard_pkgs[[i]]
+    # Guard: mclapply may return a try-error on worker crash.
+    if (inherits(r, "try-error") || is.null(r[["ok"]]) || !isTRUE(r$ok)) {
       shard_failures <- c(shard_failures, pkg)
       .record_failure(con, pkg)
     } else {
-      shard_summary_list[[pkg]] <- res$summary
-      shard_churn_list[[pkg]]   <- res$churn
-      shard_api_list[[pkg]]     <- res$api
+      shard_summary_list[[pkg]] <- r$summary
+      shard_churn_list[[pkg]]   <- r$churn
+      shard_api_list[[pkg]]     <- r$api
       .reset_failure(con, pkg)
     }
   }
