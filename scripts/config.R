@@ -12,6 +12,10 @@ SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
 
+# Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
+# cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.
+GIT_TIMEOUT <- as.integer(Sys.getenv("GIT_TIMEOUT", unset = "300"))
+
 # Number of parallel workers for the per-package clone+analyze step.
 # Default: all logical cores (overridable via ANALYSIS_CORES env var).
 ANALYSIS_CORES <- {
