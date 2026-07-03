@@ -12,6 +12,14 @@ SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
 
+# Number of parallel workers for the per-package clone+analyze step.
+# Default: all logical cores (overridable via ANALYSIS_CORES env var).
+ANALYSIS_CORES <- {
+  dc <- suppressWarnings(parallel::detectCores(logical = TRUE))
+  max(1L, as.integer(Sys.getenv("ANALYSIS_CORES",
+    unset = as.character(if (is.na(dc)) 1L else dc))))
+}
+
 #' Null/empty coalescing operator.
 #' Returns b when a is NULL, length-0, or a scalar NA.
 `%||%` <- function(a, b) {
