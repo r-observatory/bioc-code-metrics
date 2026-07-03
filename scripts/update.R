@@ -226,6 +226,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
   .pkg_worker <- function(pkg) {
     dest <- file.path(WORK_DIR, pkg)
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
+    on.exit(setTimeLimit(), add = TRUE)
+    setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
     ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
     if (!isTRUE(ok)) return(list(package = pkg, ok = FALSE))
     res <- tryCatch(
