@@ -1,0 +1,9 @@
+docs/
+out/
+*.db
+.superpowers/
+.Rproj.user
+
+# analysis scratch
+work/
+*.tmp
