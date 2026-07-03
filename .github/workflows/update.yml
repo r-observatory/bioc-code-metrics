@@ -1,0 +1,100 @@
+name: Update Bioconductor Code Metrics
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force_full:
+        description: "Re-analyze every package from scratch, ignoring the prior database."
+        type: boolean
+        default: false
+      time_budget_seconds:
+        description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
+        default: "18000"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bioc-code-metrics-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "release"
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::RSQLite
+            any::DBI
+            any::jsonlite
+            any::digest
+            any::testthat
+            any::withr
+
+      - name: Run unit tests
+        run: Rscript tests/testthat.R
+
+      - name: Download the prior database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out
+          if gh release view current >/dev/null 2>&1; then
+            gh release download current --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
+            gh release download current --pattern manifest.json --dir out 2>/dev/null || true
+          fi
+          ls -la out || true
+
+      - name: Analyze shards and publish after each
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
+          FORCE=""
+          if [ "${{ inputs.force_full }}" = "true" ]; then FORCE="--bootstrap"; fi
+
+          # Ensure the rolling release exists so uploads have a target.
+          if ! gh release view current >/dev/null 2>&1; then
+            git tag -f current
+            git push -f origin current || true
+            gh release create current --title "Bioconductor Code Metrics (rolling)" \
+              --notes "Per-version code and quality metrics for Bioconductor SOFTWARE and WORKFLOW packages, plus per-file churn between releases." --latest
+          fi
+
+          shard=0
+          while :; do
+            shard=$((shard + 1))
+            echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
+            Rscript scripts/update.R out/ ${FORCE}
+            FORCE=""  # force_full only applies to the first shard of a full rebuild
+
+            CHANGED=$(jq -r '.changed' out/manifest.json)
+            COMPLETE=$(jq -r '.bootstrap_complete' out/manifest.json)
+            ANALYZED=$(jq -r '.n_analyzed' out/manifest.json)
+            UNIVERSE=$(jq -r '.n_universe' out/manifest.json)
+            echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=${ANALYZED}/${UNIVERSE}"
+
+            if [ "$CHANGED" = "true" ]; then
+              gh release upload current out/bioc-code-metrics.db out/manifest.json --clobber
+            fi
+
+            if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
+              echo "Nothing left to do (complete=${COMPLETE}, changed=${CHANGED})."
+              break
+            fi
+            if [ "$SECONDS" -ge "$BUDGET" ]; then
+              echo "Time budget reached; the next scheduled run will continue."
+              break
+            fi
+          done
