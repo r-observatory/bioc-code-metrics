@@ -24,6 +24,11 @@ ANALYSIS_CORES <- {
     unset = as.character(if (is.na(dc)) 1L else dc))))
 }
 
+# Per-package analysis timeout in seconds. A hard cap so a pathological
+# file in a metric group (e.g. a catastrophic regex) cannot stall a shard.
+# Overridable via WORKER_TIMEOUT env var.
+WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
+
 #' Null/empty coalescing operator.
 #' Returns b when a is NULL, length-0, or a scalar NA.
 `%||%` <- function(a, b) {
