@@ -4,7 +4,7 @@
 BIOC_GIT_BASE <- "https://github.com/bioc"
 PUBLISH_REPO  <- "r-observatory/bioc-code-metrics"
 DB_FILENAME   <- "bioc-code-metrics.db"
-SHARD_SIZE         <- 400L
+SHARD_SIZE         <- 100L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"
 
