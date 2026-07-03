@@ -194,7 +194,11 @@ metrics_security <- function(ctx) {
       "gz|zip|tar|bz2|xz|7z|",
       "dll|so|dylib|o|a|lib|pyd|class|jar|pyc|",
       "xlsx|xls|docx|doc|pptx|ppt|",
-      "mp3|mp4|ogg|wav|avi|mov)$"
+      "mp3|mp4|ogg|wav|avi|mov|",
+      # Genomic / bioinformatics data formats: large sequence or alignment files
+      # that cannot contain credential secrets and are prohibitively slow to scan.
+      "sam|bam|bai|cram|fasta|fa|fastq|fq|vcf|bcf|",
+      "bed|wig|bedgraph|bigwig|bw|bigbed|bb)$"
     )
     text_files <- ctx$files[
       !grepl(nonbinary_pat, ctx$files, ignore.case = TRUE, perl = TRUE) &
@@ -223,6 +227,12 @@ metrics_security <- function(ctx) {
     for (f in text_files) {
       content <- ctx$read(f)
       if (!nzchar(content)) next
+      # Skip files larger than 1 MB: scanning multi-megabyte blobs (e.g. TCGA
+      # expression tables, EPS graphics) with PCRE is non-interruptible at the
+      # C level and cannot contain credential patterns in practice.  Known
+      # genomic formats are already excluded above via nonbinary_pat; this guard
+      # catches any remaining large files with unrecognised extensions.
+      if (nchar(content, type = "bytes") > 1e6L) next
       count <- count + n_matches(akia_pat,    content, perl = TRUE)
       count <- count + n_matches(gh_pat,      content, perl = TRUE)
       count <- count + n_matches(api_key_pat, content, perl = TRUE)
