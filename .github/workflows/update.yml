@@ -9,6 +9,10 @@ on:
         description: "Re-analyze every package from scratch, ignoring the prior database."
         type: boolean
         default: false
+      recollect:
+        description: "Backfill packages whose rows predate the binary metrics, in place (no wipe)."
+        type: boolean
+        default: false
       time_budget_seconds:
         description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
         default: "18000"
@@ -76,6 +80,8 @@ jobs:
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           FORCE=""
           if [ "${{ inputs.force_full }}" = "true" ]; then FORCE="--bootstrap"; fi
+          RECOLLECT=""
+          if [ "${{ inputs.recollect }}" = "true" ]; then RECOLLECT="--recollect"; fi
 
           # Ensure the rolling release exists so uploads have a target.
           if ! gh release view current >/dev/null 2>&1; then
@@ -89,7 +95,7 @@ jobs:
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
-            Rscript scripts/update.R out/ ${FORCE}
+            Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT}
             FORCE=""  # force_full only applies to the first shard of a full rebuild
 
             CHANGED=$(jq -r '.changed' out/manifest.json)
