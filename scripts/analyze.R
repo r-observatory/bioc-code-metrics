@@ -491,7 +491,12 @@ analyze_package <- function(repo_dir, package) {
         prev_exports = prev_exports
       )
 
-      metrics <- analyze_version(ctx)
+      # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
+      # from the same extracted source); fall back to the R groups when absent.
+      metrics <- analyze_with_binary(tmp)
+      if (is.null(metrics)) {
+        metrics <- analyze_version(ctx)
+      }
 
       dep_sig <- tryCatch(
         deprecation_signals(ctx),

@@ -344,6 +344,7 @@ if (identical(sys.nframe(), 0L)) {
   source(file.path(.script_dir, "config.R"))
   source(file.path(.script_dir, "git.R"))
   source(file.path(.script_dir, "context.R"))
+  source(file.path(.script_dir, "binary.R"))
   for (.f in sort(list.files(file.path(.script_dir, "metrics"),
                              pattern = "[.]R$", full.names = TRUE))) source(.f)
   source(file.path(.script_dir, "analyze.R"))
