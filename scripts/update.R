@@ -81,6 +81,25 @@
     params = list(MAX_CLONE_FAILURES))$package
 }
 
+#' Packages needing a metrics backfill: those with a stored row where the binary
+#' sentinel column is NULL, or every stored package when that column has not been
+#' added yet. Restricted to the current universe and excluding permanent
+#' failures.
+.recollect_todo <- function(con, universe_pkgs, perm_fail_pkgs,
+                            sentinel = "n_fns_r", table = "bioc_code_summary") {
+  if (!table %in% DBI::dbListTables(con)) return(character(0L))
+  pkgs <- if (!sentinel %in% DBI::dbListFields(con, table)) {
+    DBI::dbGetQuery(con, sprintf("SELECT DISTINCT package FROM %s", table))[["package"]]
+  } else {
+    DBI::dbGetQuery(con, sprintf(
+      'SELECT DISTINCT package FROM %s WHERE "%s" IS NULL', table, sentinel
+    ))[["package"]]
+  }
+  pkgs <- pkgs[!pkgs %in% perm_fail_pkgs]
+  pkgs <- pkgs[pkgs %in% as.character(universe_pkgs)]
+  sort(as.character(pkgs))
+}
+
 # ---------------------------------------------------------------------------
 # default_io
 # ---------------------------------------------------------------------------
@@ -147,8 +166,12 @@ default_io <- function() {
 #'   Defaults to SHARD_SIZE from config.R.
 #' @param force_full When TRUE, wipes all existing metric rows and re-analyzes
 #'   all packages (excluding permanent failures) from scratch.
+#' @param recollect When TRUE, re-analyzes only packages whose stored rows
+#'   predate the binary metrics (a sentinel column is NULL). Nothing is wiped:
+#'   rows are upserted in place, so the served DB stays complete throughout.
 #' @return Manifest list (invisibly).
-run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE) {
+run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
+                       recollect = FALSE) {
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
   db_path <- file.path(out_dir, DB_FILENAME)
@@ -191,6 +214,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE)
     todo_pkgs <- sort(as.character(
       universe$package[!universe$package %in% perm_fail_pkgs]
     ))
+  } else if (isTRUE(recollect)) {
+    # Backfill: only packages whose rows predate the binary metrics. No wipe;
+    # upsert_shard replaces each package's rows in place.
+    todo_pkgs <- .recollect_todo(con, universe$package, perm_fail_pkgs)
   } else {
     is_todo <- vapply(seq_len(n_universe), function(i) {
       pkg <- as.character(universe$package[i])
@@ -365,6 +392,7 @@ if (identical(sys.nframe(), 0L)) {
 
   shard_override <- SHARD_SIZE
   force_full     <- FALSE
+  recollect      <- FALSE
 
   for (arg in args[startsWith(args, "--")]) {
     if (startsWith(arg, "--shard=")) {
@@ -374,10 +402,13 @@ if (identical(sys.nframe(), 0L)) {
       if (!is.na(n) && n > 0L) shard_override <- n
     } else if (identical(arg, "--bootstrap")) {
       force_full <- TRUE
+    } else if (identical(arg, "--recollect")) {
+      recollect <- TRUE
     }
   }
 
   io <- default_io()
-  run_update(io, out_dir, shard_size = shard_override, force_full = force_full)
+  run_update(io, out_dir, shard_size = shard_override, force_full = force_full,
+             recollect = recollect)
   message("Done.")
 }
