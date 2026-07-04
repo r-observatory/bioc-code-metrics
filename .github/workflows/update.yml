@@ -40,6 +40,19 @@ jobs:
             any::testthat
             any::withr
 
+      - name: Install rpkg-analyzer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          gh release download v0.1.0 --repo r-observatory/rpkg-analyzer \
+            --pattern 'rpkg-analyzer-linux-x86_64.tar.gz' --dir /tmp
+          tar -xzf /tmp/rpkg-analyzer-linux-x86_64.tar.gz -C "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/rpkg-analyzer"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "RPKG_ANALYZER_BIN=$HOME/.local/bin/rpkg-analyzer" >> "$GITHUB_ENV"
+          "$HOME/.local/bin/rpkg-analyzer" --sexp <(echo 'x <- 1') >/dev/null && echo "rpkg-analyzer ready"
+
       - name: Run unit tests
         run: Rscript tests/testthat.R
 
