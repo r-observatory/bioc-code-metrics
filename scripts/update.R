@@ -230,7 +230,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       # New release detected: universe version differs from what is stored.
       !identical(as.character(lv), as.character(stored_v))
     }, logical(1L))
-    todo_pkgs <- sort(as.character(universe$package[is_todo]))
+    changed <- as.character(universe$package[is_todo])
+    # Also drain any packages whose rows predate the binary metrics, so a normal
+    # scheduled run finishes the one-time backfill and then reverts to just the
+    # changed packages once none remain.
+    backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs)
+    todo_pkgs <- sort(unique(c(changed, backfill)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
