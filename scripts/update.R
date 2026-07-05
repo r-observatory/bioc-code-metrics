@@ -246,10 +246,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   }
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
-  shard_summary_list <- list()
-  shard_churn_list   <- list()
-  shard_api_list     <- list()
-  shard_failures     <- character(0L)
+  shard_summary_list   <- list()
+  shard_churn_list     <- list()
+  shard_api_list       <- list()
+  shard_functions_list <- list()
+  shard_edges_list     <- list()
+  shard_failures       <- character(0L)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
@@ -272,7 +274,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     )
     if (is.null(res)) return(list(package = pkg, ok = FALSE))
     list(package = pkg, ok = TRUE,
-         summary = res$summary, churn = res$churn, api = res$api)
+         summary = res$summary, churn = res$churn, api = res$api,
+         functions = res$functions, edges = res$edges)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -289,21 +292,26 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_failures <- c(shard_failures, pkg)
       .record_failure(con, pkg)
     } else {
-      shard_summary_list[[pkg]] <- r$summary
-      shard_churn_list[[pkg]]   <- r$churn
-      shard_api_list[[pkg]]     <- r$api
+      shard_summary_list[[pkg]]   <- r$summary
+      shard_churn_list[[pkg]]     <- r$churn
+      shard_api_list[[pkg]]       <- r$api
+      shard_functions_list[[pkg]] <- r$functions
+      shard_edges_list[[pkg]]     <- r$edges
       .reset_failure(con, pkg)
     }
   }
 
   # ---- 7. Upsert shard into DB in-place (O(shard) memory) ------------------
-  fresh_pkgs    <- names(shard_summary_list)
-  fresh_summary <- .rbind_union_all(shard_summary_list) %||% .empty_summary()
-  fresh_churn   <- .rbind_union_all(shard_churn_list)   %||% .empty_churn()
-  fresh_api     <- .rbind_union_all(shard_api_list)     %||% .empty_api()
+  fresh_pkgs      <- names(shard_summary_list)
+  fresh_summary   <- .rbind_union_all(shard_summary_list)   %||% .empty_summary()
+  fresh_churn     <- .rbind_union_all(shard_churn_list)     %||% .empty_churn()
+  fresh_api       <- .rbind_union_all(shard_api_list)       %||% .empty_api()
+  fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()
+  fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
 
   if (length(fresh_pkgs) > 0L) {
-    upsert_shard(con, fresh_summary, fresh_churn, fresh_api)
+    upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
+                 fresh_functions, fresh_edges)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------
