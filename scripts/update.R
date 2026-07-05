@@ -81,14 +81,37 @@
     params = list(MAX_CLONE_FAILURES))$package
 }
 
-#' Packages needing a metrics backfill: those with a stored row where the binary
+#' Packages needing a metrics backfill: those with a stored row where the
 #' sentinel column is NULL, or every stored package when that column has not been
 #' added yet. Restricted to the current universe and excluding permanent
 #' failures.
+#'
+#' @param latest_only When FALSE (default), a package is flagged if ANY of its
+#'   rows has a NULL sentinel. Correct for a per-version sentinel like n_fns_r.
+#'   When TRUE, the NULL check is confined to the package's latest-version row
+#'   (the row carrying a non-NULL latest_release_date). This is required for a
+#'   marker written only on the latest row (e.g. detail_scanned): checking any
+#'   row would re-flag every multi-version package forever, so the backfill would
+#'   never converge. Packages with no latest_release_date row are not flagged.
 .recollect_todo <- function(con, universe_pkgs, perm_fail_pkgs,
-                            sentinel = "n_fns_r", table = "bioc_code_summary") {
+                            sentinel = "n_fns_r", table = "bioc_code_summary",
+                            latest_only = FALSE) {
   if (!table %in% DBI::dbListTables(con)) return(character(0L))
-  pkgs <- if (!sentinel %in% DBI::dbListFields(con, table)) {
+  fields <- DBI::dbListFields(con, table)
+  pkgs <- if (isTRUE(latest_only)) {
+    if (!"latest_release_date" %in% fields) {
+      character(0L)
+    } else if (!sentinel %in% fields) {
+      DBI::dbGetQuery(con, sprintf(
+        "SELECT DISTINCT package FROM %s WHERE latest_release_date IS NOT NULL",
+        table))[["package"]]
+    } else {
+      DBI::dbGetQuery(con, sprintf(
+        'SELECT DISTINCT package FROM %s
+         WHERE latest_release_date IS NOT NULL AND "%s" IS NULL',
+        table, sentinel))[["package"]]
+    }
+  } else if (!sentinel %in% fields) {
     DBI::dbGetQuery(con, sprintf("SELECT DISTINCT package FROM %s", table))[["package"]]
   } else {
     DBI::dbGetQuery(con, sprintf(
@@ -235,7 +258,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # scheduled run finishes the one-time backfill and then reverts to just the
     # changed packages once none remain.
     backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs)
-    todo_pkgs <- sort(unique(c(changed, backfill)))
+    # And drain any packages whose latest-version row was stored before the
+    # per-function/per-edge detail scan (detail_scanned IS NULL on that row).
+    # Latest-row-scoped so it converges: a package re-analyzed once is marked and
+    # never re-flagged, even if it produced zero functions.
+    detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+                                        sentinel = "detail_scanned",
+                                        latest_only = TRUE)
+    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
