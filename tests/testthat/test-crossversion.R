@@ -360,6 +360,40 @@ test_that("first_release_date and latest_release_date are correct", {
 })
 
 # ---------------------------------------------------------------------------
+# 8b. detail_scanned convergence marker
+# ---------------------------------------------------------------------------
+
+test_that("detail_scanned marks the latest row TRUE and leaves older rows NA", {
+  res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  n   <- nrow(res)
+  expect_true(isTRUE(res$detail_scanned[n]))
+  for (i in seq_len(n - 1L)) {
+    expect_true(is.na(res$detail_scanned[i]))
+  }
+})
+
+test_that("detail_scanned rides on the same latest row as latest_release_date", {
+  res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  # The marker must sit on exactly the row db_analyzed_state keys on, so the
+  # latest-row-scoped backfill query converges.
+  marked <- which(!is.na(res$detail_scanned))
+  dated  <- which(!is.na(res$latest_release_date))
+  expect_equal(marked, dated)
+})
+
+test_that("detail_scanned is set unconditionally for a single-version package", {
+  # A data-only package has zero functions; the marker is still set so the
+  # detail backfill converges rather than re-flagging it forever.
+  s <- data.frame(package = "solo", version = "1.0",
+                  released = "2020-01-01", stringsAsFactors = FALSE)
+  a <- data.frame(package = "solo", version = "1.0",
+                  exports_added = "[]", exports_removed = "[]",
+                  n_exports = 0L, stringsAsFactors = FALSE)
+  res <- add_cross_version_metrics(s, a, vector("list", 1L))
+  expect_true(isTRUE(res$detail_scanned[1L]))
+})
+
+# ---------------------------------------------------------------------------
 # 9. assessed_at and assessed_with
 # ---------------------------------------------------------------------------
 
@@ -395,7 +429,8 @@ test_that("empty summary_df returns data.frame with all cross-version columns", 
     "is_breaking", "bump_fidelity_ok", "assessed_at", "assessed_with",
     "n_versions", "first_release_date", "latest_release_date",
     "release_cadence_days", "dependency_drift", "authors_added_later",
-    "cold_removal_rate", "deprecation_infrastructure_maturity"
+    "cold_removal_rate", "deprecation_infrastructure_maturity",
+    "detail_scanned"
   )
   for (col in expected_cols) {
     expect_true(col %in% names(res), info = paste("missing column:", col))
