@@ -405,6 +405,27 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 }
 
 
+# Zero-row detail frames, used for non-latest versions, the binary-less path,
+# and as the empty shard fallback. Column order matches the stamped detail rows
+# so do.call(rbind, ...) binds cleanly.
+.empty_functions_df <- function() {
+  data.frame(
+    package = character(0L), version = character(0L),
+    lang = character(0L), name = character(0L), exported = logical(0L),
+    file = character(0L), line = integer(0L), loc = integer(0L),
+    n_params = integer(0L), cyclocomp = integer(0L),
+    stringsAsFactors = FALSE
+  )
+}
+
+.empty_edges_df <- function() {
+  data.frame(
+    package = character(0L), version = character(0L),
+    graph = character(0L), from = character(0L), to = character(0L),
+    stringsAsFactors = FALSE
+  )
+}
+
 #' Analyze all versions of a cloned package repository.
 #'
 #' For each version (oldest first):
@@ -421,19 +442,27 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 #'   $churn    package-stamped churn (package, version, file, added, deleted)
 #'   $api      per-version export diff (package, version, exports_added,
 #'             exports_removed, n_exports as JSON strings)
+#'   $functions per-function detail (package, version, lang, name, exported,
+#'             file, line, loc, n_params, cyclocomp), latest version only
+#'   $edges    per-call-edge detail (package, version, graph, from, to),
+#'             latest version only
 #'
-#' Hook for Task 10: cross-version metrics should be computed from $summary after
-#' this function returns, before writing to the database.
+#' Per-function and per-call-edge detail is emitted only by the analyzer binary
+#' and only for the package's latest version (the last row of versions_df, which
+#' is ordered oldest-first). Non-latest versions and the binary-less R fallback
+#' contribute zero detail rows.
 #'
 #' @param repo_dir  Path to the cloned git repository.
 #' @param package   Package name string.
-#' @return Named list: $summary, $churn, $api.
+#' @return Named list: $summary, $churn, $api, $functions, $edges.
 analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
+  functions_rows     <- vector("list", nrow(versions_df))
+  edges_rows         <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
 
@@ -498,6 +527,11 @@ analyze_package <- function(repo_dir, package) {
         metrics <- analyze_version(ctx)
       }
 
+      # Capture per-function / per-call-edge detail before metrics is mutated.
+      # Present only when the analyzer binary ran; NULL under the R fallback.
+      detail_fns <- attr(metrics, "functions")
+      detail_eg  <- attr(metrics, "edges")
+
       dep_sig <- tryCatch(
         deprecation_signals(ctx),
         error = function(e) list(symbols = character(0L), uses_lifecycle = FALSE)
@@ -530,12 +564,51 @@ analyze_package <- function(repo_dir, package) {
         stringsAsFactors = FALSE
       )
 
+      # Detail is stored for the latest version only (last row, oldest-first
+      # ordering). Stamp with package + version; otherwise contribute no rows.
+      is_latest <- (i == nrow(versions_df))
+
+      functions_row <- if (is_latest && !is.null(detail_fns) &&
+                           nrow(detail_fns) > 0L) {
+        data.frame(
+          package   = package,
+          version   = v,
+          lang      = detail_fns$lang,
+          name      = detail_fns$name,
+          exported  = detail_fns$exported,
+          file      = detail_fns$file,
+          line      = detail_fns$line,
+          loc       = detail_fns$loc,
+          n_params  = detail_fns$n_params,
+          cyclocomp = detail_fns$cyclocomp,
+          stringsAsFactors = FALSE
+        )
+      } else {
+        .empty_functions_df()
+      }
+
+      edges_row <- if (is_latest && !is.null(detail_eg) &&
+                       nrow(detail_eg) > 0L) {
+        data.frame(
+          package = package,
+          version = v,
+          graph   = detail_eg$graph,
+          from    = detail_eg$from,
+          to      = detail_eg$to,
+          stringsAsFactors = FALSE
+        )
+      } else {
+        .empty_edges_df()
+      }
+
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
-           dep_sig = dep_sig)
+           dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
     api_rows[[i]]           <- iter$api_row
+    functions_rows[[i]]     <- iter$functions_row
+    edges_rows[[i]]         <- iter$edges_row
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -586,11 +659,25 @@ analyze_package <- function(repo_dir, package) {
     )
   }
 
+  functions_df <- if (length(functions_rows) > 0L) {
+    do.call(rbind, functions_rows)
+  } else {
+    .empty_functions_df()
+  }
+
+  edges_df <- if (length(edges_rows) > 0L) {
+    do.call(rbind, edges_rows)
+  } else {
+    .empty_edges_df()
+  }
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
-    summary = summary_df,
-    churn   = churn_df,
-    api     = api_df
+    summary   = summary_df,
+    churn     = churn_df,
+    api       = api_df,
+    functions = functions_df,
+    edges     = edges_df
   )
 }
