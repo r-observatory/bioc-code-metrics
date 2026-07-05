@@ -243,6 +243,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
     summary_df$authors_added_later  <- integer(0L)
     summary_df$cold_removal_rate    <- numeric(0L)
     summary_df$deprecation_infrastructure_maturity <- integer(0L)
+    summary_df$detail_scanned       <- logical(0L)
     return(summary_df)
   }
 
@@ -391,6 +392,10 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$authors_added_later  <- NA_integer_
   summary_df$cold_removal_rate    <- NA_real_
   summary_df$deprecation_infrastructure_maturity <- NA_integer_
+  # detail_scanned: convergence marker for the detail backfill. Set only on the
+  # latest row (alongside latest_release_date) so the latest-row-scoped NULL
+  # check in .recollect_todo settles instead of re-flagging older rows forever.
+  summary_df$detail_scanned       <- NA
 
   summary_df$n_versions[n]           <- n
   summary_df$first_release_date[n]   <- first_date
@@ -400,6 +405,9 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$authors_added_later[n]  <- authors_added_later_val
   summary_df$cold_removal_rate[n]    <- cold_removal_rate_val
   summary_df$deprecation_infrastructure_maturity[n] <- dep_maturity
+  # Set unconditionally whenever this code path finalizes the latest row, even
+  # for data-only packages with zero functions, so the backfill converges.
+  summary_df$detail_scanned[n]       <- TRUE
 
   summary_df
 }
