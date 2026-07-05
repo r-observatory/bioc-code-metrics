@@ -124,6 +124,39 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+# Append rows to a detail table, creating it (schema derived from the frame) on
+# first write and tolerating new columns via ALTER TABLE ... ADD COLUMN. Mirrors
+# the schema-flexible bioc_code_summary path but without a UNIQUE index (detail
+# tables carry many rows per package/version). A zero-row frame still creates the
+# table with the correct column types. Logical columns are coerced to 0/1.
+.append_detail_table <- function(con, table, df) {
+  if (is.null(df)) return(invisible(NULL))
+  df     <- .coerce_logicals(df)
+  tables <- DBI::dbListTables(con)
+
+  if (!table %in% tables) {
+    DBI::dbWriteTable(con, table, df, row.names = FALSE,
+                      overwrite = FALSE, append = FALSE)
+    DBI::dbExecute(con, sprintf(
+      "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
+      table, table))
+    DBI::dbExecute(con, sprintf(
+      "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
+      table, table))
+  } else {
+    existing_cols <- DBI::dbListFields(con, table)
+    for (col in setdiff(names(df), existing_cols)) {
+      col_type <- if (is.integer(df[[col]])) "INTEGER"
+                  else if (is.numeric(df[[col]])) "REAL"
+                  else "TEXT"
+      DBI::dbExecute(con,
+        sprintf("ALTER TABLE %s ADD COLUMN \"%s\" %s", table, col, col_type))
+    }
+    if (nrow(df) > 0L) DBI::dbAppendTable(con, table, df)
+  }
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
 #' If the file does not yet exist it is created. The three non-summary tables
@@ -253,8 +286,17 @@ db_analyzed_state <- function(con) {
 #' @param churn_df   data.frame; columns package, version, file, added, deleted.
 #' @param api_df     data.frame; columns package, version, exports_added,
 #'   exports_removed, n_exports.
+#' @param functions_df Optional data.frame of per-function detail (package,
+#'   version, lang, name, exported, file, line, loc, n_params, cyclocomp).
+#'   NULL (the default) leaves bioc_functions untouched.
+#' @param edges_df   Optional data.frame of per-call-edge detail (package,
+#'   version, graph, from, to). NULL (the default) leaves bioc_call_edges
+#'   untouched. Detail is expected to cover each package's latest version only;
+#'   the delete-by-package step still clears any prior-version detail rows so no
+#'   stale rows survive a re-analysis.
 #' @return invisible(NULL)
-upsert_shard <- function(con, summary_df, churn_df, api_df) {
+upsert_shard <- function(con, summary_df, churn_df, api_df,
+                         functions_df = NULL, edges_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -268,10 +310,14 @@ upsert_shard <- function(con, summary_df, churn_df, api_df) {
   }
 
   DBI::dbWithTransaction(con, {
-    # -- Delete prior rows for these packages from all three tables ----------
+    # -- Delete prior rows for these packages from every table ---------------
+    # Detail tables are wiped per-package (not per-version) so a package moving
+    # to a new latest version does not leave its previous version's detail rows.
     .delete_by_package(con, "bioc_code_summary", pkgs)
     .delete_by_package(con, "bioc_code_churn",   pkgs)
     .delete_by_package(con, "bioc_api_history",  pkgs)
+    if (!is.null(functions_df)) .delete_by_package(con, "bioc_functions",  pkgs)
+    if (!is.null(edges_df))     .delete_by_package(con, "bioc_call_edges", pkgs)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -309,6 +355,10 @@ upsert_shard <- function(con, summary_df, churn_df, api_df) {
     if (!is.null(api_write) && nrow(api_write) > 0L) {
       DBI::dbAppendTable(con, "bioc_api_history", api_write)
     }
+
+    # -- Insert fresh per-function / per-call-edge detail --------------------
+    .append_detail_table(con, "bioc_functions",  functions_df)
+    .append_detail_table(con, "bioc_call_edges", edges_df)
   })
 
   invisible(NULL)
