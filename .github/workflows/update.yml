@@ -49,7 +49,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p "$HOME/.local/bin"
-          gh release download v0.1.0 --repo r-observatory/rpkg-analyzer \
+          gh release download v0.2.0 --repo r-observatory/rpkg-analyzer \
             --pattern 'rpkg-analyzer-linux-x86_64.tar.gz' --dir /tmp
           tar -xzf /tmp/rpkg-analyzer-linux-x86_64.tar.gz -C "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/rpkg-analyzer"

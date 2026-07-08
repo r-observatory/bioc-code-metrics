@@ -51,6 +51,37 @@ rpkg_analyzer_bin <- function() {
   })
 }
 
+# Build the per-dataset detail frame from parsed "dataset" records. Scalar
+# fields become columns; the nested `columns` and `row_sketch` are kept as JSON
+# strings (as .flatten_summary does for nested values). Column order matches
+# .empty_datasets_df in analyze.R (minus the package/version stamp).
+.datasets_frame <- function(recs) {
+  chr <- function(k) vapply(recs, function(r) .rec_chr(r, k), character(1L))
+  int <- function(k) vapply(recs, function(r) .rec_int(r, k), integer(1L))
+  lgl <- function(k) vapply(recs, function(r) .rec_lgl(r, k), logical(1L))
+  jsn <- function(k) vapply(recs, function(r) {
+    v <- r[[k]]
+    if (is.null(v)) NA_character_
+    else as.character(jsonlite::toJSON(v, auto_unbox = TRUE, null = "null"))
+  }, character(1L))
+  n_cols <- vapply(recs, function(r) {
+    c <- r[["columns"]]
+    if (is.null(c)) NA_integer_ else length(c)
+  }, integer(1L))
+  data.frame(
+    name = chr("name"), file = chr("file"), internal = lgl("internal"),
+    format = chr("format"), format_version = int("format_version"),
+    compression = chr("compression"), class = chr("class"), kind = chr("kind"),
+    nrow = int("nrow"), ncol = int("ncol"), length = int("length"),
+    n_cols = n_cols, n_missing_total = int("n_missing_total"),
+    schema_fp = chr("schema_fp"), shape_fp = chr("shape_fp"),
+    content_fp = chr("content_fp"), s4_package = chr("s4_package"),
+    confidence = chr("confidence"), notes = chr("notes"),
+    columns = jsn("columns"), row_sketch = jsn("row_sketch"),
+    stringsAsFactors = FALSE
+  )
+}
+
 #' Parse a full NDJSON analyzer stream into summary + detail frames.
 #'
 #' Reads every line (unlike the historical parser, which stopped at the summary)
@@ -74,6 +105,7 @@ parse_analyzer_records <- function(lines) {
              file = character(0L), line = integer(0L), loc = integer(0L),
              n_params = integer(0L), cyclocomp = integer(0L))
   eg <- list(graph = character(0L), from = character(0L), to = character(0L))
+  ds_recs <- list()
 
   for (line in lines) {
     parsed <- tryCatch(
@@ -99,6 +131,8 @@ parse_analyzer_records <- function(lines) {
       eg$graph <- c(eg$graph, .rec_chr(parsed, "graph"))
       eg$from  <- c(eg$from,  .rec_chr(parsed, "from"))
       eg$to    <- c(eg$to,    .rec_chr(parsed, "to"))
+    } else if (identical(rec, "dataset")) {
+      ds_recs[[length(ds_recs) + 1L]] <- parsed
     }
   }
 
@@ -116,7 +150,8 @@ parse_analyzer_records <- function(lines) {
   list(
     summary   = if (is.null(summ)) NULL else .flatten_summary(summ),
     functions = functions,
-    edges     = edges
+    edges     = edges,
+    datasets  = .datasets_frame(ds_recs)
   )
 }
 
@@ -146,5 +181,6 @@ analyze_with_binary <- function(dir) {
   metrics <- parsed$summary
   attr(metrics, "functions") <- parsed$functions
   attr(metrics, "edges")     <- parsed$edges
+  attr(metrics, "datasets")  <- parsed$datasets
   metrics
 }

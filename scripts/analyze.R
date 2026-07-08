@@ -434,6 +434,24 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   )
 }
 
+# Zero-row dataset frame. Column order matches the stamped dataset rows (and the
+# order emitted by parse_analyzer_records' dataset frame) so rbind binds cleanly.
+.empty_datasets_df <- function() {
+  data.frame(
+    package = character(0L), version = character(0L),
+    name = character(0L), file = character(0L), internal = logical(0L),
+    format = character(0L), format_version = integer(0L),
+    compression = character(0L), class = character(0L), kind = character(0L),
+    nrow = integer(0L), ncol = integer(0L), length = integer(0L),
+    n_cols = integer(0L), n_missing_total = integer(0L),
+    schema_fp = character(0L), shape_fp = character(0L),
+    content_fp = character(0L), s4_package = character(0L),
+    confidence = character(0L), notes = character(0L),
+    columns = character(0L), row_sketch = character(0L),
+    stringsAsFactors = FALSE
+  )
+}
+
 #' Analyze all versions of a cloned package repository.
 #'
 #' For each version (oldest first):
@@ -471,6 +489,7 @@ analyze_package <- function(repo_dir, package) {
   api_rows           <- vector("list", nrow(versions_df))
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
+  datasets_rows      <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
 
@@ -539,6 +558,7 @@ analyze_package <- function(repo_dir, package) {
       # Present only when the analyzer binary ran; NULL under the R fallback.
       detail_fns <- attr(metrics, "functions")
       detail_eg  <- attr(metrics, "edges")
+      detail_ds  <- attr(metrics, "datasets")
 
       dep_sig <- tryCatch(
         deprecation_signals(ctx),
@@ -609,14 +629,24 @@ analyze_package <- function(repo_dir, package) {
         .empty_edges_df()
       }
 
+      # Datasets are kept for every version (not latest-only), so the content
+      # fingerprint can reveal when a dataset's data changed between releases.
+      datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
+        cbind(package = package, version = v, detail_ds, stringsAsFactors = FALSE)
+      } else {
+        .empty_datasets_df()
+      }
+
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
-           dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row)
+           dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
+           datasets_row = datasets_row)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
     api_rows[[i]]           <- iter$api_row
     functions_rows[[i]]     <- iter$functions_row
     edges_rows[[i]]         <- iter$edges_row
+    datasets_rows[[i]]      <- iter$datasets_row
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -679,6 +709,12 @@ analyze_package <- function(repo_dir, package) {
     .empty_edges_df()
   }
 
+  datasets_df <- if (length(datasets_rows) > 0L) {
+    do.call(rbind, datasets_rows)
+  } else {
+    .empty_datasets_df()
+  }
+
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
   list(
@@ -686,6 +722,7 @@ analyze_package <- function(repo_dir, package) {
     churn     = churn_df,
     api       = api_df,
     functions = functions_df,
-    edges     = edges_df
+    edges     = edges_df,
+    datasets  = datasets_df
   )
 }

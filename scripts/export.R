@@ -296,7 +296,8 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
-                         functions_df = NULL, edges_df = NULL) {
+                         functions_df = NULL, edges_df = NULL,
+                         datasets_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -318,6 +319,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     .delete_by_package(con, "bioc_api_history",  pkgs)
     if (!is.null(functions_df)) .delete_by_package(con, "bioc_functions",  pkgs)
     if (!is.null(edges_df))     .delete_by_package(con, "bioc_call_edges", pkgs)
+    if (!is.null(datasets_df))  .delete_by_package(con, "bioc_datasets",   pkgs)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -359,6 +361,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
+    .append_detail_table(con, "bioc_datasets",   datasets_df)
   })
 
   invisible(NULL)
