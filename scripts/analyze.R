@@ -244,6 +244,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
     summary_df$cold_removal_rate    <- numeric(0L)
     summary_df$deprecation_infrastructure_maturity <- integer(0L)
     summary_df$detail_scanned       <- logical(0L)
+    summary_df$datasets_scanned     <- logical(0L)
     return(summary_df)
   }
 
@@ -396,6 +397,10 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # latest row (alongside latest_release_date) so the latest-row-scoped NULL
   # check in .recollect_todo settles instead of re-flagging older rows forever.
   summary_df$detail_scanned       <- NA
+  # datasets_scanned: convergence marker for the dataset backfill, distinct from
+  # detail_scanned so packages scanned before the dataset reader existed (their
+  # latest row has detail_scanned set but no dataset rows) still get re-flagged.
+  summary_df$datasets_scanned     <- NA
 
   summary_df$n_versions[n]           <- n
   summary_df$first_release_date[n]   <- first_date
@@ -408,6 +413,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   # Set unconditionally whenever this code path finalizes the latest row, even
   # for data-only packages with zero functions, so the backfill converges.
   summary_df$detail_scanned[n]       <- TRUE
+  summary_df$datasets_scanned[n]     <- TRUE
 
   summary_df
 }

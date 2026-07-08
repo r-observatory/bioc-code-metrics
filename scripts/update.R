@@ -265,7 +265,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
                                         sentinel = "detail_scanned",
                                         latest_only = TRUE)
-    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill)))
+    # And drain any package whose latest-version row predates the dataset reader
+    # (datasets_scanned IS NULL), so bioc_datasets fills in without a manual
+    # recollect. Also latest-row-scoped, so it converges once re-analyzed.
+    dataset_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+                                        sentinel = "datasets_scanned",
+                                        latest_only = TRUE)
+    todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
   }
 
   # Take the first shard_size packages from the to-do list (deterministic order).
