@@ -281,6 +281,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_api_list       <- list()
   shard_functions_list <- list()
   shard_edges_list     <- list()
+  shard_datasets_list  <- list()
   shard_failures       <- character(0L)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
@@ -305,7 +306,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (is.null(res)) return(list(package = pkg, ok = FALSE))
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
-         functions = res$functions, edges = res$edges)
+         functions = res$functions, edges = res$edges, datasets = res$datasets)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -327,6 +328,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_api_list[[pkg]]       <- r$api
       shard_functions_list[[pkg]] <- r$functions
       shard_edges_list[[pkg]]     <- r$edges
+      shard_datasets_list[[pkg]]  <- r$datasets
       .reset_failure(con, pkg)
     }
   }
@@ -338,10 +340,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_api       <- .rbind_union_all(shard_api_list)       %||% .empty_api()
   fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
+  fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
 
   if (length(fresh_pkgs) > 0L) {
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges)
+                 fresh_functions, fresh_edges, fresh_datasets)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------
