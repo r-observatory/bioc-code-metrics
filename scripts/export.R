@@ -218,6 +218,15 @@ metrics_fingerprint <- function(summary_df) {
   # would make every such row distinct and get dropped by INSERT OR IGNORE).
   df$schema_fp[is.na(df$schema_fp)] <- ""
 
+  # A single package version can surface one dataset name twice: an exported
+  # data/ object and an internal sysdata object of the same name, or the same
+  # object reached through two files. (package, name) is unique in bioc_datasets
+  # and (package, name, version) in bioc_dataset_versions, so collapse to one
+  # record per (package, name, version) up front, preferring the exported copy
+  # (internal = 0 sorts first). Without this the version append fails the PK.
+  df <- df[order(df$package, df$name, df$version, df$internal), , drop = FALSE]
+  df <- df[!duplicated(paste(df$package, df$name, df$version, sep = "\x1f")), , drop = FALSE]
+
   # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
   ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
   cts <- df[!duplicated(ck), , drop = FALSE]

@@ -48,11 +48,13 @@ test_that(".empty_datasets_df matches the stamped dataset row shape", {
 
 # One per-version dataset row, as analyze.R produces it (binary frame + stamps).
 .mk_ds_row <- function(package, version, is_current, content_fp,
-                       name = "d", schema_fp = "S1") {
+                       name = "d", schema_fp = "S1", internal = 0L) {
   data.frame(
     package = package, version = version,
     is_current = as.integer(is_current), fp_algo_version = 1L,
-    name = name, file = paste0("data/", name, ".rda"), internal = 0L,
+    name = name,
+    file = if (internal) "R/sysdata.rda" else paste0("data/", name, ".rda"),
+    internal = as.integer(internal),
     format = "rda", format_version = 2L, compression = "gzip",
     class = "data.frame", kind = "data.frame", nrow = 3L, ncol = 2L,
     length = NA_integer_, n_cols = 2L, n_missing_total = 0L,
@@ -84,6 +86,29 @@ test_that(".write_datasets_normalized splits into four tables and dedups content
   # both version rows reconstruct to the same content
   cids <- DBI::dbGetQuery(con, "SELECT DISTINCT content_id FROM bioc_dataset_versions")$content_id
   expect_length(cids, 1L)
+})
+
+test_that(".write_datasets_normalized collapses a dataset name colliding within one version", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  count <- function(t) DBI::dbGetQuery(con, sprintf("SELECT count(*) n FROM %s", t))$n
+
+  # A single package version can surface one dataset name twice: an exported
+  # data/ object and an internal sysdata object of the same name. (package, name,
+  # version) is unique in bioc_dataset_versions, so the writer must collapse to
+  # one row rather than fail the PK, keeping the exported copy.
+  df <- rbind(
+    .mk_ds_row("p", "1.0", TRUE, "CE", name = "d", internal = 0L),
+    .mk_ds_row("p", "1.0", TRUE, "CI", name = "d", internal = 1L))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p"))
+
+  expect_equal(count("bioc_dataset_versions"), 1L)   # collapsed, no PK violation
+  expect_equal(count("bioc_datasets"),         1L)
+  cid <- DBI::dbGetQuery(con, "SELECT content_id FROM bioc_dataset_versions")$content_id
+  fp  <- DBI::dbGetQuery(con,
+    sprintf("SELECT content_fp FROM bioc_dataset_contents WHERE content_id = %d", cid))$content_fp
+  expect_equal(fp, "CE")                              # exported copy wins
+  expect_equal(DBI::dbGetQuery(con, "SELECT internal FROM bioc_datasets")$internal, 0L)
 })
 
 test_that("re-analysis is idempotent and content dedups across packages", {
