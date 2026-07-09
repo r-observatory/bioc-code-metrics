@@ -46,28 +46,74 @@ test_that(".empty_datasets_df matches the stamped dataset row shape", {
   expect_true(all(c("package", "version") == names(empty)[1:2]))
 })
 
-test_that(".append_detail_table creates bioc_datasets with the expected indexes", {
+# One per-version dataset row, as analyze.R produces it (binary frame + stamps).
+.mk_ds_row <- function(package, version, is_current, content_fp,
+                       name = "d", schema_fp = "S1") {
+  data.frame(
+    package = package, version = version,
+    is_current = as.integer(is_current), fp_algo_version = 1L,
+    name = name, file = paste0("data/", name, ".rda"), internal = 0L,
+    format = "rda", format_version = 2L, compression = "gzip",
+    class = "data.frame", kind = "data.frame", nrow = 3L, ncol = 2L,
+    length = NA_integer_, n_cols = 2L, n_missing_total = 0L,
+    schema_fp = schema_fp, shape_fp = "SH", content_fp = content_fp,
+    s4_package = NA_character_, confidence = "exact", notes = NA_character_,
+    columns = '[{"name":"a","type":"integer"}]', row_sketch = '["0001","0002"]',
+    stringsAsFactors = FALSE
+  )
+}
+
+test_that(".write_datasets_normalized splits into four tables and dedups content across versions", {
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
 
-  ds <- parse_analyzer_records(c(
-    '{"rec":"summary"}',
-    '{"rec":"dataset","name":"d","file":"data/d.rda","internal":false,"format":"rda","class":"data.frame","kind":"data.frame","nrow":3,"ncol":2,"content_fp":"zzz","confidence":"exact"}'
-  ))$datasets
-  rows <- cbind(package = "p", version = "1.0", ds, stringsAsFactors = FALSE)
+  # Two versions of the same dataset (same content_fp).
+  df <- rbind(.mk_ds_row("p", "1.0", FALSE, "C1"),
+              .mk_ds_row("p", "1.1", TRUE,  "C1"))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p"))
 
-  .append_detail_table(con, "bioc_datasets", rows)
+  expect_setequal(
+    DBI::dbListTables(con),
+    c("bioc_datasets", "bioc_dataset_versions", "bioc_dataset_contents", "bioc_dataset_sketches"))
+  count <- function(t) DBI::dbGetQuery(con, sprintf("SELECT count(*) n FROM %s", t))$n
+  expect_equal(count("bioc_dataset_versions"), 2L)   # one link per version
+  expect_equal(count("bioc_dataset_contents"), 1L)   # content deduped across the two versions
+  expect_equal(count("bioc_datasets"),         1L)   # one identity row
+  expect_equal(count("bioc_dataset_sketches"), 1L)   # one sketch per distinct content
+  expect_equal(DBI::dbGetQuery(con, "SELECT current_version FROM bioc_datasets")$current_version, "1.1")
+  # both version rows reconstruct to the same content
+  cids <- DBI::dbGetQuery(con, "SELECT DISTINCT content_id FROM bioc_dataset_versions")$content_id
+  expect_length(cids, 1L)
+})
 
-  expect_true("bioc_datasets" %in% DBI::dbListTables(con))
-  idx <- DBI::dbGetQuery(con,
-    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='bioc_datasets'")$name
-  expect_true("idx_bioc_datasets_pkg_ver" %in% idx)
-  expect_true("idx_bioc_datasets_pkg" %in% idx)
+test_that("re-analysis is idempotent and content dedups across packages", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  count <- function(t) DBI::dbGetQuery(con, sprintf("SELECT count(*) n FROM %s", t))$n
 
-  got <- DBI::dbGetQuery(con,
-    "SELECT package, version, name, nrow, ncol, content_fp FROM bioc_datasets")
-  expect_equal(nrow(got), 1L)
-  expect_equal(got$package, "p")
-  expect_equal(got$nrow, 3L)
-  expect_equal(got$content_fp, "zzz")
+  # Packages p and q ship the identical dataset (content C1).
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, rbind(.mk_ds_row("p", "1.0", TRUE, "C1"), .mk_ds_row("q", "1.0", TRUE, "C1")), c("p", "q")))
+  expect_equal(count("bioc_dataset_contents"), 1L)   # shared across packages
+  expect_equal(count("bioc_dataset_versions"), 2L)
+
+  # Re-analyze p with the same data: no duplicate version or content rows.
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_ds_row("p", "1.0", TRUE, "C1"), "p"))
+  expect_equal(count("bioc_dataset_versions"), 2L)
+  expect_equal(count("bioc_dataset_contents"), 1L)
+})
+
+test_that(".gc_dataset_contents reclaims content orphaned by a data change", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  count <- function(t) DBI::dbGetQuery(con, sprintf("SELECT count(*) n FROM %s", t))$n
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_ds_row("p", "1.0", TRUE, "C1"), "p"))
+  # Data changed on re-analysis: new content C2 written, C1 no longer referenced.
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_ds_row("p", "1.1", TRUE, "C2"), "p"))
+  expect_equal(count("bioc_dataset_contents"), 2L)   # C1 orphan + C2
+
+  .gc_dataset_contents(con)
+  expect_equal(count("bioc_dataset_contents"), 1L)   # C1 reclaimed
+  expect_equal(count("bioc_dataset_sketches"), 1L)   # its sketch reclaimed too
 })

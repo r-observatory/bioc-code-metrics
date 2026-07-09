@@ -157,6 +157,121 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+# ---- dataset tables (normalized, content-addressed) -------------------------
+# Datasets are split three ways so identical content is stored once, not per
+# version: an identity row per (package, name), a per-version link that carries
+# only a small integer content_id, and a content-addressed profile keyed by
+# (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
+# The heavy row_sketch lives in its own table (kept out of the merge allowlist).
+
+.ensure_dataset_tables <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!"bioc_datasets" %in% tables) {
+    DBI::dbExecute(con, "CREATE TABLE bioc_datasets (
+      package TEXT NOT NULL, name TEXT NOT NULL, file TEXT, internal INTEGER,
+      current_version TEXT, current_content_id INTEGER,
+      PRIMARY KEY (package, name))")
+  }
+  if (!"bioc_dataset_versions" %in% tables) {
+    DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+      package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      is_current INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (package, name, version))")
+    DBI::dbExecute(con, "CREATE INDEX idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
+  }
+  if (!"bioc_dataset_contents" %in% tables) {
+    DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+      content_id INTEGER PRIMARY KEY,
+      content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+      class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+    DBI::dbExecute(con, "CREATE INDEX idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
+  }
+  if (!"bioc_dataset_sketches" %in% tables) {
+    DBI::dbExecute(con, "CREATE TABLE bioc_dataset_sketches (
+      content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
+  }
+  invisible(NULL)
+}
+
+#' Write per-version dataset records into the four normalized tables. `df` is one
+#' row per (package, version, dataset). Runs inside the caller's transaction.
+.write_datasets_normalized <- function(con, df, pkgs) {
+  .ensure_dataset_tables(con)
+  # Per-package wipe: children (version links) then parents (identity). Contents
+  # and sketches are shared/immutable and are reclaimed by GC, not deleted here.
+  .delete_by_package(con, "bioc_dataset_versions", pkgs)
+  .delete_by_package(con, "bioc_datasets",         pkgs)
+  if (is.null(df) || nrow(df) == 0L) return(invisible(NULL))
+
+  df$fp_algo_version <- as.integer(df$fp_algo_version)
+  df$internal        <- as.integer(df$internal)
+  df$is_current      <- as.integer(df$is_current)
+  # Records without a content fingerprint (.R scripts, unreadable, S4 class-only)
+  # have no profile to store; keep them out of the normalized tables.
+  df <- df[!is.na(df$content_fp) & nzchar(df$content_fp), , drop = FALSE]
+  if (nrow(df) == 0L) return(invisible(NULL))
+  # Atomic vectors / matrices / S4 have values but no column schema, so schema_fp
+  # is NA. Use an empty string so they still dedup by content and satisfy the
+  # NOT NULL + UNIQUE(content_fp, schema_fp, fp_algo_version) constraint (a NULL
+  # would make every such row distinct and get dropped by INSERT OR IGNORE).
+  df$schema_fp[is.na(df$schema_fp)] <- ""
+
+  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
+  ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
+  cts <- df[!duplicated(ck), , drop = FALSE]
+  DBI::dbExecute(con,
+    "INSERT OR IGNORE INTO bioc_dataset_contents
+       (content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol, n_missing_total, columns)
+     VALUES (?,?,?,?,?,?,?,?,?)",
+    params = list(cts$content_fp, cts$schema_fp, cts$fp_algo_version, cts$class,
+                  cts$kind, cts$nrow, cts$ncol, cts$n_missing_total, cts$columns))
+
+  ids <- DBI::dbGetQuery(con,
+    "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
+  key_map <- stats::setNames(
+    ids$content_id,
+    paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
+  df$content_id <- unname(key_map[ck])
+
+  # 2. Sketches: one INSERT OR IGNORE per content_id.
+  sk <- df[!duplicated(df$content_id) & !is.na(df$row_sketch), c("content_id", "row_sketch"), drop = FALSE]
+  if (nrow(sk) > 0L) {
+    DBI::dbExecute(con,
+      "INSERT OR IGNORE INTO bioc_dataset_sketches (content_id, row_sketch) VALUES (?, ?)",
+      params = list(sk$content_id, sk$row_sketch))
+  }
+
+  # 3. Version links (package was wiped above, so a plain append is idempotent).
+  ver <- df[, c("package", "name", "version", "content_id", "format", "compression", "confidence", "is_current"), drop = FALSE]
+  DBI::dbAppendTable(con, "bioc_dataset_versions", ver)
+
+  # 4. Identity, one per (package, name), stamped with the current version's content.
+  cur <- df[df$is_current == 1L, , drop = FALSE]
+  cur <- cur[!duplicated(paste(cur$package, cur$name, sep = "\x1f")), , drop = FALSE]
+  if (nrow(cur) > 0L) {
+    idn <- data.frame(package = cur$package, name = cur$name, file = cur$file,
+                      internal = cur$internal, current_version = cur$version,
+                      current_content_id = cur$content_id, stringsAsFactors = FALSE)
+    DBI::dbAppendTable(con, "bioc_datasets", idn)
+  }
+  invisible(NULL)
+}
+
+#' Reclaim content/sketch rows no longer referenced by any version link.
+.gc_dataset_contents <- function(con) {
+  tables <- DBI::dbListTables(con)
+  if (!"bioc_dataset_contents" %in% tables) return(invisible(NULL))
+  DBI::dbExecute(con,
+    "DELETE FROM bioc_dataset_sketches
+      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
+  DBI::dbExecute(con,
+    "DELETE FROM bioc_dataset_contents
+      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
 #' If the file does not yet exist it is created. The three non-summary tables
@@ -319,7 +434,7 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     .delete_by_package(con, "bioc_api_history",  pkgs)
     if (!is.null(functions_df)) .delete_by_package(con, "bioc_functions",  pkgs)
     if (!is.null(edges_df))     .delete_by_package(con, "bioc_call_edges", pkgs)
-    if (!is.null(datasets_df))  .delete_by_package(con, "bioc_datasets",   pkgs)
+    # dataset tables are wiped inside .write_datasets_normalized (children first)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -361,7 +476,8 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
-    .append_detail_table(con, "bioc_datasets",   datasets_df)
+    .write_datasets_normalized(con, datasets_df, pkgs)
+    .gc_dataset_contents(con)
   })
 
   invisible(NULL)

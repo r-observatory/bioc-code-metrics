@@ -105,6 +105,15 @@ jobs:
             echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=${ANALYZED}/${UNIVERSE}"
 
             if [ "$CHANGED" = "true" ]; then
+              # Guard the 2 GiB release-asset cap. Abort BEFORE the --clobber
+              # upload (which deletes the live asset first), so an oversized
+              # build can never leave the release without a database.
+              DB_BYTES=$(stat -c%s out/bioc-code-metrics.db)
+              MAX_BYTES=2040109465   # ~1.9 GiB, headroom under the 2 GiB cap
+              if [ "$DB_BYTES" -gt "$MAX_BYTES" ]; then
+                echo "::error::bioc-code-metrics.db is ${DB_BYTES} bytes (> ${MAX_BYTES}); refusing to upload to protect the live asset."
+                exit 1
+              fi
               gh release upload current out/bioc-code-metrics.db out/manifest.json --clobber
             fi
 
