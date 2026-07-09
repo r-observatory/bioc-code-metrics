@@ -281,6 +281,23 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     todo_pkgs
   }
 
+  # ---- 5b. Shard plan + wall-clock start ------------------------------------
+  # One line printed BEFORE the blocking parallel analyze so the operator sees
+  # the shard's size, the to-do pool composition, and resources at the top of the
+  # gap. changed/backfill/detail_backfill are the raw (overlapping) to-do pools
+  # and exist only on the scheduled path; guard with exists() so --bootstrap and
+  # --recollect runs still print (they show 0/0/0).
+  t_shard0   <- Sys.time()
+  n_changed  <- if (exists("changed",         inherits = FALSE)) length(changed)         else 0L
+  n_backfill <- if (exists("backfill",        inherits = FALSE)) length(backfill)        else 0L
+  n_detail   <- if (exists("detail_backfill", inherits = FALSE)) length(detail_backfill) else 0L
+  cat(sprintf(
+    "shard plan: %d pkgs this shard; to-do pool %d (changed %d / backfill %d / detail %d, overlapping), %d will remain; %d cores, %ds/pkg timeout\n",
+    length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail,
+    length(todo_pkgs) - length(shard_pkgs), ANALYSIS_CORES, WORKER_TIMEOUT),
+    file = stdout())
+  flush(stdout())
+
   # ---- 6. Analyze the shard (parallel) -------------------------------------
   shard_summary_list   <- list()
   shard_churn_list     <- list()
@@ -295,12 +312,42 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok, [summary, churn, api]).
   .pkg_worker <- function(pkg) {
+    .t0  <- Sys.time()
+    .idx <- match(pkg, shard_pkgs)          # queue position; shard_pkgs is unique
+    .n   <- length(shard_pkgs)
+    # Thinned per-worker completion line, emitted FROM the fork so it streams live
+    # during the otherwise-silent parallel phase. Prints only on every 25th queue
+    # position, every failure, every slow (>=30s) package, and the last position.
+    # One fully-formed cat() to stdout (< PIPE_BUF): forks reorder whole lines but
+    # never byte-interleave, and fd 1 is disjoint from mclapply's result pipe. The
+    # emit is wrapped in try() so a broken-stream write can never turn an ok
+    # package into a recorded failure.
+    .done <- function(ok, stage, nver) {
+      el <- as.numeric(difftime(Sys.time(), .t0, units = "secs"))
+      if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && !identical(.idx, .n)) {
+        return(invisible())
+      }
+      try({
+        cat(sprintf("[%d/%d] %s %s: %s in %.1fs\n",
+                    .idx, .n,
+                    if (isTRUE(ok)) "ok" else "FAIL", pkg,
+                    if (isTRUE(ok)) sprintf("%d versions", nver)
+                    else paste0(stage, " failed"),
+                    el),
+            file = stdout())
+        flush(stdout())
+      }, silent = TRUE)
+      invisible()
+    }
     dest <- file.path(WORK_DIR, pkg)
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     on.exit(setTimeLimit(), add = TRUE)
     setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
     ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
-    if (!isTRUE(ok)) return(list(package = pkg, ok = FALSE))
+    if (!isTRUE(ok)) {
+      .done(FALSE, "clone", 0L)
+      return(list(package = pkg, ok = FALSE))
+    }
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
@@ -309,7 +356,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
         NULL
       }
     )
-    if (is.null(res)) return(list(package = pkg, ok = FALSE))
+    if (is.null(res)) {
+      .done(FALSE, "analyze", 0L)
+      return(list(package = pkg, ok = FALSE))
+    }
+    .done(TRUE, "ok", nrow(res$summary))
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets)
@@ -403,8 +454,24 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     permanent_failures   = n_permanent_failures,
     bootstrap_complete   = bootstrap_complete,
     fingerprint          = new_fp,
-    changed              = changed
+    changed              = changed,
+    n_remaining          = length(remaining_after),
+    n_fresh              = length(fresh_pkgs),
+    n_versions           = nrow(fresh_summary)
   )
+
+  # ---- 8b. Shard receipt ----------------------------------------------------
+  # One-line closing summary, printed after the collection loop and before the
+  # manifest is written, so the merged CI log shows what this shard accomplished.
+  cat(sprintf(
+    "shard done in %.0fs: %d/%d ok, %d failed; %d versions, %d functions, %d edges written; DB %d/%d; %d queued; complete=%s\n",
+    as.numeric(difftime(Sys.time(), t_shard0, units = "secs")),
+    length(fresh_pkgs), length(shard_pkgs), length(shard_failures),
+    nrow(fresh_summary), nrow(fresh_functions), nrow(fresh_edges),
+    n_analyzed_pkgs, n_universe, length(remaining_after),
+    tolower(as.character(bootstrap_complete))),
+    file = stdout())
+  flush(stdout())
 
   write_manifest(manifest_path, manifest)
   invisible(manifest)
