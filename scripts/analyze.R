@@ -499,12 +499,28 @@ analyze_package <- function(repo_dir, package) {
   datasets_rows      <- vector("list", nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
+  # Time-gated per-version heartbeat. A single package with thousands of versions
+  # would otherwise grind silently after its worker's siblings have finished; this
+  # emits at most one line per 30s of that package's runtime (zero for packages
+  # under 30s), from the same fork, so live progress covers the long tail too.
+  .hb_t0   <- Sys.time()
+  .hb_last <- .hb_t0
 
   for (i in seq_len(nrow(versions_df))) {
     v      <- versions_df$version[i]
     ref    <- versions_df$ref[i]
     date   <- versions_df$date[i]
     commit <- versions_df$commit[i]
+    if (as.numeric(difftime(Sys.time(), .hb_last, units = "secs")) >= 30) {
+      .hb_last <- Sys.time()
+      try({
+        cat(sprintf("  %s: analyzing version %d/%d (pkg elapsed %.0fs)\n",
+                    package, i, nrow(versions_df),
+                    as.numeric(difftime(Sys.time(), .hb_t0, units = "secs"))),
+            file = stdout())
+        flush(stdout())
+      }, silent = TRUE)
+    }
 
     # Per-version work is wrapped in local() so on.exit fires per iteration
     # rather than accumulating in the outer function's exit handlers.

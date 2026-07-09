@@ -102,7 +102,11 @@ jobs:
             COMPLETE=$(jq -r '.bootstrap_complete' out/manifest.json)
             ANALYZED=$(jq -r '.n_analyzed' out/manifest.json)
             UNIVERSE=$(jq -r '.n_universe' out/manifest.json)
-            echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=${ANALYZED}/${UNIVERSE}"
+            REMAINING=$(jq -r '.n_remaining // "?"' out/manifest.json)
+            NFRESH=$(jq -r '.n_fresh // "?"' out/manifest.json)
+            NVERS=$(jq -r '.n_versions // "?"' out/manifest.json)
+            FAILED=$(jq -r '.shard_failures.count // "?"' out/manifest.json)
+            echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=${ANALYZED}/${UNIVERSE} (+${NFRESH} ok, ${FAILED} failed, ${NVERS} versions, ${REMAINING} queued)"
 
             if [ "$CHANGED" = "true" ]; then
               # Guard the 2 GiB release-asset cap. Abort BEFORE the --clobber
