@@ -445,6 +445,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 .empty_datasets_df <- function() {
   data.frame(
     package = character(0L), version = character(0L),
+    is_current = integer(0L), fp_algo_version = integer(0L),
     name = character(0L), file = character(0L), internal = logical(0L),
     format = character(0L), format_version = integer(0L),
     compression = character(0L), class = character(0L), kind = character(0L),
@@ -635,10 +636,15 @@ analyze_package <- function(repo_dir, package) {
         .empty_edges_df()
       }
 
-      # Datasets are kept for every version (not latest-only), so the content
-      # fingerprint can reveal when a dataset's data changed between releases.
+      # Datasets are kept for every version so the content fingerprint can reveal
+      # when a dataset's data changed between releases; storage stays small
+      # because the heavy profile is content-addressed and deduped downstream.
+      # is_current marks the latest version's rows; fp_algo_version pins the
+      # fingerprint canonicalization so a future change is a planned rebuild.
       datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
-        cbind(package = package, version = v, detail_ds, stringsAsFactors = FALSE)
+        cbind(package = package, version = v,
+              is_current = as.integer(is_latest), fp_algo_version = 1L,
+              detail_ds, stringsAsFactors = FALSE)
       } else {
         .empty_datasets_df()
       }
