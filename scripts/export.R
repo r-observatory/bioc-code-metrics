@@ -195,9 +195,41 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Migrate away from the pre-normalization flat bioc_datasets table (one row per
+#' dataset per version, carrying columns/row_sketch inline). It collides by name
+#' with the normalized identity table, so an incremental run against a database
+#' that still holds it would fail the identity append. Drop it, and clear the
+#' datasets_scanned sentinel on every package we are NOT writing this shard, so
+#' the flat rows are rebuilt into the normalized tables instead of being skipped
+#' as already scanned. The current shard's packages keep the marker just written
+#' for them. Identified by the absence of the identity-only current_version
+#' column, so it is a one-time no-op once the normalized schema is in place.
+.migrate_legacy_dataset_table <- function(con, keep_pkgs = character(0L)) {
+  tables <- DBI::dbListTables(con)
+  if (!"bioc_datasets" %in% tables) return(invisible(NULL))
+  if ("current_version" %in% DBI::dbListFields(con, "bioc_datasets")) {
+    return(invisible(NULL))
+  }
+  DBI::dbExecute(con, "DROP TABLE bioc_datasets")
+  if ("bioc_code_summary" %in% tables &&
+      "datasets_scanned" %in% DBI::dbListFields(con, "bioc_code_summary")) {
+    keep_pkgs <- unique(as.character(keep_pkgs))
+    if (length(keep_pkgs) > 0L) {
+      ph <- paste(rep("?", length(keep_pkgs)), collapse = ",")
+      DBI::dbExecute(con, sprintf(
+        "UPDATE bioc_code_summary SET datasets_scanned = NULL WHERE package NOT IN (%s)", ph),
+        params = as.list(keep_pkgs))
+    } else {
+      DBI::dbExecute(con, "UPDATE bioc_code_summary SET datasets_scanned = NULL")
+    }
+  }
+  invisible(NULL)
+}
+
 #' Write per-version dataset records into the four normalized tables. `df` is one
 #' row per (package, version, dataset). Runs inside the caller's transaction.
 .write_datasets_normalized <- function(con, df, pkgs) {
+  .migrate_legacy_dataset_table(con, pkgs)
   .ensure_dataset_tables(con)
   # Per-package wipe: children (version links) then parents (identity). Contents
   # and sketches are shared/immutable and are reclaimed by GC, not deleted here.
