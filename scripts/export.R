@@ -551,6 +551,113 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
   invisible(NULL)
 }
 
+#' Build a per-DB insight manifest matching the pipeline MANIFEST SCHEMA.
+#'
+#' All values are measured from `con`; a missing table counts 0 and a missing
+#' numeric column yields NULL mean/median (rendered as JSON null). bootstrap's
+#' n_universe/n_remaining may be NULL when unmeasurable.
+#'
+#' @param con         Open DBI connection to the pipeline SQLite database.
+#' @param series      "code" or "data".
+#' @param repo        "owner/name" of the publishing repo.
+#' @param db_filename The asset filename this manifest describes.
+#' @param db_bytes    On-disk size of the DB file, in bytes.
+#' @param tables      Character vector of table names to report row counts for.
+#' @param fp_table    Table to fingerprint.
+#' @param fp_cols     Columns within fp_table forming the fingerprint key.
+#' @param pkg_table   Table to count DISTINCT package from for n_packages.
+#' @param ver_table   Table to count rows from for n_versions.
+#' @param stat_table  Table to probe for stat_cols.
+#' @param stat_cols   Character vector of numeric columns to summarise.
+#' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
+#'   n_universe/n_remaining may be NULL.
+#' @return A named list matching the MANIFEST SCHEMA.
+build_manifest <- function(con, series, repo, db_filename, db_bytes,
+                           tables, fp_table, fp_cols, pkg_table, ver_table,
+                           stat_table, stat_cols, bootstrap) {
+  present <- DBI::dbListTables(con)
+  count_tbl <- function(t) {
+    if (!t %in% present) return(0L)
+    as.integer(DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s"', t))$n)
+  }
+  table_counts <- stats::setNames(lapply(tables, count_tbl), tables)
+
+  n_packages <- if (pkg_table %in% present) {
+    as.integer(DBI::dbGetQuery(con,
+      sprintf('SELECT COUNT(DISTINCT package) n FROM "%s"', pkg_table))$n)
+  } else 0L
+  n_versions <- count_tbl(ver_table)
+
+  # Fingerprint over the concatenation of fp_cols keys, ordered by the SQL
+  # tuple (not by sorting the already-concatenated strings). Code-series
+  # keys join fields with ":" (matching db_fingerprint()); data-series keys
+  # join fields with "\x1f" per the manifest schema.
+  fp_sep <- if (identical(series, "code")) ":" else "\x1f"
+  fingerprint <- {
+    if (!fp_table %in% present) {
+      digest::digest("", algo = "sha256", serialize = FALSE)
+    } else {
+      cols <- paste(sprintf('"%s"', fp_cols), collapse = ", ")
+      df <- DBI::dbGetQuery(con,
+        sprintf('SELECT %s FROM "%s" ORDER BY %s', cols, fp_table, cols))
+      keys <- if (nrow(df) == 0L) character(0L) else
+        apply(df, 1L, function(r) paste(r, collapse = fp_sep))
+      # Rows are ordered by SQLite's ORDER BY (BINARY collation, i.e. byte
+      # order) *before* concatenation, exactly matching db_fingerprint()'s
+      # "ORDER BY package, version". Sorting the already-concatenated
+      # "package:version" strings in R instead is NOT equivalent: whenever
+      # one key is a prefix of another followed by a character below ':'
+      # (0x3a) -- e.g. package "Rcpp" vs "Rcpp11" -- tuple order and
+      # concatenated-string order disagree, so the two fingerprints would
+      # diverge for real CRAN data.
+      digest::digest(paste(keys, collapse = ","),
+                     algo = "sha256", serialize = FALSE)
+    }
+  }
+
+  # Stats: mean/median per column that exists AND is numeric, else NULL.
+  # A non-numeric column (e.g. character) must never be coerced into a
+  # fabricated statistic.
+  stat_fields <- list()
+  stat_cols_present <- if (stat_table %in% present) DBI::dbListFields(con, stat_table) else character(0L)
+  for (col in stat_cols) {
+    if (col %in% stat_cols_present) {
+      v <- DBI::dbGetQuery(con, sprintf('SELECT "%s" AS v FROM "%s"', col, stat_table))$v
+      if (is.numeric(v)) {
+        v <- v[!is.na(v)]
+        stat_fields[[paste0(col, "_mean")]]   <- if (length(v)) mean(v) else NULL
+        stat_fields[[paste0(col, "_median")]] <- if (length(v)) stats::median(v) else NULL
+      } else {
+        stat_fields[[paste0(col, "_mean")]]   <- NULL
+        stat_fields[[paste0(col, "_median")]] <- NULL
+      }
+    } else {
+      stat_fields[[paste0(col, "_mean")]]   <- NULL
+      stat_fields[[paste0(col, "_median")]] <- NULL
+    }
+  }
+
+  list(
+    schema_version = 1L,
+    series         = series,
+    repo           = repo,
+    db_filename    = db_filename,
+    generated_at   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    db_bytes       = round(as.numeric(db_bytes)),
+    fingerprint    = fingerprint,
+    n_packages     = n_packages,
+    n_versions     = n_versions,
+    tables         = table_counts,
+    stats          = stat_fields,
+    bootstrap      = list(
+      n_analyzed         = bootstrap$n_analyzed,
+      n_universe         = bootstrap$n_universe,
+      n_remaining        = bootstrap$n_remaining,
+      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
+    )
+  )
+}
+
 #' Compute a SHA-256 fingerprint over the current package:version set in the DB.
 #'
 #' Queries only the two key columns (result bounded to O(n_packages)) and
