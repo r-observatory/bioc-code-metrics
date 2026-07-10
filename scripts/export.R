@@ -792,3 +792,306 @@ db_fingerprint <- function(con) {
   keys <- if (nrow(df) == 0L) character(0L) else paste(df$package, df$version, sep = ":")
   digest::digest(paste(keys, collapse = ","), algo = "sha256", serialize = FALSE)
 }
+
+# ---------------------------------------------------------------------------
+# Rich release notes (headline + per-package metrics table + catalog summary)
+# ---------------------------------------------------------------------------
+# build_changelog()/render_release_notes() above remain in place (and remain
+# directly unit tested) but are no longer wired into render_notes(); the
+# functions below replace them for that purpose.
+
+#' Fetch all rows for a set of packages from one table, chunking IN-lists to
+#' <= 900 params so a large changed-package set never exceeds SQLite's
+#' bound-parameter limit. Mirrors the chunking pattern in .delete_by_package.
+#'
+#' @param con    Open DBI connection.
+#' @param table  Table name (trusted; not user input).
+#' @param pkgs   Character vector of package names to fetch (deduped).
+#' @param select SELECT-list fragment, inserted verbatim (default "*").
+#' @return data.frame of matching rows (any number per package); a 0x0
+#'   data.frame when the table is absent or pkgs is empty.
+.fetch_by_package <- function(con, table, pkgs, select = "*") {
+  pkgs <- unique(as.character(pkgs))
+  if (!table %in% DBI::dbListTables(con) || length(pkgs) == 0L) {
+    return(data.frame())
+  }
+  chunk_size <- 900L
+  out <- list()
+  for (i in seq(1L, length(pkgs), by = chunk_size)) {
+    chunk <- pkgs[i:min(i + chunk_size - 1L, length(pkgs))]
+    ph    <- paste(rep("?", length(chunk)), collapse = ", ")
+    out[[length(out) + 1L]] <- DBI::dbGetQuery(
+      con,
+      sprintf("SELECT %s FROM %s WHERE package IN (%s)", select, table, ph),
+      params = as.list(chunk))
+  }
+  do.call(rbind, out)
+}
+
+#' Pick each package's "latest tracked version" row out of a multi-row slice
+#' of bioc_code_summary.
+#'
+#' Winner per package: the row with a non-NA latest_release_date (there is
+#' at most one, per add_cross_version_metrics, which stamps it only on the
+#' newest-version row); ties (or a schema that lacks the column) fall back
+#' to version (lexicographic, descending), then to insertion order via the
+#' rowid_ column (expected to be selected as `rowid AS rowid_, *`) when
+#' present.
+#'
+#' @param rows data.frame from .fetch_by_package() for bioc_code_summary;
+#'   may have zero rows.
+#' @return data.frame, one row per distinct package present in `rows`.
+.pick_latest_rows <- function(rows) {
+  if (nrow(rows) == 0L) return(rows)
+  has_lrd <- "latest_release_date" %in% names(rows)
+  has_rid <- "rowid_" %in% names(rows)
+  chosen <- lapply(split(rows, rows$package), function(pr) {
+    if (has_lrd) {
+      marked <- pr[!is.na(pr$latest_release_date), , drop = FALSE]
+      if (nrow(marked) > 0L) {
+        marked <- marked[order(marked$version, decreasing = TRUE), , drop = FALSE]
+        return(marked[1L, , drop = FALSE])
+      }
+    }
+    if (has_rid) {
+      pr <- pr[order(pr$rowid_, decreasing = TRUE), , drop = FALSE]
+    }
+    pr[1L, , drop = FALSE]
+  })
+  do.call(rbind, chosen)
+}
+
+#' Derive the notes table's four numeric metrics from one latest-version row
+#' of bioc_code_summary, binding to the real schema with the documented
+#' fallbacks. A column absent from the row's schema, or NA for this specific
+#' package, yields NA (rendered "n/a" downstream) -- never a fabricated 0.
+#'
+#' @param row One-row data.frame (as returned by .pick_latest_rows()).
+#' @return list(loc_r, functions, exports, deps); each a scalar or NA.
+.row_metrics <- function(row) {
+  g   <- function(col) row[[col]] %||% NA
+  has <- function(col) col %in% names(row)
+
+  loc_r <- g("loc_r")
+
+  # Functions: n_exports + n_internal when the schema carries the split
+  # columns; the fused rpkg-analyzer field n_fns_r only when it does not.
+  functions <- if (has("n_exports") || has("n_internal")) {
+    ne <- g("n_exports"); ni <- g("n_internal")
+    if (is.na(ne) && is.na(ni)) {
+      NA_integer_
+    } else {
+      (if (is.na(ne)) 0L else as.integer(ne)) + (if (is.na(ni)) 0L else as.integer(ni))
+    }
+  } else if (has("n_fns_r")) {
+    g("n_fns_r")
+  } else {
+    NA_integer_
+  }
+
+  exports <- g("n_exports")
+
+  # Deps: n_deps_direct when available; else a best-effort count parsed out
+  # of the raw Depends/Imports DESCRIPTION text (excluding R itself).
+  deps <- {
+    d <- g("n_deps_direct")
+    if (!is.na(d)) {
+      as.integer(d)
+    } else {
+      parts_present <- c(g("depends"), g("imports"))
+      parts_present <- parts_present[!is.na(parts_present)]
+      dep_txt <- paste(parts_present, collapse = ",")
+      if (!nzchar(trimws(dep_txt))) {
+        NA_integer_
+      } else {
+        pkg_names <- strsplit(dep_txt, ",", fixed = TRUE)[[1L]]
+        pkg_names <- trimws(sub("\\s*\\(.*", "", pkg_names, perl = TRUE))
+        pkg_names <- pkg_names[nzchar(pkg_names) & !grepl("^R$", pkg_names, perl = TRUE)]
+        length(pkg_names)
+      }
+    }
+  }
+
+  list(loc_r = loc_r, functions = functions, exports = exports, deps = deps)
+}
+
+#' Count each package's rows in the dataset database's identity table.
+#'
+#' @param data_con Open DBI connection to the dataset database, or NULL.
+#' @param pkgs     Character vector of packages to count for.
+#' @return Named integer vector (names = pkgs). NA when the dataset DB/table
+#'   is unavailable (unmeasurable); a real 0 when the table exists but a
+#'   package simply has no dataset rows.
+.count_datasets <- function(data_con, pkgs) {
+  pkgs <- unique(as.character(pkgs))
+  if (length(pkgs) == 0L) return(stats::setNames(integer(0L), character(0L)))
+  if (is.null(data_con) || !("bioc_datasets" %in% DBI::dbListTables(data_con))) {
+    return(stats::setNames(rep(NA_integer_, length(pkgs)), pkgs))
+  }
+  rows <- .fetch_by_package(data_con, "bioc_datasets", pkgs, select = "package")
+  tab  <- table(factor(rows$package, levels = pkgs))
+  stats::setNames(as.integer(tab), pkgs)
+}
+
+#' Format a scalar for display: "n/a" for NULL/NA, else comma-grouped.
+#'
+#' @param x A length-0/1 numeric-ish value.
+#' @return A one-line string.
+.fmt_n <- function(x) {
+  if (is.null(x) || length(x) == 0L || is.na(x)) return("n/a")
+  format(round(as.numeric(x)), big.mark = ",", trim = TRUE, scientific = FALSE)
+}
+
+#' Build the one-paragraph headline: new/updated counts, catalog size, and
+#' the bootstrap clause.
+#'
+#' @param code_manifest Parsed code-manifest.json (list).
+#' @param changed_pkgs  Character vector, this run's changed packages.
+#' @param seed_pkgs     Character vector, the prior release's package set
+#'   ("new to the catalog" = not present here).
+#' @return A single-line string.
+.build_headline <- function(code_manifest, changed_pkgs, seed_pkgs) {
+  n_changed <- length(changed_pkgs)
+  n_new     <- sum(!changed_pkgs %in% seed_pkgs)
+  n_updated <- n_changed - n_new
+
+  bs <- code_manifest$bootstrap
+  bootstrap_clause <- if (is.null(bs) || is.null(bs$n_universe)) {
+    ""
+  } else if (isTRUE(bs$bootstrap_complete)) {
+    " Bootstrap complete."
+  } else {
+    n_universe <- as.numeric(bs$n_universe)
+    n_analyzed <- as.numeric(bs$n_analyzed %||% 0)
+    pct <- if (isTRUE(n_universe == 0)) 0 else round(100 * n_analyzed / n_universe)
+    sprintf(" Bootstrap %s%% complete (%s remaining).",
+            format(pct, trim = TRUE), .fmt_n(bs$n_remaining))
+  }
+
+  sprintf(
+    "%s packages new to the catalog, %s updated. Now tracking %s packages across %s versions.%s",
+    .fmt_n(n_new), .fmt_n(n_updated),
+    .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions),
+    bootstrap_clause)
+}
+
+#' Build the "Updated this release" table's rows: one row per changed
+#' package that has a row in the code DB, sorted alphabetically, with its
+#' latest-version metrics and dataset count.
+#'
+#' @param code_con     Open DBI connection to the code database, or NULL.
+#' @param data_con     Open DBI connection to the dataset database, or NULL.
+#' @param changed_pkgs Character vector, this run's changed packages.
+#' @param seed_pkgs    Character vector, the prior release's package set.
+#' @return data.frame: package, version (tagged " (new)" as appropriate),
+#'   loc_r, functions, exports, deps, datasets. Zero rows when there is
+#'   nothing to show.
+.build_package_rows <- function(code_con, data_con, changed_pkgs, seed_pkgs) {
+  empty <- data.frame(package = character(0L), version = character(0L),
+                      loc_r = integer(0L), functions = integer(0L),
+                      exports = integer(0L), deps = integer(0L),
+                      datasets = integer(0L), stringsAsFactors = FALSE)
+  if (is.null(code_con) || length(changed_pkgs) == 0L) return(empty)
+
+  raw <- .fetch_by_package(code_con, "bioc_code_summary", changed_pkgs,
+                           select = "rowid AS rowid_, *")
+  if (nrow(raw) == 0L) return(empty)
+
+  latest <- .pick_latest_rows(raw)
+  latest <- latest[order(latest$package), , drop = FALSE]
+  ds_counts <- .count_datasets(data_con, latest$package)
+
+  out <- lapply(seq_len(nrow(latest)), function(i) {
+    r   <- latest[i, , drop = FALSE]
+    m   <- .row_metrics(r)
+    ver <- as.character(r$version)
+    if (!(r$package %in% seed_pkgs)) ver <- paste0(ver, " (new)")
+    data.frame(package = r$package, version = ver,
+               loc_r = m$loc_r, functions = m$functions,
+               exports = m$exports, deps = m$deps,
+               datasets = unname(ds_counts[[r$package]]),
+               stringsAsFactors = FALSE)
+  })
+  do.call(rbind, out)
+}
+
+#' Render the "## Updated this release" section: a markdown table capped at
+#' `cap` rows (with a summary row for the remainder), or an honest "no
+#' changes" / empty-shell fallback.
+#'
+#' @param rows      data.frame from .build_package_rows().
+#' @param n_changed Total changed-package count for this run (from
+#'   changed-packages.txt, independent of DB presence).
+#' @param cap       Max rows to show before collapsing into a summary row.
+#' @return Character vector of markdown lines (no trailing blank line).
+.build_table_section <- function(rows, n_changed, cap = 40L) {
+  if (n_changed == 0L) {
+    return(c("## Updated this release", "", "No package changes in this release."))
+  }
+  header <- c("| Package | Version | R LOC | Functions | Exports | Deps | Datasets |",
+              "|---|---|--:|--:|--:|--:|--:|")
+  if (nrow(rows) == 0L) {
+    # Every changed package was absent from the code DB (edge case): changes
+    # did happen this run, so do not claim otherwise -- show the empty shell.
+    return(c("## Updated this release", "", header))
+  }
+  shown <- utils::head(rows, cap)
+  body  <- vapply(seq_len(nrow(shown)), function(i) {
+    r <- shown[i, , drop = FALSE]
+    sprintf("| %s | %s | %s | %s | %s | %s | %s |",
+            r$package, r$version, .fmt_n(r$loc_r), .fmt_n(r$functions),
+            .fmt_n(r$exports), .fmt_n(r$deps), .fmt_n(r$datasets))
+  }, character(1L))
+  extra <- nrow(rows) - nrow(shown)
+  if (extra > 0L) {
+    body <- c(body, sprintf("| ...and %s more updated packages | | | | | | |",
+                            format(extra, big.mark = ",", trim = TRUE)))
+  }
+  c("## Updated this release", "", header, body)
+}
+
+#' Render the "## Catalog at a glance" section straight from the two
+#' already-read manifests; nothing here is recomputed from the databases.
+#'
+#' @param code_manifest Parsed code-manifest.json (list).
+#' @param data_manifest Parsed data-manifest.json (list).
+#' @return Character vector of markdown lines (no trailing blank line).
+.build_catalog_section <- function(code_manifest, data_manifest) {
+  f          <- code_manifest$tables[["bioc_functions"]]
+  median_loc <- code_manifest$stats[["loc_r_median"]]
+  d          <- data_manifest$n_versions %||% data_manifest$tables[["bioc_datasets"]]
+
+  c("## Catalog at a glance", "",
+    sprintf("- %s packages, %s versions, %s functions",
+            .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions), .fmt_n(f)),
+    sprintf("- R code: median %s LOC per package", .fmt_n(median_loc)),
+    sprintf("- %s datasets across %s packages", .fmt_n(d), .fmt_n(data_manifest$n_packages)))
+}
+
+#' Build the full release notes body: headline paragraph, per-package
+#' metrics table, catalog summary, and a plumbing footer. No top-level "# "
+#' heading is emitted -- the GitHub release title already carries that.
+#'
+#' @param code_manifest Parsed code-manifest.json (list).
+#' @param data_manifest Parsed data-manifest.json (list).
+#' @param changed_pkgs  Character vector, this run's changed packages.
+#' @param seed_pkgs     Character vector, the prior release's package set
+#'   (empty when seed-packages.txt is absent/empty: every changed package
+#'   counts as new).
+#' @param code_con      Open DBI connection to the code database, or NULL.
+#' @param data_con      Open DBI connection to the dataset database, or NULL.
+#' @param cap           Max table rows before collapsing into a summary row.
+#' @return Character vector of markdown lines.
+build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
+                                seed_pkgs, code_con, data_con, cap = 40L) {
+  headline        <- .build_headline(code_manifest, changed_pkgs, seed_pkgs)
+  rows            <- .build_package_rows(code_con, data_con, changed_pkgs, seed_pkgs)
+  table_section   <- .build_table_section(rows, length(changed_pkgs), cap = cap)
+  catalog_section <- .build_catalog_section(code_manifest, data_manifest)
+
+  short_fp <- substr(code_manifest$fingerprint %||% "", 1L, 8L)
+  footer   <- sprintf("<sub>fingerprint %s - full manifest in the release assets</sub>",
+                      short_fp)
+
+  c(headline, "", table_section, "", catalog_section, "", footer)
+}
