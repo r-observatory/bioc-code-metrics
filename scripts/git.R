@@ -41,10 +41,11 @@ clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
 #' so that 3.9 < 3.10 (not lexicographically). De-duplicates by commit SHA,
 #' keeping the lowest-version occurrence per SHA.
 #'
-#' Only SOFTWARE and WORKFLOW packages have github.com/bioc repos with RELEASE
-#' branches. Annotation/experiment data packages do not; their repos either
-#' do not exist or have no RELEASE branches. In both cases the empty frame is
-#' returned.
+#' SOFTWARE, WORKFLOW, and EXPERIMENT data packages have github.com/bioc repos
+#' with RELEASE branches. Annotation data packages do not: they have no git
+#' repos (on github.com/bioc or git.bioconductor.org) and no RELEASE branches,
+#' so they are not listed by bioc_package_repos(). When a repo has no RELEASE
+#' branches the empty frame is returned.
 #'
 #' @param repo  Path to a local git repository directory.
 #' @return data.frame(version, ref, date, commit) ordered by version ascending.

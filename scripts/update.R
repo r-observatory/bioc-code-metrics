@@ -132,18 +132,31 @@
 #' @return A list with:
 #'   \item{package_list}{function() -> data.frame(package, latest_version)}
 #'   \item{clone}{function(pkg, dest) -> logical}
+#' Bioconductor package-list repositories to scan (current release).
+#'
+#' SOFTWARE and WORKFLOW carry code; EXPERIMENT data packages carry example
+#' datasets plus some code. All three have github.com/bioc repos with
+#' RELEASE_X_Y branches, so they flow through the same clone and version-history
+#' path. Annotation data packages are intentionally omitted: they have no git
+#' repos (on github.com/bioc or git.bioconductor.org) and no RELEASE branches,
+#' so the branch-based version history this pipeline relies on does not apply.
+#'
+#' @return Character vector of Bioconductor repository base URLs.
+bioc_package_repos <- function() {
+  c(
+    "https://bioconductor.org/packages/release/bioc",
+    "https://bioconductor.org/packages/release/workflows",
+    "https://bioconductor.org/packages/release/data/experiment"
+  )
+}
+
 default_io <- function() {
   list(
     package_list = function() {
-      # Bioconductor SOFTWARE and WORKFLOW packages (current release).
-      # Only these two categories have github.com/bioc repos with RELEASE_X_Y
-      # branches. Annotation and experiment data packages are excluded because
-      # their repos either do not exist on github.com/bioc or carry no code.
+      # Bioconductor SOFTWARE, WORKFLOW, and EXPERIMENT data packages (current
+      # release); see bioc_package_repos() for why annotation is omitted.
       tryCatch({
-        repos <- c(
-          "https://bioconductor.org/packages/release/bioc",
-          "https://bioconductor.org/packages/release/workflows"
-        )
+        repos <- bioc_package_repos()
         m <- available.packages(repos = repos)
         df <- data.frame(
           package        = as.character(m[, "Package"]),
