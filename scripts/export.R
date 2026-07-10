@@ -137,12 +137,6 @@ metrics_fingerprint <- function(summary_df) {
   if (!table %in% tables) {
     DBI::dbWriteTable(con, table, df, row.names = FALSE,
                       overwrite = FALSE, append = FALSE)
-    DBI::dbExecute(con, sprintf(
-      "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
-      table, table))
-    DBI::dbExecute(con, sprintf(
-      "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
-      table, table))
   } else {
     existing_cols <- DBI::dbListFields(con, table)
     for (col in setdiff(names(df), existing_cols)) {
@@ -154,6 +148,12 @@ metrics_fingerprint <- function(summary_df) {
     }
     if (nrow(df) > 0L) DBI::dbAppendTable(con, table, df)
   }
+  DBI::dbExecute(con, sprintf(
+    "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
+    table, table))
+  DBI::dbExecute(con, sprintf(
+    "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
+    table, table))
   invisible(NULL)
 }
 
@@ -178,7 +178,6 @@ metrics_fingerprint <- function(summary_df) {
       content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
-    DBI::dbExecute(con, "CREATE INDEX idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
   }
   if (!"bioc_dataset_contents" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
@@ -186,12 +185,13 @@ metrics_fingerprint <- function(summary_df) {
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
       class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
       UNIQUE (content_fp, schema_fp, fp_algo_version))")
-    DBI::dbExecute(con, "CREATE INDEX idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
   }
   if (!"bioc_dataset_sketches" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
   }
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
+  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
   invisible(NULL)
 }
 
@@ -313,6 +313,17 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Open (or create) the dataset SQLite database, ensuring the four normalized
+#' dataset tables exist. Mirrors open_or_init_db() but for the data series.
+#'
+#' @param path File path for the dataset SQLite database.
+#' @return An open DBI connection. Caller must dbDisconnect().
+open_or_init_data_db <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  .ensure_dataset_tables(con)
+  con
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
 #' If the file does not yet exist it is created. The three non-summary tables
@@ -336,10 +347,6 @@ open_or_init_db <- function(path) {
         added   INTEGER,
         deleted INTEGER
       )")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_churn_pkg_ver ON bioc_code_churn(package, version)")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_churn_pkg ON bioc_code_churn(package)")
   }
 
   if (!"bioc_api_history" %in% tables) {
@@ -351,8 +358,6 @@ open_or_init_db <- function(path) {
         exports_removed TEXT,
         n_exports       INTEGER
       )")
-    DBI::dbExecute(con,
-      "CREATE INDEX idx_api_pkg_ver ON bioc_api_history(package, version)")
   }
 
   if (!"bioc_metrics_failures" %in% tables) {
@@ -363,6 +368,13 @@ open_or_init_db <- function(path) {
         last_attempt         TEXT
       )")
   }
+
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON bioc_code_churn(package, version)")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_churn_pkg ON bioc_code_churn(package)")
+  DBI::dbExecute(con,
+    "CREATE INDEX IF NOT EXISTS idx_api_pkg_ver ON bioc_api_history(package, version)")
 
   con
 }
@@ -452,8 +464,7 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
-                         functions_df = NULL, edges_df = NULL,
-                         datasets_df = NULL) {
+                         functions_df = NULL, edges_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -475,7 +486,6 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     .delete_by_package(con, "bioc_api_history",  pkgs)
     if (!is.null(functions_df)) .delete_by_package(con, "bioc_functions",  pkgs)
     if (!is.null(edges_df))     .delete_by_package(con, "bioc_call_edges", pkgs)
-    # dataset tables are wiped inside .write_datasets_normalized (children first)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -485,9 +495,6 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
       # First-ever write: create the table from the data.frame schema.
       DBI::dbWriteTable(con, "bioc_code_summary", summary_write,
                         row.names = FALSE, overwrite = FALSE, append = FALSE)
-      DBI::dbExecute(con,
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
-         ON bioc_code_summary(package, version)")
     } else {
       # Possibly new columns have appeared since the table was first created.
       existing_cols <- DBI::dbListFields(con, "bioc_code_summary")
@@ -501,6 +508,9 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
       }
       DBI::dbAppendTable(con, "bioc_code_summary", summary_write)
     }
+    DBI::dbExecute(con,
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_summary_pkg_ver
+       ON bioc_code_summary(package, version)")
 
     # -- Insert fresh churn rows ---------------------------------------------
     churn_write <- .coerce_logicals(churn_df)
@@ -517,11 +527,251 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
-    .write_datasets_normalized(con, datasets_df, pkgs)
-    .gc_dataset_contents(con)
   })
 
   invisible(NULL)
+}
+
+#' Upsert one shard's dataset rows into the dataset database in-place.
+#'
+#' Runs the normalized-dataset write and the content GC inside one transaction
+#' on the dataset connection. Separated from upsert_shard so the code and
+#' dataset tables live in different files.
+#'
+#' @param data_con    Open DBI connection from open_or_init_data_db().
+#' @param datasets_df  Per-(package, version, dataset) rows, or NULL.
+#' @param pkgs         Character vector of packages written this shard.
+#' @return invisible(NULL)
+upsert_datasets <- function(data_con, datasets_df, pkgs) {
+  pkgs <- unique(as.character(pkgs))
+  DBI::dbWithTransaction(data_con, {
+    .write_datasets_normalized(data_con, datasets_df, pkgs)
+    .gc_dataset_contents(data_con)
+  })
+  invisible(NULL)
+}
+
+#' Build a per-DB insight manifest matching the pipeline MANIFEST SCHEMA.
+#'
+#' All values are measured from `con`; a missing table counts 0 and a missing
+#' numeric column yields NULL mean/median (rendered as JSON null). bootstrap's
+#' n_universe/n_remaining may be NULL when unmeasurable.
+#'
+#' @param con         Open DBI connection to the pipeline SQLite database.
+#' @param series      "code" or "data".
+#' @param repo        "owner/name" of the publishing repo.
+#' @param db_filename The asset filename this manifest describes.
+#' @param db_bytes    On-disk size of the DB file, in bytes.
+#' @param tables      Character vector of table names to report row counts for.
+#' @param fp_table    Table to fingerprint.
+#' @param fp_cols     Columns within fp_table forming the fingerprint key.
+#' @param pkg_table   Table to count DISTINCT package from for n_packages.
+#' @param ver_table   Table to count rows from for n_versions.
+#' @param stat_table  Table to probe for stat_cols.
+#' @param stat_cols   Character vector of numeric columns to summarise.
+#' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
+#'   n_universe/n_remaining may be NULL.
+#' @return A named list matching the MANIFEST SCHEMA.
+build_manifest <- function(con, series, repo, db_filename, db_bytes,
+                           tables, fp_table, fp_cols, pkg_table, ver_table,
+                           stat_table, stat_cols, bootstrap) {
+  present <- DBI::dbListTables(con)
+  count_tbl <- function(t) {
+    if (!t %in% present) return(0L)
+    as.integer(DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s"', t))$n)
+  }
+  table_counts <- stats::setNames(lapply(tables, count_tbl), tables)
+
+  n_packages <- if (pkg_table %in% present) {
+    as.integer(DBI::dbGetQuery(con,
+      sprintf('SELECT COUNT(DISTINCT package) n FROM "%s"', pkg_table))$n)
+  } else 0L
+  n_versions <- count_tbl(ver_table)
+
+  # Fingerprint over the concatenation of fp_cols keys, ordered by the SQL
+  # tuple (not by sorting the already-concatenated strings). Code-series
+  # keys join fields with ":" (matching db_fingerprint()); data-series keys
+  # join fields with "\x1f" per the manifest schema.
+  fp_sep <- if (identical(series, "code")) ":" else "\x1f"
+  fingerprint <- {
+    if (!fp_table %in% present) {
+      digest::digest("", algo = "sha256", serialize = FALSE)
+    } else {
+      cols <- paste(sprintf('"%s"', fp_cols), collapse = ", ")
+      df <- DBI::dbGetQuery(con,
+        sprintf('SELECT %s FROM "%s" ORDER BY %s', cols, fp_table, cols))
+      keys <- if (nrow(df) == 0L) character(0L) else
+        apply(df, 1L, function(r) paste(r, collapse = fp_sep))
+      # Rows are ordered by SQLite's ORDER BY (BINARY collation, i.e. byte
+      # order) *before* concatenation, exactly matching db_fingerprint()'s
+      # "ORDER BY package, version". Sorting the already-concatenated
+      # "package:version" strings in R instead is NOT equivalent: whenever
+      # one key is a prefix of another followed by a character below ':'
+      # (0x3a) -- e.g. package "Rcpp" vs "Rcpp11" -- tuple order and
+      # concatenated-string order disagree, so the two fingerprints would
+      # diverge for real CRAN data.
+      digest::digest(paste(keys, collapse = ","),
+                     algo = "sha256", serialize = FALSE)
+    }
+  }
+
+  # Stats: mean/median per column that exists AND is numeric, else NULL.
+  # A non-numeric column (e.g. character) must never be coerced into a
+  # fabricated statistic.
+  stat_fields <- list()
+  stat_cols_present <- if (stat_table %in% present) DBI::dbListFields(con, stat_table) else character(0L)
+  for (col in stat_cols) {
+    if (col %in% stat_cols_present) {
+      v <- DBI::dbGetQuery(con, sprintf('SELECT "%s" AS v FROM "%s"', col, stat_table))$v
+      if (is.numeric(v)) {
+        v <- v[!is.na(v)]
+        stat_fields[[paste0(col, "_mean")]]   <- if (length(v)) mean(v) else NULL
+        stat_fields[[paste0(col, "_median")]] <- if (length(v)) stats::median(v) else NULL
+      } else {
+        stat_fields[[paste0(col, "_mean")]]   <- NULL
+        stat_fields[[paste0(col, "_median")]] <- NULL
+      }
+    } else {
+      stat_fields[[paste0(col, "_mean")]]   <- NULL
+      stat_fields[[paste0(col, "_median")]] <- NULL
+    }
+  }
+
+  list(
+    schema_version = 1L,
+    series         = series,
+    repo           = repo,
+    db_filename    = db_filename,
+    generated_at   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    db_bytes       = round(as.numeric(db_bytes)),
+    fingerprint    = fingerprint,
+    n_packages     = n_packages,
+    n_versions     = n_versions,
+    tables         = table_counts,
+    stats          = stat_fields,
+    bootstrap      = list(
+      n_analyzed         = bootstrap$n_analyzed,
+      n_universe         = bootstrap$n_universe,
+      n_remaining        = bootstrap$n_remaining,
+      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
+    )
+  )
+}
+
+#' Union `pkgs` into a sorted, deduped newline file at `path` (accumulates the
+#' run's changed set across shards for the changelog).
+#'
+#' @param path Newline-delimited text file. Created if absent.
+#' @param pkgs Character vector of package names touched this run.
+#' @return Invisibly NULL.
+record_changed_packages <- function(path, pkgs) {
+  existing <- if (file.exists(path)) readLines(path, warn = FALSE) else character(0L)
+  all <- sort(unique(c(existing, as.character(pkgs))))
+  all <- all[nzchar(all)]
+  writeLines(all, path)
+  invisible(NULL)
+}
+
+#' Read the accumulated changed-package set (empty vector if absent).
+#'
+#' @param path Newline-delimited text file as written by record_changed_packages().
+#' @return Character vector, sorted as stored; character(0L) when path is absent.
+read_changed_packages <- function(path) {
+  if (!file.exists(path)) return(character(0L))
+  x <- readLines(path, warn = FALSE)
+  x[nzchar(x)]
+}
+
+#' Format a numeric delta as "(+N)"/"(-N)"; "(n/a)" when either side is
+#' missing so an unmeasurable quantity is never rendered as a fabricated 0.
+#'
+#' @param cur  Current value, or NULL/length-0 if unmeasured.
+#' @param prev Previous value, or NULL/length-0 if unmeasured.
+#' @return A one-line string.
+.fmt_delta <- function(cur, prev) {
+  if (is.null(cur) || is.null(prev) || length(cur) == 0L || length(prev) == 0L) return("(n/a)")
+  d <- cur - prev
+  sprintf("(%s%s)", if (d >= 0) "+" else "-", format(abs(d), trim = TRUE))
+}
+
+#' Build the "Changes since <prev>" markdown section.
+#'
+#' Every number rendered comes from `today`/`prev` (already-parsed manifests)
+#' or `changed_pkgs`; nothing is invented. A stat/table present on only one
+#' side prints its known value (or "n/a") with an "(n/a)" delta rather than a
+#' misleading "+N"/"-N".
+#'
+#' @param today  Manifest list (already-parsed) for this release.
+#' @param prev   Manifest list for the previous dated release, or NULL for
+#'   the first dated release of a series.
+#' @param changed_pkgs Character vector of packages touched this run.
+#' @param cap    Max packages listed (default 25).
+#' @return A single markdown string.
+build_changelog <- function(today, prev, changed_pkgs, cap = 25L) {
+  L <- character(0L)
+  if (is.null(prev)) {
+    L <- c(L, "## Changes since (first dated release)", "",
+           "Initial dated release; no prior snapshot to diff.", "",
+           sprintf("- Packages: %s", today$n_packages),
+           sprintf("- Versions: %s", today$n_versions),
+           sprintf("- DB size: %s bytes", format(today$db_bytes, big.mark = ",")))
+    return(paste(L, collapse = "\n"))
+  }
+  # today$series is always populated by build_manifest(); the "release"
+  # fallback only guards a directly-constructed today list in tests. Either
+  # way sprintf() must never receive a NULL/length-0 argument here, or the
+  # whole heading line silently vanishes from L.
+  prev_tag <- prev$dated_tag %||% sprintf("%s-<prev>", today$series %||% "release")
+  L <- c(L, sprintf("## Changes since %s", prev_tag), "",
+    sprintf("- Packages: %s %s", today$n_packages, .fmt_delta(today$n_packages, prev$n_packages)),
+    sprintf("- Versions: %s %s", today$n_versions, .fmt_delta(today$n_versions, prev$n_versions)),
+    sprintf("- DB size: %s bytes %s", format(today$db_bytes, big.mark = ","),
+            .fmt_delta(today$db_bytes, prev$db_bytes)))
+  # Stats deltas (union of keys, sorted).
+  for (k in sort(unique(c(names(today$stats), names(prev$stats))))) {
+    label <- sub("_mean$", " mean", sub("_median$", " median", k))
+    L <- c(L, sprintf("- %s: %s %s", label, today$stats[[k]] %||% "n/a",
+                      .fmt_delta(today$stats[[k]], prev$stats[[k]])))
+  }
+  # Per-table row-count deltas.
+  L <- c(L, "- Table row counts:")
+  for (t in sort(unique(c(names(today$tables), names(prev$tables))))) {
+    L <- c(L, sprintf("  - %s: %s %s", t, today$tables[[t]] %||% "n/a",
+                      .fmt_delta(today$tables[[t]], prev$tables[[t]])))
+  }
+  # Changed-package list, capped.
+  n <- length(changed_pkgs)
+  if (n == 0L) {
+    L <- c(L, "- Newly or re-analyzed packages (0): none")
+  } else {
+    shown <- head(sort(changed_pkgs), cap)
+    L <- c(L, sprintf("- Newly or re-analyzed packages (%d shown of %d):", length(shown), n),
+           sprintf("  - %s", paste(shown, collapse = ", ")))
+  }
+  paste(L, collapse = "\n")
+}
+
+#' Render the full release notes for a DB.
+#'
+#' @param manifest A manifest list as produced by build_manifest().
+#' @param changelog_md The markdown string returned by build_changelog().
+#' @param title Release title, rendered as the top-level heading.
+#' @return Character vector of markdown lines.
+render_release_notes <- function(manifest, changelog_md, title) {
+  c(
+    sprintf("# %s", title), "",
+    sprintf("- DB: `%s` (%s bytes)", manifest$db_filename, format(manifest$db_bytes, big.mark = ",")),
+    sprintf("- Generated: %s", manifest$generated_at),
+    sprintf("- Fingerprint: `%s`", manifest$fingerprint),
+    sprintf("- Packages: %s   Versions: %s", manifest$n_packages, manifest$n_versions),
+    sprintf("- Bootstrap: %s/%s analyzed (%s remaining, complete=%s)",
+            manifest$bootstrap$n_analyzed,
+            manifest$bootstrap$n_universe %||% "?",
+            manifest$bootstrap$n_remaining %||% "?",
+            tolower(as.character(manifest$bootstrap$bootstrap_complete))),
+    "",
+    changelog_md, ""
+  )
 }
 
 #' Compute a SHA-256 fingerprint over the current package:version set in the DB.

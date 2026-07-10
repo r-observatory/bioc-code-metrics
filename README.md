@@ -18,7 +18,9 @@ differs (Bioconductor uses release branches rather than per-version tags).
 
 ## Output
 
-`bioc-code-metrics.db` (published on the rolling `current` release):
+`bioc-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
+release is immutable once a later day's release exists, and old releases are
+pruned on a retention schedule):
 
 - `bioc_code_summary` - one row per package release, with the metric columns and
   the release date.
@@ -26,8 +28,13 @@ differs (Bioconductor uses release branches rather than per-version tags).
   releases.
 - `bioc_api_history` - exported-symbol additions and removals per release.
 
-A `manifest.json` accompanies the database with a `changed` flag and a
-`bootstrap_complete` flag.
+`bioc-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
+release, and holds the dataset-focused tables.
+
+Each dated release carries its own `manifest.json` asset (copied from
+`code-manifest.json` or `data-manifest.json`). A separate `run-status.json`,
+written alongside but not published, carries the `changed` and
+`bootstrap_complete` flags that drive the shard loop.
 
 ## Running
 
@@ -37,10 +44,11 @@ Rscript scripts/update.R out/     # analyze the next shard of packages, carry-fo
 Rscript scripts/update.R out/ --bootstrap   # re-analyze everything from scratch
 ```
 
-The update reads the prior database from `out/`, analyzes a shard of packages
-that are new or have a new release, and writes an updated database plus manifest.
-Only Bioconductor software and workflow packages have release-branch repositories;
-data packages are not covered. Set `GITHUB_TOKEN` so git fetches are authenticated.
+The update reads the prior databases from `out/`, analyzes a shard of packages
+that are new or have a new release, and writes the updated code and dataset
+databases plus their manifests. Only Bioconductor software and workflow
+packages have release-branch repositories; data packages are not covered. Set
+`GITHUB_TOKEN` so git fetches are authenticated.
 
 ## Notes
 

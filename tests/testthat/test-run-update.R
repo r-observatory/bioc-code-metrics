@@ -135,8 +135,9 @@ test_that("sharded bootstrap: three runs cover universe of 5, fourth is no-op", 
   expect_equal(length(pkgs1), 2L)
   expect_equal(pkgs1, c("pkgA", "pkgB"))  # deterministic alphabetical shard
 
-  # manifest.json written to out_dir
-  expect_true(file.exists(file.path(out_dir, "manifest.json")))
+  # code-manifest.json and data-manifest.json written to out_dir
+  expect_true(file.exists(file.path(out_dir, "code-manifest.json")))
+  expect_true(file.exists(file.path(out_dir, "data-manifest.json")))
 
   # ---- Run 2 ---------------------------------------------------------------
   m2 <- run_update(io, out_dir, shard_size = 2L)

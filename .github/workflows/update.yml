@@ -60,73 +60,103 @@ jobs:
       - name: Run unit tests
         run: Rscript tests/testthat.R
 
-      - name: Download the prior database
+      - name: Download the latest dated databases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p out
-          if gh release view current >/dev/null 2>&1; then
-            gh release download current --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
-            gh release download current --pattern manifest.json --dir out 2>/dev/null || true
+          latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
+
+          CODE_TAG=$(latest_tag code)
+          DATA_TAG=$(latest_tag data)
+          echo "prior code tag: ${CODE_TAG:-none}; prior data tag: ${DATA_TAG:-none}"
+
+          if [ -n "$CODE_TAG" ]; then
+            gh release download "$CODE_TAG" --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
+            gh release download "$CODE_TAG" --pattern manifest.json --dir out 2>/dev/null || true
+            [ -f out/manifest.json ] && mv out/manifest.json out/prev-code-manifest.json || true
           fi
+          if [ -n "$DATA_TAG" ]; then
+            gh release download "$DATA_TAG" --pattern bioc-data-metrics.db --dir out 2>/dev/null || true
+            gh release download "$DATA_TAG" --pattern manifest.json --dir out 2>/dev/null || true
+            [ -f out/manifest.json ] && mv out/manifest.json out/prev-data-manifest.json || true
+          fi
+          echo "PREV_CODE_TAG=${CODE_TAG}" >> "$GITHUB_ENV"
+          echo "PREV_DATA_TAG=${DATA_TAG}" >> "$GITHUB_ENV"
           ls -la out || true
 
       - name: Analyze shards and publish after each
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_TITLE_PREFIX: Bioconductor
         run: |
-          set -uo pipefail
+          set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
-          FORCE=""
-          if [ "${{ inputs.force_full }}" = "true" ]; then FORCE="--bootstrap"; fi
-          RECOLLECT=""
-          if [ "${{ inputs.recollect }}" = "true" ]; then RECOLLECT="--recollect"; fi
+          FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
+          RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
+          TODAY="$(date -u +%Y-%m-%d)"
+          CODE_TAG="code-${TODAY}"
+          DATA_TAG="data-${TODAY}"
+          MAX_BYTES=2040109465
 
-          # Ensure the rolling release exists so uploads have a target.
-          if ! gh release view current >/dev/null 2>&1; then
-            git tag -f current
-            git push -f origin current || true
-            gh release create current --title "Bioconductor Code Metrics (rolling)" \
-              --notes "Per-version code and quality metrics for Bioconductor SOFTWARE and WORKFLOW packages, plus per-file churn between releases." --latest
-          fi
+          publish() {  # $1=tag $2=db-file $3=series $4=notes-file
+            local bytes; bytes=$(stat -c%s "out/$2")
+            if [ "$bytes" -gt "$MAX_BYTES" ]; then
+              echo "::error::out/$2 is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish $1."
+              return 1
+            fi
+            cp "out/$3-manifest.json" out/manifest.json
+            local latest_flag="--latest=false"; [ "$3" = "code" ] && latest_flag="--latest"
+            if gh release view "$1" >/dev/null 2>&1; then
+              # Today's release already exists (an earlier shard this run): clobber ONLY today.
+              gh release upload "$1" "out/$2" out/manifest.json --clobber
+              gh release edit "$1" --notes-file "out/$4"
+            else
+              gh release create "$1" "out/$2" out/manifest.json \
+                --title "Bioconductor ${3^} Metrics - ${TODAY}" --notes-file "out/$4" "$latest_flag"
+            fi
+          }
 
           shard=0
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
             Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT}
-            FORCE=""  # force_full only applies to the first shard of a full rebuild
+            FORCE=""
 
-            CHANGED=$(jq -r '.changed' out/manifest.json)
-            COMPLETE=$(jq -r '.bootstrap_complete' out/manifest.json)
-            ANALYZED=$(jq -r '.n_analyzed' out/manifest.json)
-            UNIVERSE=$(jq -r '.n_universe' out/manifest.json)
-            REMAINING=$(jq -r '.n_remaining // "?"' out/manifest.json)
-            NFRESH=$(jq -r '.n_fresh // "?"' out/manifest.json)
-            NVERS=$(jq -r '.n_versions // "?"' out/manifest.json)
-            FAILED=$(jq -r '.shard_failures.count // "?"' out/manifest.json)
-            echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=${ANALYZED}/${UNIVERSE} (+${NFRESH} ok, ${FAILED} failed, ${NVERS} versions, ${REMAINING} queued)"
+            CHANGED=$(jq -r '.changed' out/run-status.json)
+            COMPLETE=$(jq -r '.bootstrap_complete' out/run-status.json)
+            echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=$(jq -r .n_analyzed out/run-status.json)/$(jq -r .n_universe out/run-status.json)"
 
             if [ "$CHANGED" = "true" ]; then
-              # Guard the 2 GiB release-asset cap. Abort BEFORE the --clobber
-              # upload (which deletes the live asset first), so an oversized
-              # build can never leave the release without a database.
-              DB_BYTES=$(stat -c%s out/bioc-code-metrics.db)
-              MAX_BYTES=2040109465   # ~1.9 GiB, headroom under the 2 GiB cap
-              if [ "$DB_BYTES" -gt "$MAX_BYTES" ]; then
-                echo "::error::bioc-code-metrics.db is ${DB_BYTES} bytes (> ${MAX_BYTES}); refusing to upload to protect the live asset."
-                exit 1
-              fi
-              gh release upload current out/bioc-code-metrics.db out/manifest.json --clobber
+              Rscript scripts/render_notes.R out/
+              publish "$CODE_TAG" bioc-code-metrics.db code release-notes-code.md || exit 1
+              publish "$DATA_TAG" bioc-data-metrics.db data release-notes-data.md || exit 1
             fi
 
             if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
               echo "Nothing left to do (complete=${COMPLETE}, changed=${CHANGED})."
               break
             fi
-            if [ "$SECONDS" -ge "$BUDGET" ]; then
-              echo "Time budget reached; the next scheduled run will continue."
-              break
-            fi
+            [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
+          done
+
+      - name: Prune old dated releases
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: "30"
+        run: |
+          set -euo pipefail
+          for series in code data; do
+            gh release list --limit 1000 --json tagName -q '.[].tagName' \
+              | { grep "^${series}-" || true; } \
+              | Rscript scripts/prune.R \
+              | while read -r tag; do
+                  [ -n "$tag" ] || continue
+                  echo "pruning $tag"
+                  gh release delete "$tag" --yes --cleanup-tag || true
+                done
           done

@@ -173,10 +173,13 @@ default_io <- function() {
 
 #' Run one sharded update of the bioc-code-metrics pipeline.
 #'
-#' Opens (or creates) the SQLite DB at out_dir/DB_FILENAME, determines which
-#' packages need analysis by querying the DB (not by reading whole tables),
-#' processes the next shard, upserts only the shard's rows in-place (bounded
-#' to O(shard) memory), and emits a manifest.json.
+#' Opens (or creates) the code DB at out_dir/DB_FILENAME and the dataset DB at
+#' out_dir/DATA_DB_FILENAME, determines which packages need analysis by querying
+#' the DB (not by reading whole tables), processes the next shard, upserts only
+#' the shard's rows in-place (bounded to O(shard) memory) with dataset rows
+#' written before the code summary, and emits code-manifest.json,
+#' data-manifest.json, run-status.json, and the changed-packages.txt
+#' accumulator.
 #'
 #' Clone and analyze failures are tracked per-package. Packages that have
 #' failed >= MAX_CLONE_FAILURES consecutive times are permanently excluded from
@@ -197,11 +200,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                        recollect = FALSE) {
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-  db_path <- file.path(out_dir, DB_FILENAME)
+  db_path      <- file.path(out_dir, DB_FILENAME)
+  data_db_path <- file.path(out_dir, DATA_DB_FILENAME)
 
-  # ---- 1. Open DB (creates tables if absent) --------------------------------
+  # ---- 1. Open both DBs (creates tables if absent) --------------------------
   con <- open_or_init_db(db_path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
+  data_con <- open_or_init_data_db(data_db_path)
+  on.exit(DBI::dbDisconnect(data_con), add = TRUE)
 
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
@@ -400,8 +406,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
 
   if (length(fresh_pkgs) > 0L) {
+    # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
+    # so a scanned code row always implies its dataset rows were written. The
+    # dataset write is delete-then-insert (idempotent), so if the code write
+    # fails afterwards the package stays on the to-do list and the next run
+    # redoes both cleanly, rather than being marked done with datasets missing.
+    upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
-                 fresh_functions, fresh_edges, fresh_datasets)
+                 fresh_functions, fresh_edges)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------
@@ -421,14 +433,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Re-query permanent failures after this run (some may have just hit the limit).
   n_permanent_failures <- length(.permanent_failures(con))
 
-  manifest_path <- file.path(out_dir, "manifest.json")
   prior_fp <- tryCatch({
-    if (file.exists(manifest_path)) {
-      m <- jsonlite::fromJSON(manifest_path)
-      m[["fingerprint"]]
-    } else {
-      NULL
-    }
+    prev_path <- file.path(out_dir, "prev-code-manifest.json")
+    cur_path  <- file.path(out_dir, "code-manifest.json")
+    src <- if (file.exists(prev_path)) prev_path else if (file.exists(cur_path)) cur_path else NULL
+    if (is.null(src)) NULL else jsonlite::fromJSON(src)[["fingerprint"]]
   }, error = function(e) NULL)
 
   # bootstrap_complete: no deferred packages remain AND DB covers the universe
@@ -473,7 +482,45 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   flush(stdout())
 
-  write_manifest(manifest_path, manifest)
+  bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
+                    n_remaining = length(remaining_after),
+                    bootstrap_complete = bootstrap_complete)
+  code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
+  data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
+
+  code_manifest <- build_manifest(
+    con, series = "code", repo = PUBLISH_REPO, db_filename = DB_FILENAME,
+    db_bytes = code_db_bytes,
+    tables = c("bioc_code_summary", "bioc_api_history", "bioc_functions",
+               "bioc_call_edges", "bioc_code_churn"),
+    fp_table = "bioc_code_summary", fp_cols = c("package", "version"),
+    pkg_table = "bioc_code_summary", ver_table = "bioc_code_summary",
+    stat_table = "bioc_code_summary", stat_cols = c("loc_r", "n_fns_r"),
+    bootstrap = bootstrap)
+
+  data_manifest <- build_manifest(
+    data_con, series = "data", repo = PUBLISH_REPO, db_filename = DATA_DB_FILENAME,
+    db_bytes = data_db_bytes,
+    tables = c("bioc_datasets", "bioc_dataset_versions", "bioc_dataset_contents"),
+    fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
+    pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
+    stat_table = "bioc_dataset_contents", stat_cols = c("nrow", "ncol"),
+    bootstrap = bootstrap)
+
+  write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
+  write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
+  write_manifest(file.path(out_dir, "run-status.json"),
+                 list(changed = changed, bootstrap_complete = bootstrap_complete,
+                      n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
+                      n_remaining = length(remaining_after), n_fresh = length(fresh_pkgs),
+                      n_shard = length(shard_pkgs),
+                      n_versions = nrow(fresh_summary),
+                      shard_failures = length(shard_failures)))
+
+  if (length(fresh_pkgs) > 0L) {
+    record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)
+  }
+
   invisible(manifest)
 }
 
