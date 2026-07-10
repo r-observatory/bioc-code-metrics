@@ -658,6 +658,122 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
   )
 }
 
+#' Union `pkgs` into a sorted, deduped newline file at `path` (accumulates the
+#' run's changed set across shards for the changelog).
+#'
+#' @param path Newline-delimited text file. Created if absent.
+#' @param pkgs Character vector of package names touched this run.
+#' @return Invisibly NULL.
+record_changed_packages <- function(path, pkgs) {
+  existing <- if (file.exists(path)) readLines(path, warn = FALSE) else character(0L)
+  all <- sort(unique(c(existing, as.character(pkgs))))
+  all <- all[nzchar(all)]
+  writeLines(all, path)
+  invisible(NULL)
+}
+
+#' Read the accumulated changed-package set (empty vector if absent).
+#'
+#' @param path Newline-delimited text file as written by record_changed_packages().
+#' @return Character vector, sorted as stored; character(0L) when path is absent.
+read_changed_packages <- function(path) {
+  if (!file.exists(path)) return(character(0L))
+  x <- readLines(path, warn = FALSE)
+  x[nzchar(x)]
+}
+
+#' Format a numeric delta as "(+N)"/"(-N)"; "(n/a)" when either side is
+#' missing so an unmeasurable quantity is never rendered as a fabricated 0.
+#'
+#' @param cur  Current value, or NULL/length-0 if unmeasured.
+#' @param prev Previous value, or NULL/length-0 if unmeasured.
+#' @return A one-line string.
+.fmt_delta <- function(cur, prev) {
+  if (is.null(cur) || is.null(prev) || length(cur) == 0L || length(prev) == 0L) return("(n/a)")
+  d <- cur - prev
+  sprintf("(%s%s)", if (d >= 0) "+" else "-", format(abs(d), trim = TRUE))
+}
+
+#' Build the "Changes since <prev>" markdown section.
+#'
+#' Every number rendered comes from `today`/`prev` (already-parsed manifests)
+#' or `changed_pkgs`; nothing is invented. A stat/table present on only one
+#' side prints its known value (or "n/a") with an "(n/a)" delta rather than a
+#' misleading "+N"/"-N".
+#'
+#' @param today  Manifest list (already-parsed) for this release.
+#' @param prev   Manifest list for the previous dated release, or NULL for
+#'   the first dated release of a series.
+#' @param changed_pkgs Character vector of packages touched this run.
+#' @param cap    Max packages listed (default 25).
+#' @return A single markdown string.
+build_changelog <- function(today, prev, changed_pkgs, cap = 25L) {
+  L <- character(0L)
+  if (is.null(prev)) {
+    L <- c(L, "## Changes since (first dated release)", "",
+           "Initial dated release; no prior snapshot to diff.", "",
+           sprintf("- Packages: %s", today$n_packages),
+           sprintf("- Versions: %s", today$n_versions),
+           sprintf("- DB size: %s bytes", format(today$db_bytes, big.mark = ",")))
+    return(paste(L, collapse = "\n"))
+  }
+  # today$series is always populated by build_manifest(); the "release"
+  # fallback only guards a directly-constructed today list in tests. Either
+  # way sprintf() must never receive a NULL/length-0 argument here, or the
+  # whole heading line silently vanishes from L.
+  prev_tag <- prev$dated_tag %||% sprintf("%s-<prev>", today$series %||% "release")
+  L <- c(L, sprintf("## Changes since %s", prev_tag), "",
+    sprintf("- Packages: %s %s", today$n_packages, .fmt_delta(today$n_packages, prev$n_packages)),
+    sprintf("- Versions: %s %s", today$n_versions, .fmt_delta(today$n_versions, prev$n_versions)),
+    sprintf("- DB size: %s bytes %s", format(today$db_bytes, big.mark = ","),
+            .fmt_delta(today$db_bytes, prev$db_bytes)))
+  # Stats deltas (union of keys, sorted).
+  for (k in sort(unique(c(names(today$stats), names(prev$stats))))) {
+    label <- sub("_mean$", " mean", sub("_median$", " median", k))
+    L <- c(L, sprintf("- %s: %s %s", label, today$stats[[k]] %||% "n/a",
+                      .fmt_delta(today$stats[[k]], prev$stats[[k]])))
+  }
+  # Per-table row-count deltas.
+  L <- c(L, "- Table row counts:")
+  for (t in sort(unique(c(names(today$tables), names(prev$tables))))) {
+    L <- c(L, sprintf("  - %s: %s %s", t, today$tables[[t]] %||% "n/a",
+                      .fmt_delta(today$tables[[t]], prev$tables[[t]])))
+  }
+  # Changed-package list, capped.
+  n <- length(changed_pkgs)
+  if (n == 0L) {
+    L <- c(L, "- Newly or re-analyzed packages (0): none")
+  } else {
+    shown <- head(sort(changed_pkgs), cap)
+    L <- c(L, sprintf("- Newly or re-analyzed packages (%d shown of %d):", length(shown), n),
+           sprintf("  - %s", paste(shown, collapse = ", ")))
+  }
+  paste(L, collapse = "\n")
+}
+
+#' Render the full release notes for a DB.
+#'
+#' @param manifest A manifest list as produced by build_manifest().
+#' @param changelog_md The markdown string returned by build_changelog().
+#' @param title Release title, rendered as the top-level heading.
+#' @return Character vector of markdown lines.
+render_release_notes <- function(manifest, changelog_md, title) {
+  c(
+    sprintf("# %s", title), "",
+    sprintf("- DB: `%s` (%s bytes)", manifest$db_filename, format(manifest$db_bytes, big.mark = ",")),
+    sprintf("- Generated: %s", manifest$generated_at),
+    sprintf("- Fingerprint: `%s`", manifest$fingerprint),
+    sprintf("- Packages: %s   Versions: %s", manifest$n_packages, manifest$n_versions),
+    sprintf("- Bootstrap: %s/%s analyzed (%s remaining, complete=%s)",
+            manifest$bootstrap$n_analyzed,
+            manifest$bootstrap$n_universe %||% "?",
+            manifest$bootstrap$n_remaining %||% "?",
+            tolower(as.character(manifest$bootstrap$bootstrap_complete))),
+    "",
+    changelog_md, ""
+  )
+}
+
 #' Compute a SHA-256 fingerprint over the current package:version set in the DB.
 #'
 #' Queries only the two key columns (result bounded to O(n_packages)) and
