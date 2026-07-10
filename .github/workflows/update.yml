@@ -82,6 +82,13 @@ jobs:
             gh release download "$DATA_TAG" --pattern manifest.json --dir out 2>/dev/null || true
             [ -f out/manifest.json ] && mv out/manifest.json out/prev-data-manifest.json || true
           fi
+
+          # Snapshot the pre-run package set so the release notes can tag
+          # each changed package as new-to-the-catalog vs updated. Always
+          # write the file (empty when there is no prior code DB) so the
+          # renderer never has to special-case its absence.
+          sqlite3 out/bioc-code-metrics.db "SELECT DISTINCT package FROM bioc_code_summary" > out/seed-packages.txt 2>/dev/null || : > out/seed-packages.txt
+
           echo "PREV_CODE_TAG=${CODE_TAG}" >> "$GITHUB_ENV"
           echo "PREV_DATA_TAG=${DATA_TAG}" >> "$GITHUB_ENV"
           ls -la out || true

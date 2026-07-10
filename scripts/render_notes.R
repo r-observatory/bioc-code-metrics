@@ -5,18 +5,26 @@
 
 #' Render out/release-notes-code.md and out/release-notes-data.md.
 #'
-#' Reads code-manifest.json and data-manifest.json (and, when a prior dated
-#' tag is supplied and the file is present, prev-code-manifest.json /
-#' prev-data-manifest.json) from out_dir, along with the accumulated
-#' changed-packages.txt, and writes the two rendered notes files back into
-#' out_dir.
+#' Reads code-manifest.json and data-manifest.json from out_dir, along with
+#' the accumulated changed-packages.txt and the seed-packages.txt snapshot
+#' (the prior release's package set, written by the workflow before the
+#' shard loop), opens the code and dataset databases read-only, and builds
+#' one rich notes body via build_release_notes(): a plain-language headline,
+#' a table of this release's changed packages with their real metrics, and
+#' a compact catalog summary. The same body is written to both notes files,
+#' since both the code and dataset releases describe the same run.
 #'
-#' @param out_dir Directory holding the manifests and changed-packages.txt;
-#'   also where the two release-notes-*.md files are written.
-#' @param prev_code_tag Dated tag of the prior code release (e.g.
-#'   "code-2026-07-09"), or NULL/"" for the first dated release of the series.
-#' @param prev_data_tag Same, for the data series.
-#' @param title_prefix Prefix used to build each release's title heading.
+#' prev_code_tag/prev_data_tag/title_prefix are accepted for call-site
+#' compatibility (the workflow still passes them) but no longer affect the
+#' rendered content: the new format has no delta-from-previous section and
+#' no top-level title heading (the GitHub release title already carries it).
+#'
+#' @param out_dir Directory holding the manifests, changed-packages.txt,
+#'   seed-packages.txt, and the two databases; also where the two
+#'   release-notes-*.md files are written.
+#' @param prev_code_tag Unused; retained for signature compatibility.
+#' @param prev_data_tag Unused; retained for signature compatibility.
+#' @param title_prefix Unused; retained for signature compatibility.
 #' @return Invisibly NULL.
 render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
                          title_prefix = "Bioconductor") {
@@ -24,18 +32,32 @@ render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
   if (identical(prev_data_tag, "")) prev_data_tag <- NULL
 
   changed <- read_changed_packages(file.path(out_dir, "changed-packages.txt"))
-  one <- function(series, prev_tag, title) {
-    m <- jsonlite::fromJSON(file.path(out_dir, sprintf("%s-manifest.json", series)))
-    prev_path <- file.path(out_dir, sprintf("prev-%s-manifest.json", series))
-    prev <- if (!is.null(prev_tag) && file.exists(prev_path)) {
-      p <- jsonlite::fromJSON(prev_path); p$dated_tag <- prev_tag; p
-    } else NULL
-    cl <- build_changelog(m, prev, changed, cap = 25L)
-    notes <- render_release_notes(m, cl, title)
-    writeLines(notes, file.path(out_dir, sprintf("release-notes-%s.md", series)))
+  seed    <- read_changed_packages(file.path(out_dir, "seed-packages.txt"))
+
+  code_manifest <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"))
+  data_manifest <- jsonlite::fromJSON(file.path(out_dir, "data-manifest.json"))
+
+  code_path <- file.path(out_dir, DB_FILENAME)
+  data_path <- file.path(out_dir, DATA_DB_FILENAME)
+
+  code_con <- NULL
+  data_con <- NULL
+  if (file.exists(code_path)) {
+    code_con <- DBI::dbConnect(RSQLite::SQLite(), code_path, flags = RSQLite::SQLITE_RO)
   }
-  one("code", prev_code_tag, sprintf("%s Code Metrics", title_prefix))
-  one("data", prev_data_tag, sprintf("%s Data Metrics", title_prefix))
+  if (file.exists(data_path)) {
+    data_con <- DBI::dbConnect(RSQLite::SQLite(), data_path, flags = RSQLite::SQLITE_RO)
+  }
+  on.exit({
+    if (!is.null(code_con)) DBI::dbDisconnect(code_con)
+    if (!is.null(data_con)) DBI::dbDisconnect(data_con)
+  }, add = TRUE)
+
+  notes <- build_release_notes(code_manifest, data_manifest, changed, seed,
+                               code_con, data_con)
+
+  writeLines(notes, file.path(out_dir, "release-notes-code.md"))
+  writeLines(notes, file.path(out_dir, "release-notes-data.md"))
   invisible(NULL)
 }
 

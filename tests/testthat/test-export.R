@@ -505,3 +505,18 @@ test_that("db_fingerprint on empty DB returns a valid SHA-256 hex string", {
   expect_equal(nchar(fp), 64L)
   expect_true(grepl("^[0-9a-f]{64}$", fp))
 })
+
+# ---------------------------------------------------------------------------
+# record_changed_packages / read_changed_packages
+# ---------------------------------------------------------------------------
+
+test_that("record/read changed packages unions and dedupes", {
+  p <- withr::local_tempfile()
+  record_changed_packages(p, c("b", "a"))
+  record_changed_packages(p, c("a", "c"))
+  expect_identical(read_changed_packages(p), c("a", "b", "c"))
+})
+
+test_that("read_changed_packages returns empty when absent", {
+  expect_identical(read_changed_packages(tempfile()), character(0L))
+})
