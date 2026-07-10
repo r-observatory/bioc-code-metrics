@@ -313,6 +313,17 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Open (or create) the dataset SQLite database, ensuring the four normalized
+#' dataset tables exist. Mirrors open_or_init_db() but for the data series.
+#'
+#' @param path File path for the dataset SQLite database.
+#' @return An open DBI connection. Caller must dbDisconnect().
+open_or_init_data_db <- function(path) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  .ensure_dataset_tables(con)
+  con
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
 #' If the file does not yet exist it is created. The three non-summary tables
@@ -452,8 +463,7 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
-                         functions_df = NULL, edges_df = NULL,
-                         datasets_df = NULL) {
+                         functions_df = NULL, edges_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -475,7 +485,6 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     .delete_by_package(con, "bioc_api_history",  pkgs)
     if (!is.null(functions_df)) .delete_by_package(con, "bioc_functions",  pkgs)
     if (!is.null(edges_df))     .delete_by_package(con, "bioc_call_edges", pkgs)
-    # dataset tables are wiped inside .write_datasets_normalized (children first)
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
@@ -517,10 +526,27 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
-    .write_datasets_normalized(con, datasets_df, pkgs)
-    .gc_dataset_contents(con)
   })
 
+  invisible(NULL)
+}
+
+#' Upsert one shard's dataset rows into the dataset database in-place.
+#'
+#' Runs the normalized-dataset write and the content GC inside one transaction
+#' on the dataset connection. Separated from upsert_shard so the code and
+#' dataset tables live in different files.
+#'
+#' @param data_con    Open DBI connection from open_or_init_data_db().
+#' @param datasets_df  Per-(package, version, dataset) rows, or NULL.
+#' @param pkgs         Character vector of packages written this shard.
+#' @return invisible(NULL)
+upsert_datasets <- function(data_con, datasets_df, pkgs) {
+  pkgs <- unique(as.character(pkgs))
+  DBI::dbWithTransaction(data_con, {
+    .write_datasets_normalized(data_con, datasets_df, pkgs)
+    .gc_dataset_contents(data_con)
+  })
   invisible(NULL)
 }
 
