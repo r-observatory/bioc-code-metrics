@@ -897,10 +897,14 @@ format_bytes <- function(n) {
             format(pct, trim = TRUE), .fmt_n(bs$n_remaining))
   }
 
+  new_word <- if (isTRUE(n_new == 1L)) "package" else "packages"
+  pkg_word <- if (isTRUE(as.numeric(code_manifest$n_packages) == 1)) "package" else "packages"
+  ver_word <- if (isTRUE(as.numeric(code_manifest$n_versions) == 1)) "version" else "versions"
   sprintf(
-    "%s packages new to the catalog, %s updated. Now tracking %s packages across %s versions.%s",
-    .fmt_n(n_new), .fmt_n(n_updated),
-    .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions),
+    "%s %s new to the catalog, %s updated. Now tracking %s %s across %s %s.%s",
+    .fmt_n(n_new), new_word, .fmt_n(n_updated),
+    .fmt_n(code_manifest$n_packages), pkg_word,
+    .fmt_n(code_manifest$n_versions), ver_word,
     bootstrap_clause)
 }
 

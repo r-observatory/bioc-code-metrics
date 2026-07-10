@@ -83,7 +83,7 @@ test_that("render_notes renders the headline, per-package table, catalog and foo
 
   # Headline: 1 new (DESeq2, not in seed-packages.txt), 1 updated (limma).
   expect_true(any(grepl(
-    "^1 packages new to the catalog, 1 updated\\. Now tracking 1,500 packages across 5,000 versions\\.",
+    "^1 package new to the catalog, 1 updated\\. Now tracking 1,500 packages across 5,000 versions\\.",
     code_md)))
   expect_true(any(grepl("Bootstrap 50% complete \\(1,000 remaining\\)\\.", code_md)))
 
