@@ -682,98 +682,6 @@ read_changed_packages <- function(path) {
   x[nzchar(x)]
 }
 
-#' Format a numeric delta as "(+N)"/"(-N)"; "(n/a)" when either side is
-#' missing so an unmeasurable quantity is never rendered as a fabricated 0.
-#'
-#' @param cur  Current value, or NULL/length-0 if unmeasured.
-#' @param prev Previous value, or NULL/length-0 if unmeasured.
-#' @return A one-line string.
-.fmt_delta <- function(cur, prev) {
-  if (is.null(cur) || is.null(prev) || length(cur) == 0L || length(prev) == 0L) return("(n/a)")
-  d <- cur - prev
-  sprintf("(%s%s)", if (d >= 0) "+" else "-", format(abs(d), trim = TRUE))
-}
-
-#' Build the "Changes since <prev>" markdown section.
-#'
-#' Every number rendered comes from `today`/`prev` (already-parsed manifests)
-#' or `changed_pkgs`; nothing is invented. A stat/table present on only one
-#' side prints its known value (or "n/a") with an "(n/a)" delta rather than a
-#' misleading "+N"/"-N".
-#'
-#' @param today  Manifest list (already-parsed) for this release.
-#' @param prev   Manifest list for the previous dated release, or NULL for
-#'   the first dated release of a series.
-#' @param changed_pkgs Character vector of packages touched this run.
-#' @param cap    Max packages listed (default 25).
-#' @return A single markdown string.
-build_changelog <- function(today, prev, changed_pkgs, cap = 25L) {
-  L <- character(0L)
-  if (is.null(prev)) {
-    L <- c(L, "## Changes since (first dated release)", "",
-           "Initial dated release; no prior snapshot to diff.", "",
-           sprintf("- Packages: %s", today$n_packages),
-           sprintf("- Versions: %s", today$n_versions),
-           sprintf("- DB size: %s bytes", format(today$db_bytes, big.mark = ",")))
-    return(paste(L, collapse = "\n"))
-  }
-  # today$series is always populated by build_manifest(); the "release"
-  # fallback only guards a directly-constructed today list in tests. Either
-  # way sprintf() must never receive a NULL/length-0 argument here, or the
-  # whole heading line silently vanishes from L.
-  prev_tag <- prev$dated_tag %||% sprintf("%s-<prev>", today$series %||% "release")
-  L <- c(L, sprintf("## Changes since %s", prev_tag), "",
-    sprintf("- Packages: %s %s", today$n_packages, .fmt_delta(today$n_packages, prev$n_packages)),
-    sprintf("- Versions: %s %s", today$n_versions, .fmt_delta(today$n_versions, prev$n_versions)),
-    sprintf("- DB size: %s bytes %s", format(today$db_bytes, big.mark = ","),
-            .fmt_delta(today$db_bytes, prev$db_bytes)))
-  # Stats deltas (union of keys, sorted).
-  for (k in sort(unique(c(names(today$stats), names(prev$stats))))) {
-    label <- sub("_mean$", " mean", sub("_median$", " median", k))
-    L <- c(L, sprintf("- %s: %s %s", label, today$stats[[k]] %||% "n/a",
-                      .fmt_delta(today$stats[[k]], prev$stats[[k]])))
-  }
-  # Per-table row-count deltas.
-  L <- c(L, "- Table row counts:")
-  for (t in sort(unique(c(names(today$tables), names(prev$tables))))) {
-    L <- c(L, sprintf("  - %s: %s %s", t, today$tables[[t]] %||% "n/a",
-                      .fmt_delta(today$tables[[t]], prev$tables[[t]])))
-  }
-  # Changed-package list, capped.
-  n <- length(changed_pkgs)
-  if (n == 0L) {
-    L <- c(L, "- Newly or re-analyzed packages (0): none")
-  } else {
-    shown <- head(sort(changed_pkgs), cap)
-    L <- c(L, sprintf("- Newly or re-analyzed packages (%d shown of %d):", length(shown), n),
-           sprintf("  - %s", paste(shown, collapse = ", ")))
-  }
-  paste(L, collapse = "\n")
-}
-
-#' Render the full release notes for a DB.
-#'
-#' @param manifest A manifest list as produced by build_manifest().
-#' @param changelog_md The markdown string returned by build_changelog().
-#' @param title Release title, rendered as the top-level heading.
-#' @return Character vector of markdown lines.
-render_release_notes <- function(manifest, changelog_md, title) {
-  c(
-    sprintf("# %s", title), "",
-    sprintf("- DB: `%s` (%s bytes)", manifest$db_filename, format(manifest$db_bytes, big.mark = ",")),
-    sprintf("- Generated: %s", manifest$generated_at),
-    sprintf("- Fingerprint: `%s`", manifest$fingerprint),
-    sprintf("- Packages: %s   Versions: %s", manifest$n_packages, manifest$n_versions),
-    sprintf("- Bootstrap: %s/%s analyzed (%s remaining, complete=%s)",
-            manifest$bootstrap$n_analyzed,
-            manifest$bootstrap$n_universe %||% "?",
-            manifest$bootstrap$n_remaining %||% "?",
-            tolower(as.character(manifest$bootstrap$bootstrap_complete))),
-    "",
-    changelog_md, ""
-  )
-}
-
 #' Compute a SHA-256 fingerprint over the current package:version set in the DB.
 #'
 #' Queries only the two key columns (result bounded to O(n_packages)) and
@@ -796,9 +704,30 @@ db_fingerprint <- function(con) {
 # ---------------------------------------------------------------------------
 # Rich release notes (headline + per-package metrics table + catalog summary)
 # ---------------------------------------------------------------------------
-# build_changelog()/render_release_notes() above remain in place (and remain
-# directly unit tested) but are no longer wired into render_notes(); the
-# functions below replace them for that purpose.
+
+#' Render a byte count as a compact human-readable string.
+#'
+#' Bytes below 1024 render as "N bytes"; above that, KB/MB/GB in powers of
+#' 1024, whole numbers for KB and MB, one decimal place for GB. NULL/NA (an
+#' unmeasured size) renders as "n/a", never a fabricated 0.
+#'
+#' @param n A single byte count (numeric), or NULL/NA.
+#' @return A one-line string, e.g. "870 MB", "1.4 GB", "235 KB", "512 bytes".
+format_bytes <- function(n) {
+  if (is.null(n) || length(n) == 0L || is.na(n)) return("n/a")
+  n <- as.numeric(n)
+  # Round half up for the whole-number units so an exact x.5 boundary
+  # (e.g. 240128 / 1024 = 234.5) matches everyday expectation rather than
+  # R's round-half-to-even default (which would report 234 KB).
+  half_up <- function(x) floor(x + 0.5)
+  if (n < 1024)  return(sprintf("%d bytes", as.integer(half_up(n))))
+  kb <- n / 1024
+  if (kb < 1024) return(sprintf("%d KB", as.integer(half_up(kb))))
+  mb <- kb / 1024
+  if (mb < 1024) return(sprintf("%d MB", as.integer(half_up(mb))))
+  gb <- mb / 1024
+  sprintf("%.1f GB", gb)
+}
 
 #' Fetch all rows for a set of packages from one table, chunking IN-lists to
 #' <= 900 params so a large changed-package set never exceeds SQLite's
@@ -1052,6 +981,8 @@ db_fingerprint <- function(con) {
 
 #' Render the "## Catalog at a glance" section straight from the two
 #' already-read manifests; nothing here is recomputed from the databases.
+#' The code and data DB sizes are shown human-readable via format_bytes()
+#' (never as raw byte counts).
 #'
 #' @param code_manifest Parsed code-manifest.json (list).
 #' @param data_manifest Parsed data-manifest.json (list).
@@ -1065,7 +996,9 @@ db_fingerprint <- function(con) {
     sprintf("- %s packages, %s versions, %s functions",
             .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions), .fmt_n(f)),
     sprintf("- R code: median %s LOC per package", .fmt_n(median_loc)),
-    sprintf("- %s datasets across %s packages", .fmt_n(d), .fmt_n(data_manifest$n_packages)))
+    sprintf("- %s datasets across %s packages", .fmt_n(d), .fmt_n(data_manifest$n_packages)),
+    sprintf("- Databases: code %s, data %s",
+            format_bytes(code_manifest$db_bytes), format_bytes(data_manifest$db_bytes)))
 }
 
 #' Build the full release notes body: headline paragraph, per-package
