@@ -890,11 +890,24 @@ format_bytes <- function(n) {
   } else if (isTRUE(bs$bootstrap_complete)) {
     " Bootstrap complete."
   } else {
-    n_universe <- as.numeric(bs$n_universe)
-    n_analyzed <- as.numeric(bs$n_analyzed %||% 0)
-    pct <- if (isTRUE(n_universe == 0)) 0 else round(100 * n_analyzed / n_universe)
-    sprintf(" Bootstrap %s%% complete (%s remaining).",
-            format(pct, trim = TRUE), .fmt_n(bs$n_remaining))
+    n_universe  <- as.numeric(bs$n_universe)
+    n_remaining <- as.numeric(bs$n_remaining %||% 0)
+    if (length(n_remaining) == 0L || is.na(n_remaining) || n_remaining < 0) {
+      n_remaining <- 0
+    }
+    if (is.na(n_universe) || n_universe <= 0) {
+      # Degenerate/empty universe: no meaningful progress to report.
+      ""
+    } else {
+      # Progress and the remaining count share one denominator (n_universe), so
+      # the percentage reaches 100 only when nothing remains; floor() never
+      # rounds up to 100 while work is queued. "processed" (not "complete")
+      # keeps the completion wording in the bootstrap_complete branch only.
+      n_remaining <- min(n_remaining, n_universe)
+      pct <- floor(100 * (n_universe - n_remaining) / n_universe)
+      sprintf(" Bootstrap %s%% processed (%s remaining).",
+              format(pct, trim = TRUE), .fmt_n(n_remaining))
+    }
   }
 
   new_word <- if (isTRUE(n_new == 1L)) "package" else "packages"

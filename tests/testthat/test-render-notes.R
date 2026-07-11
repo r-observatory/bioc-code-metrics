@@ -85,7 +85,7 @@ test_that("render_notes renders the headline, per-package table, catalog and foo
   expect_true(any(grepl(
     "^1 package new to the catalog, 1 updated\\. Now tracking 1,500 packages across 5,000 versions\\.",
     code_md)))
-  expect_true(any(grepl("Bootstrap 50% complete \\(1,000 remaining\\)\\.", code_md)))
+  expect_true(any(grepl("Bootstrap 50% processed \\(1,000 remaining\\)\\.", code_md)))
 
   # Table: limma is tagged updated (no "(new)"); DESeq2 is tagged new.
   expect_true(any(grepl("^\\| DESeq2 \\| 1\\.46\\.0 \\(new\\) \\| 42,110 \\| 890 \\| 512 \\| 11 \\| 0 \\|$", code_md)))
