@@ -994,14 +994,19 @@ format_bytes <- function(n) {
 .build_catalog_section <- function(code_manifest, data_manifest) {
   f          <- code_manifest$tables[["bioc_functions"]]
   median_loc <- code_manifest$stats[["loc_r_median"]]
-  d          <- data_manifest$n_versions %||% data_manifest$tables[["bioc_datasets"]]
+  # Count distinct datasets (the bioc_datasets table), not dataset *versions*
+  # (n_versions counts bioc_dataset_versions). Fall back to n_versions only if
+  # the table count is somehow absent.
+  d          <- data_manifest$tables[["bioc_datasets"]] %||% data_manifest$n_versions
 
   c("## Catalog at a glance", "",
     sprintf("- %s packages, %s versions, %s functions",
             .fmt_n(code_manifest$n_packages), .fmt_n(code_manifest$n_versions), .fmt_n(f)),
     sprintf("- R code: median %s LOC per package", .fmt_n(median_loc)),
     sprintf("- %s datasets across %s packages", .fmt_n(d), .fmt_n(data_manifest$n_packages)),
-    sprintf("- Databases: code %s, data %s",
+    # The code and dataset databases ship as two separate releases, so state
+    # both sizes and say so -- the same notes body is attached to each release.
+    sprintf("- Databases: code metrics %s and dataset metrics %s (published as separate code and data releases)",
             format_bytes(code_manifest$db_bytes), format_bytes(data_manifest$db_bytes)))
 }
 

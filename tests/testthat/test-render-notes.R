@@ -95,7 +95,13 @@ test_that("render_notes renders the headline, per-package table, catalog and foo
   expect_true(any(grepl("^## Catalog at a glance$", code_md)))
   expect_true(any(grepl("1,500 packages, 5,000 versions, 45,000 functions", code_md)))
   expect_true(any(grepl("median 850 LOC per package", code_md)))
-  expect_true(any(grepl("12,000 datasets across 3,000 packages", code_md)))
+  # Distinct datasets (bioc_datasets = 9,000), NOT dataset versions (n_versions = 12,000).
+  expect_true(any(grepl("9,000 datasets across 3,000 packages", code_md)))
+  expect_false(any(grepl("12,000 datasets", code_md)))
+  # Both DB sizes are named and flagged as separate releases (98 KB / 20 KB here).
+  expect_true(any(grepl(
+    "Databases: code metrics 98 KB and dataset metrics 20 KB \\(published as separate code and data releases\\)",
+    code_md)))
 
   # Footer: short fingerprint only, no db bytes/full fingerprint/timestamp.
   expect_true(any(grepl("^<sub>fingerprint abcdef12 - full manifest in the release assets</sub>$", code_md)))
