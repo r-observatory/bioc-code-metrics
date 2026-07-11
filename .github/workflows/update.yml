@@ -60,7 +60,7 @@ jobs:
       - name: Run unit tests
         run: Rscript tests/testthat.R
 
-      - name: Download the latest dated databases
+      - name: Download the latest databases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -68,18 +68,27 @@ jobs:
           mkdir -p out
           latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
 
-          CODE_TAG=$(latest_tag code)
-          DATA_TAG=$(latest_tag data)
-          echo "prior code tag: ${CODE_TAG:-none}; prior data tag: ${DATA_TAG:-none}"
+          # A single consolidated release per day (metrics-YYYY-MM-DD) carries both
+          # the code and data DBs as assets. Fall back to the legacy split code-/data-
+          # tags on the first run after the consolidation so the in-flight bootstrap
+          # (the prior code DB) is not lost.
+          METRICS_TAG=$(latest_tag metrics)
+          CODE_SRC="${METRICS_TAG:-$(latest_tag code)}"
+          DATA_SRC="${METRICS_TAG:-$(latest_tag data)}"
+          echo "prior metrics tag: ${METRICS_TAG:-none}; code src: ${CODE_SRC:-none}; data src: ${DATA_SRC:-none}"
 
-          if [ -n "$CODE_TAG" ]; then
-            gh release download "$CODE_TAG" --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
-            gh release download "$CODE_TAG" --pattern manifest.json --dir out 2>/dev/null || true
+          if [ -n "$CODE_SRC" ]; then
+            gh release download "$CODE_SRC" --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
+            gh release download "$CODE_SRC" --pattern code-manifest.json --dir out 2>/dev/null \
+              || gh release download "$CODE_SRC" --pattern manifest.json --dir out 2>/dev/null || true
+            [ -f out/code-manifest.json ] && mv out/code-manifest.json out/prev-code-manifest.json || true
             [ -f out/manifest.json ] && mv out/manifest.json out/prev-code-manifest.json || true
           fi
-          if [ -n "$DATA_TAG" ]; then
-            gh release download "$DATA_TAG" --pattern bioc-data-metrics.db --dir out 2>/dev/null || true
-            gh release download "$DATA_TAG" --pattern manifest.json --dir out 2>/dev/null || true
+          if [ -n "$DATA_SRC" ]; then
+            gh release download "$DATA_SRC" --pattern bioc-data-metrics.db --dir out 2>/dev/null || true
+            gh release download "$DATA_SRC" --pattern data-manifest.json --dir out 2>/dev/null \
+              || gh release download "$DATA_SRC" --pattern manifest.json --dir out 2>/dev/null || true
+            [ -f out/data-manifest.json ] && mv out/data-manifest.json out/prev-data-manifest.json || true
             [ -f out/manifest.json ] && mv out/manifest.json out/prev-data-manifest.json || true
           fi
 
@@ -89,8 +98,8 @@ jobs:
           # renderer never has to special-case its absence.
           sqlite3 out/bioc-code-metrics.db "SELECT DISTINCT package FROM bioc_code_summary" > out/seed-packages.txt 2>/dev/null || : > out/seed-packages.txt
 
-          echo "PREV_CODE_TAG=${CODE_TAG}" >> "$GITHUB_ENV"
-          echo "PREV_DATA_TAG=${DATA_TAG}" >> "$GITHUB_ENV"
+          echo "PREV_CODE_TAG=${CODE_SRC}" >> "$GITHUB_ENV"
+          echo "PREV_DATA_TAG=${DATA_SRC}" >> "$GITHUB_ENV"
           ls -la out || true
 
       - name: Analyze shards and publish after each
@@ -104,25 +113,30 @@ jobs:
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
           TODAY="$(date -u +%Y-%m-%d)"
-          CODE_TAG="code-${TODAY}"
-          DATA_TAG="data-${TODAY}"
+          METRICS_TAG="metrics-${TODAY}"
           MAX_BYTES=2040109465
 
-          publish() {  # $1=tag $2=db-file $3=series $4=notes-file
-            local bytes; bytes=$(stat -c%s "out/$2")
-            if [ "$bytes" -gt "$MAX_BYTES" ]; then
-              echo "::error::out/$2 is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish $1."
-              return 1
-            fi
-            cp "out/$3-manifest.json" out/manifest.json
-            local latest_flag="--latest=false"; [ "$3" = "code" ] && latest_flag="--latest"
-            if gh release view "$1" >/dev/null 2>&1; then
+          # Publish ONE dated release carrying both the code and data metrics DBs
+          # (plus both manifests) as assets, with a single notes body. render_notes.R
+          # writes the same catalog to release-notes-code.md/-data.md, so either is
+          # the combined body; we attach the code one.
+          publish_metrics() {
+            local f bytes
+            for f in bioc-code-metrics.db bioc-data-metrics.db; do
+              bytes=$(stat -c%s "out/$f")
+              if [ "$bytes" -gt "$MAX_BYTES" ]; then
+                echo "::error::out/$f is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish ${METRICS_TAG}."
+                return 1
+              fi
+            done
+            local assets=(out/bioc-code-metrics.db out/bioc-data-metrics.db out/code-manifest.json out/data-manifest.json)
+            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
               # Today's release already exists (an earlier shard this run): clobber ONLY today.
-              gh release upload "$1" "out/$2" out/manifest.json --clobber
-              gh release edit "$1" --notes-file "out/$4"
+              gh release upload "$METRICS_TAG" "${assets[@]}" --clobber
+              gh release edit "$METRICS_TAG" --notes-file out/release-notes-code.md
             else
-              gh release create "$1" "out/$2" out/manifest.json \
-                --title "Bioconductor ${3^} Metrics - ${TODAY}" --notes-file "out/$4" "$latest_flag"
+              gh release create "$METRICS_TAG" "${assets[@]}" \
+                --title "Bioconductor Metrics - ${TODAY}" --notes-file out/release-notes-code.md --latest
             fi
           }
 
@@ -139,8 +153,7 @@ jobs:
 
             if [ "$CHANGED" = "true" ]; then
               Rscript scripts/render_notes.R out/
-              publish "$CODE_TAG" bioc-code-metrics.db code release-notes-code.md || exit 1
-              publish "$DATA_TAG" bioc-data-metrics.db data release-notes-data.md || exit 1
+              publish_metrics || exit 1
             fi
 
             if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
@@ -157,13 +170,14 @@ jobs:
           KEEP: "30"
         run: |
           set -euo pipefail
-          for series in code data; do
-            gh release list --limit 1000 --json tagName -q '.[].tagName' \
-              | { grep "^${series}-" || true; } \
-              | Rscript scripts/prune.R \
-              | while read -r tag; do
-                  [ -n "$tag" ] || continue
-                  echo "pruning $tag"
-                  gh release delete "$tag" --yes --cleanup-tag || true
-                done
-          done
+          # Prune only the consolidated metrics- series. Legacy code-/data- releases
+          # are left untouched here and removed by a one-time cleanup once the new
+          # scheme is confirmed.
+          gh release list --limit 1000 --json tagName -q '.[].tagName' \
+            | { grep "^metrics-" || true; } \
+            | Rscript scripts/prune.R \
+            | while read -r tag; do
+                [ -n "$tag" ] || continue
+                echo "pruning $tag"
+                gh release delete "$tag" --yes --cleanup-tag || true
+              done
