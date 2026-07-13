@@ -55,3 +55,7 @@ packages have release-branch repositories; data packages are not covered. Set
 Each package is cloned, analyzed across all its release branches, and deleted
 before the next one, so peak disk stays small. Metrics are computed from git and
 the package source; there is no external `cloc` dependency.
+
+## Feedback
+
+Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.
