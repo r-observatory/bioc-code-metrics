@@ -67,7 +67,7 @@
 }
 
 # ---------------------------------------------------------------------------
-# analyze_package: detail is stored for the latest version only
+# analyze_package: detail is stored per version
 # ---------------------------------------------------------------------------
 
 test_that("analyze_package returns functions/edges frames", {
@@ -90,7 +90,7 @@ test_that("analyze_package returns functions/edges frames", {
                    c("package", "version", "graph", "from", "to"))
 })
 
-test_that("analyze_package stores detail only for the latest version", {
+test_that("analyze_package stores detail for all versions", {
   skip_on_os("windows")
   stub_dir <- tempfile("ccm_stub_")
   dir.create(stub_dir)
@@ -107,23 +107,21 @@ test_that("analyze_package stores detail only for the latest version", {
   # Summary still has one row per version.
   expect_equal(nrow(result$summary), 2L)
 
-  # The stub emits the same fixture for BOTH versions, but only the latest
-  # version's detail is kept.
-  expect_true(nrow(result$functions) > 0L)
-  expect_equal(unique(result$functions$version), "1.1")
+  # The stub emits the same fixture for BOTH versions; detail is now kept for
+  # every version, not just the latest.
+  expect_setequal(unique(result$functions$version), c("1.0", "1.1"))
   expect_equal(unique(result$functions$package), "mypkg")
-  expect_false(any(result$functions$version == "1.0"))
-  expect_equal(nrow(result$functions), 3L)
+  expect_equal(nrow(result$functions), 6L)   # 3 functions x 2 versions
 
-  expect_equal(unique(result$edges$version), "1.1")
-  expect_false(any(result$edges$version == "1.0"))
-  expect_equal(nrow(result$edges), 3L)
+  expect_setequal(unique(result$edges$version), c("1.0", "1.1"))
+  expect_equal(nrow(result$edges), 6L)        # 3 edges x 2 versions
 
-  # Honest NA survives the round trip: compiled function.
+  # Honest NA survives the round trip: compiled function, present in each version.
   nat <- result$functions[result$functions$name == "native_helper", ]
-  expect_true(is.na(nat$exported))
-  expect_true(is.na(nat$n_params))
-  expect_true(is.na(nat$cyclocomp))
+  expect_equal(nrow(nat), 2L)
+  expect_true(all(is.na(nat$exported)))
+  expect_true(all(is.na(nat$n_params)))
+  expect_true(all(is.na(nat$cyclocomp)))
 })
 
 test_that("analyze_package yields zero detail rows when no binary is available", {
@@ -228,8 +226,8 @@ test_that("upsert_shard replaces a package's detail rows across versions", {
                .empty_churn_df(), .empty_api_df(),
                .make_functions("pkgA", "1.0"), .make_edges("pkgA", "1.0"))
 
-  # Re-analysis: pkgA now latest 1.1. Detail is stored for 1.1 only; the old
-  # 1.0 detail rows must not linger (delete-by-package before append).
+  # Re-analysis: upsert with pkgA at 1.1 only. delete-by-package must drop the
+  # old 1.0 detail rows before appending, so no stale rows linger.
   upsert_shard(con, .mini_summary("pkgA", "1.1"),
                .empty_churn_df(), .empty_api_df(),
                .make_functions("pkgA", "1.1"), .make_edges("pkgA", "1.1"))

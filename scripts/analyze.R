@@ -393,9 +393,10 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$authors_added_later  <- NA_integer_
   summary_df$cold_removal_rate    <- NA_real_
   summary_df$deprecation_infrastructure_maturity <- NA_integer_
-  # detail_scanned: convergence marker for the detail backfill. Set only on the
-  # latest row (alongside latest_release_date) so the latest-row-scoped NULL
-  # check in .recollect_todo settles instead of re-flagging older rows forever.
+  # detail_scanned: convergence marker for the all-versions detail backfill. Set
+  # on EVERY row (detail is now stored per version), so the .recollect_todo NULL
+  # check re-flags a package while any row is unscanned and converges once a
+  # re-analysis marks them all.
   summary_df$detail_scanned       <- NA
   # datasets_scanned: convergence marker for the dataset backfill, distinct from
   # detail_scanned so packages scanned before the dataset reader existed (their
@@ -410,9 +411,10 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$authors_added_later[n]  <- authors_added_later_val
   summary_df$cold_removal_rate[n]    <- cold_removal_rate_val
   summary_df$deprecation_infrastructure_maturity[n] <- dep_maturity
-  # Set unconditionally whenever this code path finalizes the latest row, even
-  # for data-only packages with zero functions, so the backfill converges.
-  summary_df$detail_scanned[n]       <- TRUE
+  # detail_scanned on EVERY row (set unconditionally, even for data-only
+  # packages with zero functions) so the all-versions backfill converges.
+  # datasets_scanned stays latest-row-only (its backfill is latest-scoped).
+  summary_df$detail_scanned          <- TRUE
   summary_df$datasets_scanned[n]     <- TRUE
 
   summary_df
@@ -615,12 +617,12 @@ analyze_package <- function(repo_dir, package) {
         stringsAsFactors = FALSE
       )
 
-      # Detail is stored for the latest version only (last row, oldest-first
-      # ordering). Stamp with package + version; otherwise contribute no rows.
+      # Detail is stored for EVERY version (the analyzer already computes it per
+      # version above). Stamp with package + version; a version with no detail
+      # contributes no rows.
       is_latest <- (i == nrow(versions_df))
 
-      functions_row <- if (is_latest && !is.null(detail_fns) &&
-                           nrow(detail_fns) > 0L) {
+      functions_row <- if (!is.null(detail_fns) && nrow(detail_fns) > 0L) {
         data.frame(
           package   = package,
           version   = v,
@@ -638,8 +640,7 @@ analyze_package <- function(repo_dir, package) {
         .empty_functions_df()
       }
 
-      edges_row <- if (is_latest && !is.null(detail_eg) &&
-                       nrow(detail_eg) > 0L) {
+      edges_row <- if (!is.null(detail_eg) && nrow(detail_eg) > 0L) {
         data.frame(
           package = package,
           version = v,
