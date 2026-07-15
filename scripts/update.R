@@ -150,6 +150,25 @@ bioc_package_repos <- function() {
   )
 }
 
+#' Parse the current Bioconductor release ("X.Y") from config.yaml lines.
+#' Returns NA_character_ when no release_version line is present.
+.parse_bioc_release <- function(lines) {
+  line <- grep("^\\s*release_version:", lines, value = TRUE)
+  if (length(line) == 0L) return(NA_character_)
+  v <- sub('.*release_version:\\s*"?([0-9]+\\.[0-9]+)"?.*', "\\1", line[[1L]])
+  if (grepl("^[0-9]+\\.[0-9]+$", v)) v else NA_character_
+}
+
+#' The current Bioconductor release number (e.g. "3.23"), from the Bioconductor
+#' config. The analyzer stores each package's newest `version` as its max
+#' RELEASE_X_Y branch, so this is what a package's stored version must be
+#' compared against to decide if it is up to date. NA on failure, which makes
+#' the version check a safe no-op (no false re-flagging) rather than an error.
+.current_bioc_release <- function(url = "https://bioconductor.org/config.yaml") {
+  tryCatch(.parse_bioc_release(readLines(url, warn = FALSE)),
+           error = function(e) NA_character_)
+}
+
 default_io <- function() {
   list(
     package_list = function() {
@@ -158,9 +177,16 @@ default_io <- function() {
       tryCatch({
         repos <- bioc_package_repos()
         m <- available.packages(repos = repos)
+        # latest_version is the current BIOCONDUCTOR RELEASE (e.g. "3.23"), NOT
+        # the package's own DESCRIPTION version. The analyzer stores each
+        # package's newest `version` as its max RELEASE_X_Y branch, so the
+        # up-to-date check in run_update must compare against the release --
+        # comparing against the DESCRIPTION version makes every analyzed package
+        # look perpetually changed, so the bootstrap re-analyzes the same
+        # packages forever and never advances.
         df <- data.frame(
           package        = as.character(m[, "Package"]),
-          latest_version = as.character(m[, "Version"]),
+          latest_version = .current_bioc_release(),
           stringsAsFactors = FALSE,
           row.names        = NULL
         )

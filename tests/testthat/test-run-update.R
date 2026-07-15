@@ -368,3 +368,16 @@ test_that("transient failure that later succeeds resets the failure counter", {
   expect_true("pkgFlaky" %in% pkgs_db)      # package now in DB
   expect_equal(m2$permanent_failures, 0L)   # no permanent failures
 })
+
+# ---------------------------------------------------------------------------
+# .parse_bioc_release: the up-to-date check compares stored versions against
+# the current Bioconductor RELEASE, parsed from config.yaml.
+# ---------------------------------------------------------------------------
+
+test_that(".parse_bioc_release extracts release_version from config.yaml lines", {
+  lines <- c('release_version: "3.23"', 'devel_version: "3.24"', '  bioc_version: "3.23"')
+  expect_equal(.parse_bioc_release(lines), "3.23")
+  expect_equal(.parse_bioc_release(c("release_version: 3.20")), "3.20")   # unquoted
+  expect_true(is.na(.parse_bioc_release(c("devel_version: 3.24"))))       # no release line
+  expect_true(is.na(.parse_bioc_release(character(0))))                   # empty
+})
