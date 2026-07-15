@@ -303,13 +303,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # scheduled run finishes the one-time backfill and then reverts to just the
     # changed packages once none remain.
     backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs)
-    # And drain any packages whose latest-version row was stored before the
-    # per-function/per-edge detail scan (detail_scanned IS NULL on that row).
-    # Latest-row-scoped so it converges: a package re-analyzed once is marked and
-    # never re-flagged, even if it produced zero functions.
+    # And drain any package with a version row that predates all-versions detail
+    # (detail_scanned IS NULL on ANY row). Re-analyzing fills per-version detail
+    # and marks every row, so it converges; a package re-analyzed once is never
+    # re-flagged, even if some versions produced zero functions.
     detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
                                         sentinel = "detail_scanned",
-                                        latest_only = TRUE)
+                                        latest_only = FALSE)
     # And drain any package whose latest-version row predates the dataset reader
     # (datasets_scanned IS NULL), so bioc_datasets fills in without a manual
     # recollect. Also latest-row-scoped, so it converges once re-analyzed.

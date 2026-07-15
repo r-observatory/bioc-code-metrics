@@ -363,22 +363,13 @@ test_that("first_release_date and latest_release_date are correct", {
 # 8b. detail_scanned convergence marker
 # ---------------------------------------------------------------------------
 
-test_that("detail_scanned marks the latest row TRUE and leaves older rows NA", {
+test_that("detail_scanned marks every version row TRUE", {
+  # Detail is now stored for all versions, so the convergence marker rides on
+  # every row (not just the latest); the all-versions backfill re-flags a
+  # package while ANY row is NA and converges once all rows are set.
   res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
-  n   <- nrow(res)
-  expect_true(isTRUE(res$detail_scanned[n]))
-  for (i in seq_len(n - 1L)) {
-    expect_true(is.na(res$detail_scanned[i]))
-  }
-})
-
-test_that("detail_scanned rides on the same latest row as latest_release_date", {
-  res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
-  # The marker must sit on exactly the row db_analyzed_state keys on, so the
-  # latest-row-scoped backfill query converges.
-  marked <- which(!is.na(res$detail_scanned))
-  dated  <- which(!is.na(res$latest_release_date))
-  expect_equal(marked, dated)
+  expect_false(any(is.na(res$detail_scanned)))
+  expect_true(all(res$detail_scanned))
 })
 
 test_that("detail_scanned is set unconditionally for a single-version package", {
