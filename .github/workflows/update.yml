@@ -130,13 +130,17 @@ jobs:
               fi
             done
             local assets=(out/bioc-code-metrics.db out/bioc-data-metrics.db out/code-manifest.json out/data-manifest.json)
+            # Stamp the title with the publish time so a same-day clobber is
+            # visibly a fresh update (the dated tag stays daily for retention
+            # pruning; --clobber does not move the release's published timestamp).
+            local title="Bioconductor Metrics - ${TODAY} (updated $(date -u +'%H:%M') UTC)"
             if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
               # Today's release already exists (an earlier shard this run): clobber ONLY today.
               gh release upload "$METRICS_TAG" "${assets[@]}" --clobber
-              gh release edit "$METRICS_TAG" --notes-file out/release-notes-code.md
+              gh release edit "$METRICS_TAG" --title "$title" --notes-file out/release-notes-code.md
             else
               gh release create "$METRICS_TAG" "${assets[@]}" \
-                --title "Bioconductor Metrics - ${TODAY}" --notes-file out/release-notes-code.md --latest
+                --title "$title" --notes-file out/release-notes-code.md --latest
             fi
           }
 
