@@ -5,6 +5,12 @@ BIOC_GIT_BASE <- "https://github.com/bioc"
 PUBLISH_REPO  <- "r-observatory/bioc-code-metrics"
 DB_FILENAME   <- "bioc-code-metrics.db"
 DATA_DB_FILENAME <- "bioc-data-metrics.db"
+# Backoff between attempts at the bioconductor.org release lookup, in seconds;
+# one more attempt is made than there are waits. The first wait is small because
+# most failures are a one-off blip; the tail covers a real outage, of the kind
+# that served 504 for at least eight minutes on 2026-07-26.
+RELEASE_RETRY_WAITS_S <- c(5, 15, 30, 60, 120, 300, 600)
+
 SHARD_SIZE         <- 100L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"

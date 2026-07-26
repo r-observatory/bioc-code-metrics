@@ -572,9 +572,13 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
 #'   n_universe/n_remaining may be NULL.
 #' @return A named list matching the MANIFEST SCHEMA.
+#' @param last_changed ISO-8601 timestamp of the last run that actually moved the
+#'   data, or NULL when this run did. Kept separate from the generation time
+#'   because a run that finds nothing to do still needs to report that it ran.
 build_manifest <- function(con, series, repo, db_filename, db_bytes,
                            tables, fp_table, fp_cols, pkg_table, ver_table,
-                           stat_table, stat_cols, bootstrap) {
+                           stat_table, stat_cols, bootstrap,
+                           last_changed = NULL) {
   present <- DBI::dbListTables(con)
   count_tbl <- function(t) {
     if (!t %in% present) return(0L)
@@ -637,12 +641,21 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
     }
   }
 
+  now_iso <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+
   list(
     schema_version = 1L,
     series         = series,
     repo           = repo,
     db_filename    = db_filename,
-    generated_at   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    generated_at   = now_iso,
+    # last_checked answers "did this pipeline run", last_changed answers "did the
+    # data move". They diverge for months at a time here: the universe is keyed
+    # on the Bioconductor release, so between releases every daily run correctly
+    # finds nothing to do. Consumers that key freshness on last_changed would
+    # read that healthy silence as a dead pipeline.
+    last_checked   = now_iso,
+    last_changed   = last_changed %||% now_iso,
     db_bytes       = round(as.numeric(db_bytes)),
     fingerprint    = fingerprint,
     n_packages     = n_packages,

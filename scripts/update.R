@@ -159,14 +159,50 @@ bioc_package_repos <- function() {
   if (grepl("^[0-9]+\\.[0-9]+$", v)) v else NA_character_
 }
 
+#' Retry `fn` on error, sleeping RELEASE_RETRY_WAITS_S between attempts. One more
+#' attempt is made than there are waits, and the final attempt's error propagates.
+#' sleep and rand are injected so the suite asserts the schedule without waiting.
+with_retry <- function(fn, waits = RELEASE_RETRY_WAITS_S, sleep = Sys.sleep,
+                       rand = function() stats::runif(1, 1, 1.25)) {
+  for (w in waits) {
+    val <- tryCatch(fn(), error = function(e) e)
+    if (!inherits(val, "error")) return(val)
+    sleep(w * rand())
+  }
+  fn()
+}
+
 #' The current Bioconductor release number (e.g. "3.23"), from the Bioconductor
 #' config. The analyzer stores each package's newest `version` as its max
 #' RELEASE_X_Y branch, so this is what a package's stored version must be
 #' compared against to decide if it is up to date. NA on failure, which makes
 #' the version check a safe no-op (no false re-flagging) rather than an error.
-.current_bioc_release <- function(url = "https://bioconductor.org/config.yaml") {
-  tryCatch(.parse_bioc_release(readLines(url, warn = FALSE)),
-           error = function(e) NA_character_)
+#'
+#' That no-op is the right default but a dangerous silence: every analyzed
+#' package then looks current, which is indistinguishable in the log from a run
+#' that genuinely had nothing to do. On the day Bioconductor cuts a release, a
+#' fetch failure here would defer the entire update with nothing to show for it.
+#' So the lookup retries first, and announces itself when it still gives up.
+#' A config.yaml that arrives without a release_version line counts as a failed
+#' attempt too: a gateway error page parses to NA just as an outage does.
+.current_bioc_release <- function(url = "https://bioconductor.org/config.yaml",
+                                  read = function(u) readLines(u, warn = FALSE),
+                                  ...) {
+  attempt <- function() {
+    v <- .parse_bioc_release(read(url))
+    if (is.na(v)) stop("no release_version line in the response")
+    v
+  }
+  tryCatch(
+    with_retry(attempt, ...),
+    error = function(e) {
+      message(sprintf(paste("::warning::Bioconductor release lookup failed (%s): %s.",
+                            "Every analyzed package will be treated as up to date this run,",
+                            "so a new release will not be picked up until a later run",
+                            "reaches config.yaml."),
+                      url, conditionMessage(e)))
+      NA_character_
+    })
 }
 
 default_io <- function() {
@@ -472,12 +508,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Re-query permanent failures after this run (some may have just hit the limit).
   n_permanent_failures <- length(.permanent_failures(con))
 
-  prior_fp <- tryCatch({
+  prev_manifest <- tryCatch({
     prev_path <- file.path(out_dir, "prev-code-manifest.json")
     cur_path  <- file.path(out_dir, "code-manifest.json")
     src <- if (file.exists(prev_path)) prev_path else if (file.exists(cur_path)) cur_path else NULL
-    if (is.null(src)) NULL else jsonlite::fromJSON(src)[["fingerprint"]]
+    if (is.null(src)) NULL else jsonlite::fromJSON(src)
   }, error = function(e) NULL)
+  prior_fp <- prev_manifest[["fingerprint"]]
 
   # bootstrap_complete: no deferred packages remain AND DB covers the universe
   # minus permanently-failed packages.
@@ -524,6 +561,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete)
+
+  # When this run moved nothing, the moment the data last moved is whatever the
+  # previous manifest recorded. Carrying it forward is what lets last_checked
+  # advance every run without pretending the data is newer than it is. NULL
+  # (no previous manifest, or one predating these fields) means "now", which is
+  # correct for a first run and honest for the changeover.
+  last_changed <- if (changed) NULL else
+    (prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 
@@ -535,7 +580,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     fp_table = "bioc_code_summary", fp_cols = c("package", "version"),
     pkg_table = "bioc_code_summary", ver_table = "bioc_code_summary",
     stat_table = "bioc_code_summary", stat_cols = c("loc_r", "n_fns_r"),
-    bootstrap = bootstrap)
+    bootstrap = bootstrap, last_changed = last_changed)
 
   data_manifest <- build_manifest(
     data_con, series = "data", repo = PUBLISH_REPO, db_filename = DATA_DB_FILENAME,
@@ -544,7 +589,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
     pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
     stat_table = "bioc_dataset_contents", stat_cols = c("nrow", "ncol"),
-    bootstrap = bootstrap)
+    bootstrap = bootstrap, last_changed = last_changed)
 
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
