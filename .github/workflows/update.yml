@@ -144,7 +144,25 @@ jobs:
             fi
           }
 
+          # The universe is keyed on the Bioconductor RELEASE, which moves twice a
+          # year, so between releases every daily run correctly finds nothing to
+          # do and publishes nothing. Consumers that read freshness off the latest
+          # release would then watch this pipeline appear to die for months. Put
+          # the two small manifests back on the release that is already latest, so
+          # last_checked advances daily while last_changed stays at the moment the
+          # data really moved. No database is re-uploaded.
+          refresh_heartbeat() {
+            if [ -z "${PREV_CODE_TAG:-}" ]; then
+              echo "No prior release to carry a heartbeat; nothing to refresh."
+              return 0
+            fi
+            echo "Nothing published this run; refreshing the freshness manifests on ${PREV_CODE_TAG}."
+            gh release upload "$PREV_CODE_TAG" \
+              out/code-manifest.json out/data-manifest.json --clobber
+          }
+
           shard=0
+          published=0
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
@@ -158,6 +176,7 @@ jobs:
             if [ "$CHANGED" = "true" ]; then
               Rscript scripts/render_notes.R out/
               publish_metrics || exit 1
+              published=1
             fi
 
             if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
@@ -166,6 +185,22 @@ jobs:
             fi
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
           done
+
+          # A run that never reached Bioconductor comes back with an empty
+          # universe, and from there it is shaped exactly like a healthy
+          # months-of-silence run: nothing to analyze, nothing changed, nothing
+          # published, exit 0. available.packages() warns rather than errors when
+          # the repos are unreachable, so no error escapes to stop the run.
+          # Refreshing the freshness manifests here would report a pipeline that
+          # cannot see upstream as current, and leaving them stale is the only
+          # signal anything downstream would ever get.
+          N_UNIVERSE=$(jq -r '.n_universe // 0' out/run-status.json)
+          if [ "$N_UNIVERSE" -eq 0 ]; then
+            echo "::error::The Bioconductor package universe came back empty, so this run never reached upstream. Not refreshing the freshness manifests."
+            exit 1
+          fi
+
+          [ "$published" -eq 1 ] || refresh_heartbeat
 
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}
