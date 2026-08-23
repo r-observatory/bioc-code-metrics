@@ -567,3 +567,78 @@ test_that("a scanned row records which build scanned it and which generation it 
   expect_equal(unique(result$summary$analyzer_version), "0.4.0-test")
   expect_equal(unique(result$datasets$fp_algo_version), FP_ALGO_VERSION)
 })
+
+# --- the run has to record which build scanned its rows -----------------------
+# The stale-scan check reads bioc_code_summary.analyzer_version, and clears
+# every marker for as long as that column is absent. Nothing guarantees the
+# column ever arrives: it reaches the table only when the per-package summary
+# happens to carry it, which is a property of what analyze_package returned
+# rather than of the run. A run that writes rows without recording the build it
+# scanned under leaves the check with nothing to compare, so the clear repeats
+# on the next run, and the one after, and the whole universe is queued again
+# every time.
+
+.ds_run_io <- function() list(
+  package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
+                                       stringsAsFactors = FALSE),
+  clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
+
+# analyze_package without the analyzer version its own binary would have put
+# there, which is what any older stored row looks like.
+.ds_stub_analyze <- function() {
+  env <- environment(run_update)
+  old <- get("analyze_package", envir = env)
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+      latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
+      stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL),
+    envir = env)
+  old
+}
+
+test_that("a run records the analyzer build on rows that arrived without one", {
+  skip_on_os("windows")
+  stub_dir <- tempfile("bcm_stub_")
+  dir.create(stub_dir)
+  on.exit(unlink(stub_dir, recursive = TRUE), add = TRUE)
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .write_versioned_stub(stub_dir, character(0L), "0.4.0-test"))
+
+  old <- .ds_stub_analyze()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  run_update(.ds_run_io(), out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_true("analyzer_version" %in% DBI::dbListFields(con, "bioc_code_summary"))
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT analyzer_version FROM bioc_code_summary")[[1L]],
+    "0.4.0-test")
+})
+
+test_that("the scan marker survives a second run over the same universe", {
+  skip_on_os("windows")
+  stub_dir <- tempfile("bcm_stub_")
+  dir.create(stub_dir)
+  on.exit(unlink(stub_dir, recursive = TRUE), add = TRUE)
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .write_versioned_stub(stub_dir, character(0L), "0.4.0-test"))
+
+  old <- .ds_stub_analyze()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  io  <- .ds_run_io()
+  run_update(io, out, shard_size = 10L)
+  m2 <- run_update(io, out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_equal(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1L]], 1L)
+  expect_equal(m2$n_fresh, 0L)
+  expect_false(m2$changed)
+})

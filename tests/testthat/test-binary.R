@@ -238,3 +238,30 @@ test_that("rpkg_analyzer_version is NA when the output is not a version banner",
   withr::local_envvar(RPKG_ANALYZER_BIN = stub)
   expect_true(is.na(rpkg_analyzer_version()))
 })
+
+# The stale-scan check compares a stored analyzer_version against what
+# rpkg_analyzer_version() reads from --version, while analyze.R stores whatever
+# the analyzer's own summary record says and only falls back to --version when
+# the record is silent. Those are two channels for one fact. If a build ever
+# reports itself differently in the two, every stored row reads as stale, every
+# run clears every marker, and the pipeline republishes forever. Pin them
+# together here so that shows up as a test failure instead.
+test_that("the analyzer reports the same version in its record and on --version", {
+  skip_if_not(nzchar(rpkg_analyzer_bin()), "needs rpkg-analyzer")
+
+  dir <- tempfile("bcm_ver_")
+  dir.create(dir)
+  on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+  writeLines(c("Package: verpkg", "Version: 1.0", "Title: T", "Description: D.",
+               "License: MIT + file LICENSE"), file.path(dir, "DESCRIPTION"))
+  dir.create(file.path(dir, "R"))
+  writeLines("f <- function() 1", file.path(dir, "R", "f.R"))
+
+  metrics <- analyze_with_binary(dir)
+  skip_if(is.null(metrics), "the analyzer produced no summary record")
+  skip_if(is.null(metrics[["analyzer_version"]]),
+          "this build does not report its version in the summary record")
+
+  expect_identical(as.character(metrics[["analyzer_version"]]),
+                   rpkg_analyzer_version())
+})
