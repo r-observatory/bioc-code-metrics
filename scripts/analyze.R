@@ -231,8 +231,15 @@ deprecation_signals <- function(ctx) {
 #' @param deprecation_series  list of length nrow(summary_df); each element
 #'   is list(symbols = character, uses_lifecycle = logical) from
 #'   deprecation_signals(ctx).
+#' @param datasets_read  logical; whether the dataset reader actually ran on the
+#'   latest version. It gates datasets_scanned, which is a statement about what
+#'   is in bioc_datasets rather than about what this function was asked to do.
+#'   The default is FALSE because a caller that cannot say the reader ran must
+#'   not claim it did: the marker retires a package from the backfill pool, so
+#'   claiming it wrongly is permanent.
 #' @return Augmented summary_df with cross-version columns appended.
-add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
+add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
+                                      datasets_read = FALSE) {
   n <- nrow(summary_df)
 
   # Normalise a possibly-missing deprecation_series entry to safe defaults.
@@ -431,9 +438,14 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$deprecation_infrastructure_maturity[n] <- dep_maturity
   # detail_scanned on EVERY row (set unconditionally, even for data-only
   # packages with zero functions) so the all-versions backfill converges.
-  # datasets_scanned stays latest-row-only (its backfill is latest-scoped).
+  # datasets_scanned stays latest-row-only (its backfill is latest-scoped), and
+  # unlike detail_scanned it is only written when the dataset reader ran. Every
+  # dataset row comes from the analyzer binary, so a run that fell back to the
+  # pure-R path collected nothing; marking those packages scanned would retire
+  # them from the backfill pool with an empty bioc_datasets and no later run
+  # would ever pick them up again.
   summary_df$detail_scanned          <- TRUE
-  summary_df$datasets_scanned[n]     <- TRUE
+  if (isTRUE(datasets_read)) summary_df$datasets_scanned[n] <- TRUE
 
   summary_df
 }
@@ -517,6 +529,10 @@ analyze_package <- function(repo_dir, package) {
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
+  # Whether the dataset reader ran on each version, which a zero-row dataset
+  # frame cannot tell you: a package that ships no data and a package nothing
+  # looked at both produce none.
+  datasets_read      <- logical(nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -693,7 +709,7 @@ analyze_package <- function(repo_dir, package) {
 
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row)
+           datasets_row = datasets_row, datasets_read = !is.null(detail_ds))
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -701,6 +717,7 @@ analyze_package <- function(repo_dir, package) {
     functions_rows[[i]]     <- iter$functions_row
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
+    datasets_read[[i]]      <- isTRUE(iter$datasets_read)
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -765,7 +782,14 @@ analyze_package <- function(repo_dir, package) {
 
   datasets_df <- .rbind_datasets(datasets_rows) %||% .empty_datasets_df()
 
-  summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
+  # The marker lives on the latest row, so it is the latest version's scan that
+  # decides it. Reaching for the last element of the vector rather than any() is
+  # deliberate: an older version read while the newest one was not says nothing
+  # about what the package's current row carries.
+  summary_df <- add_cross_version_metrics(
+    summary_df, api_df, deprecation_series,
+    datasets_read = length(datasets_read) > 0L &&
+      isTRUE(datasets_read[[length(datasets_read)]]))
 
   list(
     summary   = summary_df,

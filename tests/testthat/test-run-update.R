@@ -105,7 +105,21 @@
 # Test 1: sharded bootstrap -- three runs exhaust a 5-package universe
 # ---------------------------------------------------------------------------
 
+#' Skip when the analyzer binary is absent.
+#'
+#' These two tests assert that a shard ADVANCES between runs. Advancing depends
+#' on the per-package sentinels being written, and only the analyzer binary
+#' writes them, so without the binary the same shard is selected forever and
+#' the assertions fail with count mismatches that say nothing about the cause.
+#' Only a linux-x86_64 build is published, so this skips on macOS rather than
+#' reporting twelve mysterious failures to anyone developing there.
+skip_without_analyzer <- function() {
+  if (!nzchar(rpkg_analyzer_bin()))
+    testthat::skip("needs rpkg-analyzer: without it the backfill pool never drains")
+}
+
 test_that("sharded bootstrap: three runs cover universe of 5, fourth is no-op", {
+  skip_without_analyzer()
   out_dir <- tempfile()
   dir.create(out_dir)
   on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
@@ -299,6 +313,7 @@ test_that("force_full re-analyzes packages already in DB within shard_size limit
 # ---------------------------------------------------------------------------
 
 test_that("package hitting MAX_CLONE_FAILURES is excluded from todo and counted in permanent_failures", {
+  skip_without_analyzer()
   out_dir <- tempfile()
   dir.create(out_dir)
   on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
@@ -380,4 +395,51 @@ test_that(".parse_bioc_release extracts release_version from config.yaml lines",
   expect_equal(.parse_bioc_release(c("release_version: 3.20")), "3.20")   # unquoted
   expect_true(is.na(.parse_bioc_release(c("devel_version: 3.24"))))       # no release line
   expect_true(is.na(.parse_bioc_release(character(0))))                   # empty
+})
+
+# ---------------------------------------------------------------------------
+# The dataset marker is only earned by a run that actually read datasets
+# ---------------------------------------------------------------------------
+# Dataset records come from the analyzer binary alone; analyze_package falls
+# back to the pure-R analyze_version() whenever analyze_with_binary() returns
+# NULL. Both tests stub that one call rather than depending on whether this
+# machine has the binary, so the assertion means the same thing on a laptop and
+# in CI.
+
+.with_binary_returning <- function(value, expr) {
+  env <- environment(analyze_package)
+  old <- get("analyze_with_binary", envir = env)
+  assign("analyze_with_binary", function(dir) value, envir = env)
+  on.exit(assign("analyze_with_binary", old, envir = env), add = TRUE)
+  force(expr)
+}
+
+test_that("a package analyzed without the dataset reader is not marked scanned", {
+  repo <- tempfile("bcm_ds_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgNoReader", repo, versions = c("1.0", "1.1"))
+
+  res <- .with_binary_returning(NULL, analyze_package(repo, "pkgNoReader"))
+
+  expect_equal(nrow(res$datasets), 0L)
+  expect_true(all(is.na(res$summary$datasets_scanned)))
+})
+
+test_that("a package the reader looked at is marked scanned even with nothing to report", {
+  repo <- tempfile("bcm_ds_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgReader", repo, versions = c("1.0", "1.1"))
+
+  # A package that ships no data still gets a scan: the reader ran and found
+  # nothing, which is a different fact from never having looked.
+  metrics <- structure(list(loc_r = 1L),
+                       functions = .empty_functions_df()[, -(1:2), drop = FALSE],
+                       edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
+                       datasets  = .datasets_frame(list()))
+  res <- .with_binary_returning(metrics, analyze_package(repo, "pkgReader"))
+
+  last <- nrow(res$summary)
+  expect_equal(nrow(res$datasets), 0L)
+  expect_true(isTRUE(res$summary$datasets_scanned[last]))
+  expect_true(all(is.na(res$summary$datasets_scanned[-last])))
 })

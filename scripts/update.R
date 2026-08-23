@@ -303,6 +303,20 @@ default_io <- function() {
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                        recollect = FALSE) {
+  # Without the analyzer binary the run still completes and still writes rows,
+  # and it makes no progress: the per-package metrics, the per-function detail
+  # and every dataset row come from the binary alone, so each package analysed
+  # stays in the backfill pool and the next run selects the same shard again.
+  # The bootstrap never advances and nothing else in the output says so, which
+  # is a silent stall rather than a failure.
+  if (!nzchar(rpkg_analyzer_bin())) {
+    warning("rpkg-analyzer not found: per-package detail and dataset rows will ",
+            "not be written, the backfill pool will not drain, and the shard ",
+            "will not advance between runs. Set RPKG_ANALYZER_BIN or install ",
+            "the binary.",
+            call. = FALSE, immediate. = TRUE)
+  }
+
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
   db_path      <- file.path(out_dir, DB_FILENAME)
