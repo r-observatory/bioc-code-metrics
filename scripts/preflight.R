@@ -21,15 +21,19 @@
 # describes yesterday's release.
 
 # The two series the download step brings back, named once. `expected` names
-# the ones the resolved release actually advertised, which is what tells a cold
-# start (nothing to fetch) apart from a lost download (something to fetch that
-# did not arrive).
+# the ones whose DATABASE the resolved release advertised, and the downloaded
+# prev-*-manifest.json names the ones whose MANIFEST it advertised. Either one
+# is proof that there was a prior release for that series, which is what tells
+# a cold start (nothing to fetch) apart from a lost download (something to
+# fetch that did not arrive). Both are needed, because the publish uploads the
+# database and the manifest as separate assets and an interrupted publish can
+# leave a release carrying one without the other.
 .preflight_specs <- function() list(
   list(series = "code", db = DB_FILENAME,
-       manifest = "prev-code-manifest.json",
+       manifest = "prev-code-manifest.json", manifest_asset = "code-manifest.json",
        ver_table = "bioc_code_summary", pkg_table = "bioc_code_summary"),
   list(series = "data", db = DATA_DB_FILENAME,
-       manifest = "prev-data-manifest.json",
+       manifest = "prev-data-manifest.json", manifest_asset = "data-manifest.json",
        ver_table = "bioc_dataset_versions", pkg_table = "bioc_datasets")
 )
 
@@ -183,38 +187,60 @@ prior_db_notes <- function(series, counts, prior, tables) {
 
 #' Check every database the resolved release advertised.
 #'
+#' A series is checked when the resolved release advertised its database OR its
+#' manifest. Keying on the database alone is not enough: the two are separate
+#' assets of the same release, so a publish interrupted between them leaves a
+#' release carrying the manifest and no database, the download step then has
+#' nothing to fetch and hands back an empty `expected`, and a gate that reads
+#' that as a cold start would let the run rebuild from nothing and publish it
+#' as latest. That release stays latest, so it would repeat every day.
+#'
 #' @param out_dir  Directory the download step wrote into.
 #' @param expected Character vector of series ("code", "data") whose database
-#'   the release this run resolved actually advertises. Empty means there was
-#'   no prior release, which is a cold start and has nothing to check.
-#' @return list(violations = character, notes = character).
+#'   the release this run resolved actually advertises.
+#' @return list(violations = character, notes = character, checked = character).
+#'   `checked` names the series that had any evidence of a prior release;
+#'   empty is the genuine cold start.
 preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
   violations <- character(0L)
   notes      <- character(0L)
+  checked    <- character(0L)
   expected   <- as.character(expected %||% character(0L))
 
   for (spec in .preflight_specs()) {
-    if (!spec$series %in% expected) next
+    m_path     <- file.path(out_dir, spec$manifest)
+    advertised <- spec$series %in% expected
+    # The filename is what says which series a baseline belongs to; the series
+    # field inside it only decides whether the row counts can be compared. A
+    # manifest too old to compare against is still proof of a prior release.
+    baselined  <- file.exists(m_path)
+    if (!advertised && !baselined) next
+    checked <- c(checked, spec$series)
 
     db_path <- file.path(out_dir, spec$db)
     counts  <- .pf_db_counts(db_path, spec$ver_table, spec$pkg_table)
-    prior   <- if (file.exists(file.path(out_dir, spec$manifest))) {
-      tryCatch(jsonlite::fromJSON(file.path(out_dir, spec$manifest)),
-               error = function(e) NULL)
+    prior   <- if (baselined) {
+      tryCatch(jsonlite::fromJSON(m_path), error = function(e) NULL)
     } else NULL
     tables <- list(ver_table = spec$ver_table, pkg_table = spec$pkg_table)
 
-    # The row-count gate. The release this run resolved says it carries this
-    # database, so an empty one is not a first run: it is a download that
-    # failed, or a file that arrived truncated past the workflow's size check.
+    # The row-count gate. The release this run resolved left evidence that it
+    # carries this series, so an empty database is not a first run: it is a
+    # download that failed, a file that arrived truncated past the workflow's
+    # size check, or an asset the previous publish never finished uploading.
     # Continuing from here would analyse a shard into nothing and publish that
     # as latest.
     if (counts$n_versions <= 0) {
+      why <- if (advertised) {
+        sprintf("the release this run resolved advertises %s", spec$db)
+      } else {
+        sprintf("%s came back from the prior release but %s was not among its assets",
+                spec$manifest_asset, spec$db)
+      }
       violations <- c(violations, sprintf(
-        paste0("the release this run resolved advertises %s, and what came ",
-               "back holds no rows in %s. This run would rebuild from an ",
-               "empty database and publish it as latest."),
-        spec$db, spec$ver_table))
+        paste0("%s, and what came back holds no rows in %s. This run would ",
+               "rebuild from an empty database and publish it as latest."),
+        why, spec$ver_table))
       next
     }
 
@@ -222,7 +248,7 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
     notes      <- c(notes,      prior_db_notes(spec$series, counts, prior, tables))
   }
 
-  list(violations = violations, notes = notes)
+  list(violations = violations, notes = notes, checked = checked)
 }
 
 #' What an operator should do when this refuses.
@@ -275,11 +301,13 @@ if (identical(sys.nframe(), 0L)) {
          "refusing to build a release on top of it.",
          preflight_repair_advice(), call. = FALSE)
   }
-  if (length(expected) == 0L) {
+  # Report what was actually looked at, not what the release advertised: a
+  # series can be checked on the strength of its manifest alone.
+  if (length(checked$checked) == 0L) {
     cat("no prior release to build on; this run starts from nothing\n")
   } else {
     cat(sprintf("the prior %s %s came back intact\n",
-                paste(expected, collapse = " and "),
-                if (length(expected) > 1L) "databases" else "database"))
+                paste(checked$checked, collapse = " and "),
+                if (length(checked$checked) > 1L) "databases" else "database"))
   }
 }

@@ -95,6 +95,55 @@ test_that("a manifest predating the series field is noted, not refused", {
   expect_true(length(res$notes) > 0L)
 })
 
+test_that("a manifest that came back without its database stops the run", {
+  # publish_metrics uploads the database and the manifest in one
+  # `gh release upload --clobber`, which deletes each existing asset before
+  # replacing it and cannot do so atomically. An interrupted publish can
+  # therefore leave a release advertising code-manifest.json and no
+  # bioc-code-metrics.db, in which case the download step has nothing to fetch
+  # and hands preflight an empty `expected`. The manifest that DID come back is
+  # the evidence that this is not a cold start.
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
+  res <- preflight_prior_dbs(out, character(0L))
+  expect_true(length(res$violations) > 0L)
+  expect_true(any(grepl("bioc-code-metrics.db", res$violations, fixed = TRUE)))
+  expect_true(any(grepl("code-manifest.json", res$violations, fixed = TRUE)))
+})
+
+test_that("a data manifest that came back without its database stops the run", {
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-data-manifest.json"),
+                 .pf_manifest(series = "data"))
+  v <- preflight_prior_dbs(out, character(0L))$violations
+  expect_true(length(v) > 0L)
+  expect_true(any(grepl("bioc-data-metrics.db", v, fixed = TRUE)))
+})
+
+test_that("a manifest predating the series field still demands its database", {
+  # The series field is what lets the row counts be compared; the FILENAME is
+  # what says which database should have come with it. A baseline too old to
+  # compare against is still proof that there was a prior release.
+  out <- withr::local_tempdir()
+  write_manifest(file.path(out, "prev-code-manifest.json"),
+                 list(schema_version = 1L, n_packages = 99, n_versions = 99))
+  v <- preflight_prior_dbs(out, character(0L))$violations
+  expect_true(length(v) > 0L)
+  expect_true(any(grepl("bioc-code-metrics.db", v, fixed = TRUE)))
+})
+
+test_that("preflight reports which series it actually looked at", {
+  # The download step cannot tell the caller whether anything was checked, and
+  # the run log has to say "nothing to build on" only when that is true.
+  out <- withr::local_tempdir()
+  expect_identical(preflight_prior_dbs(out, character(0L))$checked, character(0L))
+
+  .pf_code_db(file.path(out, DB_FILENAME), 4L)
+  write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
+  expect_identical(preflight_prior_dbs(out, "code")$checked, "code")
+  expect_identical(preflight_prior_dbs(out, character(0L))$checked, "code")
+})
+
 test_that("a file that is not a database at all stops the run", {
   # A download that stops partway leaves bytes on disk that SQLite will not
   # open. That has to read as "holds nothing", not as an R error nobody can act
