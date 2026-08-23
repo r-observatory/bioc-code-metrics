@@ -272,6 +272,22 @@ metrics_fingerprint <- function(summary_df) {
   col_mean_mean = "REAL", col_mean_q3 = "REAL", col_mean_max = "REAL",
   col_mean_sd = "REAL",
 
+  # How much of a column profile the record beside it carries, which used to be
+  # unsaid. A wide object's column list was truncated at 512 entries with no
+  # marker, so a 19,763 column frame stored the word "numeric" 512 times and
+  # nothing said the other 19,251 were gone. Now the analyzer declares a depth
+  # and drops no column: `full` is every column and every statistic, `reduced`
+  # is every column with four counts and no per-column fingerprint, and `none`
+  # replaces the array entirely with the whole-object summary and the
+  # row_mean_*/col_mean_* margins, so a NULL columns value beside `none` is the
+  # profile rather than a gap in it. ncol is the true width at every depth.
+  #
+  # The fourth value, `structural`, does not reach this table. It names a record
+  # whose values were never read, and such a record carries no content
+  # fingerprint, so there is no content-addressed row to put it on: see the drop
+  # in .write_datasets_normalized.
+  column_detail = "TEXT",
+
   # Slots of a list that hold nothing at all. They count towards its length and
   # they draw as nothing, so a list of ten with four of them empty is not the
   # list its length says it is.
@@ -414,9 +430,36 @@ metrics_fingerprint <- function(summary_df) {
   df$fp_algo_version <- as.integer(df$fp_algo_version)
   df$internal        <- as.integer(df$internal)
   df$is_current      <- as.integer(df$is_current)
-  # Records without a content fingerprint (.R scripts, unreadable, S4 class-only)
-  # have no profile to store; keep them out of the normalized tables.
-  df <- df[!is.na(df$content_fp) & nzchar(df$content_fp), , drop = FALSE]
+  # Records without a content fingerprint (.R scripts, unreadable, S4 class-only,
+  # and any object read for its shape and not its values) have no profile to
+  # store; keep them out of the normalized tables. The tables are content
+  # addressed, so there is nothing to key such a record on, and inventing a key
+  # would put unlike datasets on one row: the reader once gave a billion cells
+  # across 35 objects four fingerprints between them.
+  #
+  # Dropping them is right. Dropping them in silence is not, because nothing
+  # else in the run says the catalog is missing them, so say how many and which,
+  # and how many of them the reader described at structural depth, which is the
+  # one cause that names itself.
+  keep <- !is.na(df$content_fp) & nzchar(df$content_fp)
+  if (any(!keep)) {
+    gone    <- df[!keep, , drop = FALSE]
+    n_struct <- if ("column_detail" %in% names(gone)) {
+      sum(!is.na(gone$column_detail) & gone$column_detail == "structural")
+    } else 0L
+    named <- sprintf("%s %s", gone$package, gone$name)
+    cat(sprintf("dropped %d dataset record%s with no content fingerprint%s: %s%s\n",
+                nrow(gone), if (nrow(gone) == 1L) "" else "s",
+                if (n_struct > 0L) {
+                  sprintf(" (%d read without their values)", n_struct)
+                } else "",
+                paste(head(named, 5L), collapse = ", "),
+                if (length(named) > 5L)
+                  sprintf(" and %d more", length(named) - 5L) else ""),
+        file = stdout())
+    flush(stdout())
+  }
+  df <- df[keep, , drop = FALSE]
   if (nrow(df) == 0L) return(invisible(NULL))
   # Atomic vectors / matrices / S4 have values but no column schema, so schema_fp
   # is NA. Use an empty string so they still dedup by content and satisfy the

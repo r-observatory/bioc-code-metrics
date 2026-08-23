@@ -526,6 +526,31 @@ test_that("a re-scan under a new generation is stored beside the profile it supe
   system2("git", c("-C", repo, "checkout", "-"), stdout = FALSE, stderr = FALSE)
 }
 
+# A one-version repo carrying one dataset at each of the analyzer's four column
+# depths. The skipped one is three columns of nine million values written as a
+# compact sequence, so it costs 200 bytes on disk and the reader never
+# materializes it, which is the documented way into structural depth.
+.make_depth_repo <- function(repo) {
+  .make_one_version_repo(repo)
+  system2("git", c("-C", repo, "checkout", "RELEASE_1_0"),
+          stdout = FALSE, stderr = FALSE)
+  d <- file.path(repo, "data")
+  dir.create(d, showWarnings = FALSE)
+  set.seed(11L)
+  narrow <- data.frame(a = 1:5, b = letters[1:5], stringsAsFactors = FALSE)
+  save(narrow, file = file.path(d, "narrow.rda"))
+  uniform <- as.data.frame(matrix(stats::runif(5L * 600L), nrow = 5L))
+  save(uniform, file = file.path(d, "uniform.rda"))
+  mixed <- as.data.frame(matrix(stats::runif(5L * 600L), nrow = 5L))
+  mixed$V1 <- 1:5
+  save(mixed, file = file.path(d, "mixed.rda"))
+  skipped <- data.frame(a = 1:9000000L, b = 1:9000000L)
+  save(skipped, file = file.path(d, "skipped.rda"))
+  system2("git", c("-C", repo, "add", "."), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "commit", "-m", "data"), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "checkout", "-"), stdout = FALSE, stderr = FALSE)
+}
+
 # A stub analyzer that reports a version of its own and otherwise prints the
 # fixture, so a run can be told apart from a run by a different build.
 .write_versioned_stub <- function(dir, ndjson_lines, version) {
@@ -831,4 +856,96 @@ test_that("the fields the analyzer reports about empty slots and time zones are 
     "SELECT n_empty_slots, tz FROM bioc_dataset_contents")
   expect_equal(got$n_empty_slots, 4L)
   expect_equal(got$tz, "Europe/Berlin")
+})
+
+# --- how deep the column profile goes -------------------------------------
+# The analyzer stopped truncating a wide object's column list and started
+# saying instead how much of one a record carries: full, reduced, none or
+# structural. Without a declared column the pipeline computes that and drops it
+# on the way into SQLite, and a reader of bioc_dataset_contents cannot tell a
+# record with no columns array from one whose columns are all there.
+
+test_that("how deep a record's column profile goes is stored beside the profile", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  df <- rbind(
+    .mk_ds_row("p", "1.0", TRUE, "C1", name = "a"),
+    .mk_ds_row("p", "1.0", TRUE, "C2", name = "b"),
+    .mk_ds_row("p", "1.0", TRUE, "C3", name = "c"))
+  df$column_detail <- c("full", "reduced", "none")
+  # A record at none depth carries no columns array at all; the whole-object
+  # summary stands in its place.
+  df$columns[3L] <- NA_character_
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT d.name, c.column_detail, c.columns
+       FROM bioc_datasets d
+       JOIN bioc_dataset_contents c ON c.content_id = d.current_content_id
+      ORDER BY d.name")
+  expect_equal(got$name, c("a", "b", "c"))
+  expect_equal(got$column_detail, c("full", "reduced", "none"))
+  expect_true(is.na(got$columns[3L]))
+})
+
+test_that("a record the reader could not fingerprint is kept out of the catalog, and counted", {
+  # A frame at structural depth was read for its shape and never for its
+  # values, so it carries no content fingerprint, and the content-addressed
+  # tables have no identity to store it under. Giving it one would put unlike
+  # datasets on the same row. Dropping it is right; dropping it in silence is
+  # not, because nothing else in the run says the catalog is missing them.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  df <- rbind(
+    .mk_ds_row("p", "1.0", TRUE, "C1", name = "kept"),
+    .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "skipped"),
+    .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "script"))
+  df$column_detail <- c("full", "structural", NA_character_)
+
+  said <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p")))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT name FROM bioc_datasets")$name, "kept")
+  expect_true(any(grepl("2 dataset records", said, fixed = TRUE)))
+  expect_true(any(grepl("1 read without", said, fixed = TRUE)))
+  expect_true(any(grepl("p skipped", said, fixed = TRUE)))
+})
+
+test_that("the analyzer's four column depths reach the table, or say why they do not", {
+  skip_if(!nzchar(rpkg_analyzer_bin()),
+          "no rpkg-analyzer binary: set RPKG_ANALYZER_BIN or put one on PATH")
+  skip_on_os("windows")
+  repo <- tempfile("bcm_depth_repo_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .make_depth_repo(repo)
+
+  result <- analyze_package(repo, "mypkg")
+  ds <- result$datasets
+  expect_true(!is.null(ds) && nrow(ds) > 0L)
+  skip_if(!"column_detail" %in% names(ds),
+          sprintf("rpkg-analyzer %s does not declare a column depth",
+                  rpkg_analyzer_version()))
+  depth <- stats::setNames(ds$column_detail, ds$name)
+  expect_equal(unname(depth["narrow"]),  "full")
+  expect_equal(unname(depth["uniform"]), "none")
+  expect_equal(unname(depth["mixed"]),   "reduced")
+  expect_equal(unname(depth["skipped"]), "structural")
+
+  # The structural one is the only record with no content fingerprint, which is
+  # what keeps it out of the catalog below.
+  expect_true(is.na(ds$content_fp[ds$name == "skipped"]))
+  expect_true(all(!is.na(ds$content_fp[ds$name != "skipped"])))
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, ds, "mypkg"))
+  got <- DBI::dbGetQuery(con,
+    "SELECT d.name, c.column_detail, c.ncol
+       FROM bioc_datasets d
+       JOIN bioc_dataset_contents c ON c.content_id = d.current_content_id
+      ORDER BY d.name")
+  expect_setequal(got$name, c("mixed", "narrow", "uniform"))
+  expect_equal(got$column_detail[got$name == "uniform"], "none")
+  # ncol is the true width at every depth, whatever the columns array holds.
+  expect_equal(got$ncol[got$name == "uniform"], 600L)
 })
