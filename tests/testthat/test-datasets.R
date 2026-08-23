@@ -776,3 +776,59 @@ test_that("a package the installed analyzer cannot read names no build either", 
   expect_true(all(is.na(
     DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1L]])))
 })
+
+test_that("a columns profile too large to serve is refused, and the row says so", {
+  # A single value over MySQL's max_allowed_packet cannot be loaded at all, and
+  # that ceiling is not raisable: a misparsed file has already produced a
+  # 306 MB profile in the sibling pipeline, whose dataset tables merge into the
+  # same database as these. The profile is what gets dropped, never the row.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  orig <- MAX_DATASET_COLUMNS_BYTES
+  MAX_DATASET_COLUMNS_BYTES <<- 64L
+  on.exit(MAX_DATASET_COLUMNS_BYTES <<- orig, add = TRUE)
+
+  big <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  big$columns <- paste0('[{"name":"', strrep("x", 500L), '"}]')
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, big, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT class, nrow, columns, columns_refused_bytes FROM bioc_dataset_contents")
+  expect_equal(nrow(got), 1L)
+  expect_true(is.na(got$columns))
+  expect_equal(got$columns_refused_bytes, nchar(big$columns, type = "bytes"))
+  # The rest of the profile is still true and still stored.
+  expect_equal(got$class, "data.frame")
+  expect_equal(got$nrow, 3L)
+})
+
+test_that("a columns profile within the bound is stored untouched", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT columns, columns_refused_bytes FROM bioc_dataset_contents")
+  expect_equal(got$columns, row$columns)
+  # Zero rather than NULL: nothing was refused is a measurement, and a column
+  # that is NULL for every healthy row reads to a coverage check as dead.
+  expect_equal(got$columns_refused_bytes, 0L)
+})
+
+test_that("the fields the analyzer reports about empty slots and time zones are stored", {
+  # Both are top-level fields of a dataset record and neither had a declared
+  # column, so .write_datasets_normalized computed them and dropped them on the
+  # way into SQLite.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  row$n_empty_slots <- 4L
+  row$tz <- "Europe/Berlin"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT n_empty_slots, tz FROM bioc_dataset_contents")
+  expect_equal(got$n_empty_slots, 4L)
+  expect_equal(got$tz, "Europe/Berlin")
+})

@@ -270,7 +270,26 @@ metrics_fingerprint <- function(summary_df) {
   row_mean_sd = "REAL",
   col_mean_min = "REAL", col_mean_q1 = "REAL", col_mean_median = "REAL",
   col_mean_mean = "REAL", col_mean_q3 = "REAL", col_mean_max = "REAL",
-  col_mean_sd = "REAL"
+  col_mean_sd = "REAL",
+
+  # Slots of a list that hold nothing at all. They count towards its length and
+  # they draw as nothing, so a list of ten with four of them empty is not the
+  # list its length says it is.
+  n_empty_slots = "INTEGER",
+  # The time zone an instant is stored in. It belongs to the object rather than
+  # to the file: the same moment written in two zones reads as two different
+  # local times. index_tz above it is the zone of a series' index, which is a
+  # different field on a different kind of object, and declaring one was not
+  # declaring the other.
+  tz = "TEXT",
+
+  # How many bytes of column profile this row does NOT carry. Zero on a row
+  # that carries all of it, which is every honest row; a count says the profile
+  # was over MAX_DATASET_COLUMNS_BYTES and was refused rather than stored. It
+  # is written by the pipeline rather than read from the analyzer, so that a
+  # reader can tell an object with no columns from one whose columns would not
+  # fit through the load.
+  columns_refused_bytes = "INTEGER"
 )
 
 # How one file happened to store the data, which is not a property of the data.
@@ -404,6 +423,36 @@ metrics_fingerprint <- function(summary_df) {
   # NOT NULL + UNIQUE(content_fp, schema_fp, fp_algo_version) constraint (a NULL
   # would make every such row distinct and get dropped by INSERT OR IGNORE).
   df$schema_fp[is.na(df$schema_fp)] <- ""
+
+  # Nothing upstream bounds one column profile, and one pathological value is
+  # enough to make the published database unloadable: MySQL refuses any single
+  # value over its 32 MiB packet ceiling and fails the whole table's load, not
+  # the row's. A file read as something it is not has already produced profiles
+  # of 321 MB in the sibling pipeline that loads into the same place.
+  #
+  # What is refused is the profile, never the row. The class, the shape, the
+  # counts and the fingerprints are all still true and still worth storing, and
+  # the refused size stays beside them so a reader can tell a row whose columns
+  # would not fit from an object that has no columns at all.
+  df$columns_refused_bytes <- 0L
+  if ("columns" %in% names(df)) {
+    sizes <- nchar(as.character(df$columns), type = "bytes")
+    over  <- !is.na(sizes) & sizes > MAX_DATASET_COLUMNS_BYTES
+    if (any(over)) {
+      df$columns_refused_bytes[over] <- sizes[over]
+      df$columns[over] <- NA_character_
+      named <- sprintf("%s %s (%s)", df$package[over], df$name[over],
+                       vapply(sizes[over], format_bytes, character(1L)))
+      cat(sprintf("refused %d column profile%s over %s: %s%s\n",
+                  sum(over), if (sum(over) == 1L) "" else "s",
+                  format_bytes(MAX_DATASET_COLUMNS_BYTES),
+                  paste(head(named, 5L), collapse = ", "),
+                  if (length(named) > 5L)
+                    sprintf(" and %d more", length(named) - 5L) else ""),
+          file = stdout())
+      flush(stdout())
+    }
+  }
 
   # A single package version can surface one dataset name twice: an exported
   # data/ object and an internal sysdata object of the same name, or the same
