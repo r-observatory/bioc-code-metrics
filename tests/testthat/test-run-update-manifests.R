@@ -9,14 +9,15 @@ test_that("run_update writes both manifests and the changed-packages file", {
   assign("analyze_package", function(dest, pkg) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
-      stringsAsFactors = FALSE),
+      analyzer_version = "0.4.0-test", stringsAsFactors = FALSE),
     churn = NULL, api = NULL, functions = NULL, edges = NULL,
     datasets = data.frame(package = pkg, name = "d1", version = "1.0",
       file = "data/d1.rda", internal = 0L, format = "rda", compression = "gzip",
       confidence = "high", class = "data.frame", kind = "table", nrow = 5L,
       ncol = 1L, n_missing_total = 0L, content_fp = "cf", schema_fp = "sf",
-      fp_algo_version = 1L, columns = '["a"]', row_sketch = NA_character_,
-      is_current = 1L, stringsAsFactors = FALSE)),
+      fp_algo_version = FP_ALGO_VERSION, columns = '["a"]', row_sketch = NA_character_,
+      is_current = 1L, stringsAsFactors = FALSE),
+    binary_versions = "1.0"),
     envir = environment(run_update))
   on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
 
@@ -36,6 +37,14 @@ test_that("run_update writes both manifests and the changed-packages file", {
   # (a data_con/con swap) would read 0 here, catching that mistake.
   expect_identical(dm$n_packages, 1L)
   expect_true("pkgA" %in% read_changed_packages(file.path(out, "changed-packages.txt")))
+  # A row that says it was dataset-scanned names the build that scanned it.
+  # analyze_package cannot return one without the other, so a stub that does is
+  # standing in for a shape the pipeline never sees.
+  ccon <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(ccon), add = TRUE)
+  expect_equal(
+    DBI::dbGetQuery(ccon, "SELECT analyzer_version FROM bioc_code_summary")[[1L]],
+    "0.4.0-test")
 })
 
 test_that("both manifests report the packages no dataset scan reached", {
