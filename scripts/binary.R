@@ -20,6 +20,22 @@ rpkg_analyzer_bin <- function() {
   unname(Sys.which("rpkg-analyzer"))
 }
 
+#' The version of the analyzer binary that will run, or NA when it cannot be
+#' determined. Data collected by an older build describes less than the same
+#' scan would now, and this is what lets that be noticed.
+rpkg_analyzer_version <- function() {
+  bin <- rpkg_analyzer_bin()
+  if (!nzchar(bin)) return(NA_character_)
+  out <- tryCatch(
+    suppressWarnings(system2(bin, "--version", stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0L))
+  if (!length(out)) return(NA_character_)
+  # "rpkg-analyzer 0.4.0"
+  v <- sub("^\\s*rpkg-analyzer\\s+", "", out[[1L]])
+  v <- trimws(v)
+  if (!nzchar(v) || identical(v, out[[1L]])) NA_character_ else v
+}
+
 # Extract one scalar field from a parsed NDJSON record, defaulting to NA.
 # With simplifyVector = FALSE, scalar JSON values decode to length-1 atomics.
 .rec_chr <- function(rec, key) {

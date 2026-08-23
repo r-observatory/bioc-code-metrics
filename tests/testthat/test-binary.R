@@ -195,3 +195,46 @@ test_that("analyze_with_binary returns NULL when the binary is unavailable", {
           "a real rpkg-analyzer is on PATH")
   expect_null(analyze_with_binary(tempfile()))
 })
+
+# ---------------------------------------------------------------------------
+# rpkg_analyzer_version: which build is about to run
+# ---------------------------------------------------------------------------
+
+# Write an executable stub that answers --version and nothing else.
+.write_version_stub <- function(dir, line) {
+  stub <- file.path(dir, "stub-version.sh")
+  writeLines(c("#!/bin/sh", sprintf("echo %s", shQuote(line))), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("rpkg_analyzer_version reports the version the binary prints", {
+  skip_on_os("windows")
+  dir <- tempfile("bcm_stub_")
+  dir.create(dir)
+  on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .write_version_stub(dir, "rpkg-analyzer 0.4.0"))
+  expect_identical(rpkg_analyzer_version(), "0.4.0")
+})
+
+test_that("rpkg_analyzer_version is NA when no binary is available", {
+  withr::local_envvar(RPKG_ANALYZER_BIN = "/nonexistent/path/to/nothing")
+  skip_if(nzchar(unname(Sys.which("rpkg-analyzer"))),
+          "a real rpkg-analyzer is on PATH")
+  expect_true(is.na(rpkg_analyzer_version()))
+})
+
+test_that("rpkg_analyzer_version is NA when the output is not a version banner", {
+  # A guess here would clear the scan marker on every run and never settle, so
+  # anything that does not look like the banner has to read as unknown.
+  skip_on_os("windows")
+  dir <- tempfile("bcm_stub_")
+  dir.create(dir)
+  on.exit(unlink(dir, recursive = TRUE), add = TRUE)
+
+  stub <- .write_version_stub(dir, "usage: rpkg-analyzer DIR")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+  expect_true(is.na(rpkg_analyzer_version()))
+})

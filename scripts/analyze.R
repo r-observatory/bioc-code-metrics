@@ -3,6 +3,24 @@
 # Load order: config.R -> git.R -> context.R -> metrics/structure.R -> analyze.R
 # This file does NOT auto-source its dependencies so the caller controls order.
 
+# The fingerprint algorithm's generation. It is part of the uniqueness key on
+# bioc_dataset_contents, which is written with INSERT OR IGNORE, so a re-scan of
+# data whose bytes have not changed produces the same content_fp and is silently
+# dropped. Anything that changes what a profile records, rather than what the
+# data is, has to be a new generation or it never reaches the table. Superseded
+# rows are left unreferenced and reclaimed by the contents GC.
+#
+# The number is shared with the CRAN pipeline rather than counted per origin: a
+# Bioconductor package and a CRAN package that ship identical bytes only match
+# when both were profiled under the same generation.
+#
+# 1: the original record, being the class, the shape, the columns array and the
+#    fingerprints.
+# 3: everything the current reader describes about a dataset, which is most of
+#    what .DATASET_CONTENT_COLS declares. Generation 2 was CRAN's alone and is
+#    skipped here so both origins land on the same number.
+FP_ALGO_VERSION <- 3L
+
 #' Registry of metric group functions.
 #' Each value is a function(ctx) -> named list of scalar metric values.
 #' Add more groups here when new metric modules are implemented.
@@ -577,6 +595,13 @@ analyze_package <- function(repo_dir, package) {
       metrics <- analyze_with_binary(tmp)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)
+      } else if (is.null(metrics[["analyzer_version"]])) {
+        # Which build produced this row is what lets a later run tell data it
+        # already holds from data a newer build would describe differently.
+        # Taken from the binary rather than from its output, so a build that
+        # does not report itself still leaves the column behind and the
+        # re-scan queue can still settle.
+        metrics[["analyzer_version"]] <- rpkg_analyzer_version()
       }
 
       # Capture per-function / per-call-edge detail before metrics is mutated.
@@ -660,7 +685,7 @@ analyze_package <- function(repo_dir, package) {
       # fingerprint canonicalization so a future change is a planned rebuild.
       datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
         cbind(package = package, version = v,
-              is_current = as.integer(is_latest), fp_algo_version = 1L,
+              is_current = as.integer(is_latest), fp_algo_version = FP_ALGO_VERSION,
               detail_ds, stringsAsFactors = FALSE)
       } else {
         .empty_datasets_df()

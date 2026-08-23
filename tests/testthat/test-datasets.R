@@ -400,3 +400,170 @@ test_that("a padded frame writes without carrying its padding into the wrong typ
   # The identity row still comes from the current version, padding or not.
   expect_equal(DBI::dbGetQuery(con, "SELECT origin_dir FROM bioc_datasets")$origin_dir, "data")
 })
+
+# --- noticing that a scan is out of date -------------------------------------
+
+.mk_summary_tbl <- function(con, rows) {
+  DBI::dbWriteTable(con, "bioc_code_summary", rows)
+}
+
+test_that("an analyzer upgrade puts the packages it already scanned back in the queue", {
+  # The marker records that a package was scanned, not what scanned it, so
+  # without this every package looks done after an upgrade and nothing re-runs.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("current", "older", "unknown"),
+    datasets_scanned = c(TRUE, TRUE, TRUE),
+    analyzer_version = c("0.4.0", "0.2.0", NA_character_),
+    stringsAsFactors = FALSE))
+
+  n <- .invalidate_stale_dataset_scans(con, "0.4.0")
+  expect_equal(n, 2L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT package, datasets_scanned FROM bioc_code_summary ORDER BY package")
+  # Only the row produced by the running build keeps its marker.
+  expect_equal(got$package[!is.na(got$datasets_scanned)], "current")
+})
+
+test_that("nothing is invalidated when the running version cannot be determined", {
+  # Clearing on a guess would re-scan the archive every run and never settle.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = "p", datasets_scanned = TRUE, analyzer_version = "0.2.0",
+    stringsAsFactors = FALSE))
+
+  expect_equal(.invalidate_stale_dataset_scans(con, NA_character_), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, ""), 0L)
+  expect_true(DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1]][[1]] == 1L)
+})
+
+test_that("rows from before the version was recorded are all invalidated once", {
+  # Nothing on them says which build produced them, so none can be shown to
+  # match. The column appears on this run's write, so the branch is taken once.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("a", "b"), datasets_scanned = c(TRUE, NA),
+    stringsAsFactors = FALSE))
+
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.4.0"), 1L)  # only the marked one
+  left <- DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1]]
+  expect_true(all(is.na(left)))
+})
+
+test_that("the re-scan queue settles instead of clearing every marker forever", {
+  # If the version column never appears, the column-absent branch fires on every
+  # run: the whole archive is queued, the shard truncates to its alphabetical
+  # prefix, and packages later in the alphabet are never reached again.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .mk_summary_tbl(con, data.frame(
+    package = c("a", "b"), datasets_scanned = c(TRUE, TRUE),
+    stringsAsFactors = FALSE))
+
+  # First run: nothing records which build produced these, so both are queued.
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.4.0"), 2L)
+  # That run re-analyses them, and the write leaves the version behind.
+  DBI::dbExecute(con, "ALTER TABLE bioc_code_summary ADD COLUMN analyzer_version TEXT")
+  DBI::dbExecute(con, "UPDATE bioc_code_summary SET datasets_scanned = 1, analyzer_version = '0.4.0'")
+  # Every run after that clears nothing.
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.4.0"), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.4.0"), 0L)
+  expect_equal(.invalidate_stale_dataset_scans(con, "0.4.0"), 0L)
+})
+
+test_that("a re-scan under a new generation is stored beside the profile it supersedes", {
+  # bioc_dataset_contents is keyed on (content_fp, schema_fp, fp_algo_version)
+  # and written with INSERT OR IGNORE. Data whose bytes have not changed keeps
+  # its content_fp, so a richer profile of it only reaches the table when the
+  # generation moves; on the old generation the write is silently dropped and
+  # the new fields are computed and thrown away.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+
+  old <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  old$fp_algo_version <- 1L
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, old, "p"))
+
+  new <- .mk_wide_row(package = "q", content_fp = "C1")
+  new$fp_algo_version <- FP_ALGO_VERSION
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, new, "q"))
+
+  got <- DBI::dbGetQuery(con, "SELECT fp_algo_version, matrix_shape
+                             FROM bioc_dataset_contents ORDER BY fp_algo_version")
+  expect_equal(nrow(got), 2L)
+  expect_equal(got$fp_algo_version, c(1L, FP_ALGO_VERSION))
+  # The generation-1 row never held these; the new one does.
+  expect_true(is.na(got$matrix_shape[[1L]]))
+  expect_equal(got$matrix_shape[[2L]], "symmetric")
+})
+
+# Build a real one-release git repo so analyze_package walks a version of it.
+# Bioconductor versions are RELEASE_X_Y branches (list_versions ignores tags),
+# so RELEASE_1_0 is version "1.0".
+.make_one_version_repo <- function(repo) {
+  dir.create(repo)
+  system2("git", c("init", repo), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "config", "user.email", "t@t.test"),
+          stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "config", "user.name", "T"),
+          stdout = FALSE, stderr = FALSE)
+  writeLines("# readme", file.path(repo, "README"))
+  system2("git", c("-C", repo, "add", "."), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "commit", "-m", "init"), stdout = FALSE, stderr = FALSE)
+
+  system2("git", c("-C", repo, "checkout", "-b", "RELEASE_1_0"),
+          stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"), showWarnings = FALSE)
+  writeLines("foo <- function() 1", file.path(repo, "R", "foo.R"))
+  writeLines("Package: mypkg\nVersion: 1.0\n", file.path(repo, "DESCRIPTION"))
+  writeLines("export(foo)\n", file.path(repo, "NAMESPACE"))
+  system2("git", c("-C", repo, "add", "."), stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "commit", "-m", "release-1.0"),
+          stdout = FALSE, stderr = FALSE)
+  system2("git", c("-C", repo, "checkout", "-"), stdout = FALSE, stderr = FALSE)
+}
+
+# A stub analyzer that reports a version of its own and otherwise prints the
+# fixture, so a run can be told apart from a run by a different build.
+.write_versioned_stub <- function(dir, ndjson_lines, version) {
+  fixture <- file.path(dir, "fixture.ndjson")
+  writeLines(ndjson_lines, fixture)
+  stub <- file.path(dir, "stub-analyzer.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then',
+    sprintf('  echo "rpkg-analyzer %s"', version),
+    "  exit 0",
+    "fi",
+    sprintf("cat %s", shQuote(fixture))), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("a scanned row records which build scanned it and which generation it used", {
+  # Without both stamps the row cannot be told from one an older build produced,
+  # and a re-scan of unchanged bytes is dropped as a duplicate.
+  skip_on_os("windows")
+  stub_dir <- tempfile("bcm_stub_")
+  dir.create(stub_dir)
+  on.exit(unlink(stub_dir, recursive = TRUE), add = TRUE)
+  stub <- .write_versioned_stub(stub_dir, c(
+    '{"rec":"summary","package":"mypkg","n_fns_r":1}',
+    paste0('{"rec":"dataset","name":"d","file":"data/d.rda","internal":false,',
+           '"format":"rda","class":"data.frame","kind":"data.frame","nrow":3,',
+           '"ncol":2,"schema_fp":"S1","content_fp":"C1"}')
+  ), "0.4.0-test")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+
+  repo <- tempfile("bcm_ds_repo_")
+  on.exit(unlink(repo, recursive = TRUE), add = TRUE)
+  .make_one_version_repo(repo)
+
+  result <- analyze_package(repo, "mypkg")
+
+  expect_equal(unique(result$summary$analyzer_version), "0.4.0-test")
+  expect_equal(unique(result$datasets$fp_algo_version), FP_ALGO_VERSION)
+})
