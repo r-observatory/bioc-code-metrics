@@ -178,3 +178,202 @@ test_that(".gc_dataset_contents reclaims content orphaned by a data change", {
   expect_equal(count("bioc_dataset_contents"), 1L)   # C1 reclaimed
   expect_equal(count("bioc_dataset_sketches"), 1L)   # its sketch reclaimed too
 })
+
+# --- carrying what a newer analyzer describes --------------------------------
+# A scan of the whole archive is expensive, and every one of these is a way for
+# it to cost that and change nothing in the database.
+
+.mk_wide_row <- function(package = "p", version = "1.0", content_fp = "C1",
+                         origin_dir = "data", name = "d") {
+  row <- .mk_ds_row(package, version, TRUE, content_fp, name = name)
+  row$fp_algo_version <- 3L
+  # Fields the analyzer describes that the tables have never seen.
+  row$matrix_shape  <- "symmetric"
+  row$matrix_uplo   <- "L"
+  row$density       <- 0.125
+  row$n_stored      <- 3L
+  row$object_system <- "S4"
+  row$is_spatial    <- TRUE
+  row$origin_dir    <- origin_dir
+  row
+}
+
+test_that("fields a newer analyzer describes reach the contents table", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents")
+  expect_equal(got$matrix_shape, "symmetric")
+  expect_equal(got$matrix_uplo, "L")
+  expect_equal(got$density, 0.125)
+  expect_equal(got$n_stored, 3L)
+  expect_equal(got$object_system, "S4")
+  expect_equal(got$is_spatial, 1L)         # logicals store as integers
+})
+
+test_that("how many elements a vector holds survives the write", {
+  # A vector has no rows and no columns, so length is the only size it has. The
+  # CREATE dropped the column, which left every vector row in the catalog with
+  # nothing at all recorded about how big it was.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$class  <- "numeric"
+  row$kind   <- "vector"
+  row$nrow   <- NA_integer_
+  row$ncol   <- NA_integer_
+  row$length <- 4085L
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT length FROM bioc_dataset_contents")$length, 4085L)
+})
+
+test_that("where a dataset was found is identity, not content", {
+  # origin_dir differs between two files holding the same bytes, so putting it
+  # on the content row would give them two rows and break the dedup.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_wide_row(package = "q", origin_dir = "extdata"), "q"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM bioc_dataset_contents")$n, 1L)
+  expect_false("origin_dir" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+  ids <- DBI::dbGetQuery(con, "SELECT package, origin_dir FROM bioc_datasets ORDER BY package")
+  expect_equal(ids$origin_dir, c("data", "extdata"))
+})
+
+test_that("a table created before these fields existed is widened, not skipped", {
+  # The incremental path runs against a database downloaded from the last
+  # release, so a widened CREATE never applies to it. Without an ALTER the new
+  # columns are dropped in silence and the scan that produced them is wasted.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  expect_false("matrix_shape" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+
+  expect_true("matrix_shape" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+  expect_equal(DBI::dbGetQuery(con, "SELECT matrix_shape FROM bioc_dataset_contents")$matrix_shape,
+               "symmetric")
+})
+
+test_that("how a file stores its data is recorded, not just what it holds", {
+  # R's serialization format has versions, and a version 3 file cannot be read
+  # by R before 3.5.0, so this is the difference between a dataset a reader can
+  # open and one they cannot. It was being parsed and then dropped, along with
+  # the on-disk size and the note saying how the file was read.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$format_version   <- 3L
+  row$compressed_bytes <- 4096L
+  row$notes            <- "s4-dim-slot"
+  row$shape_fp         <- "SHP1"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  v <- DBI::dbGetQuery(con, "SELECT format_version, compressed_bytes, notes FROM bioc_dataset_versions")
+  expect_equal(v$format_version, 3L)
+  expect_equal(v$compressed_bytes, 4096L)
+  expect_equal(v$notes, "s4-dim-slot")
+  # The shape fingerprint describes the data, so it sits with the data.
+  expect_equal(DBI::dbGetQuery(con, "SELECT shape_fp FROM bioc_dataset_contents")$shape_fp, "SHP1")
+  expect_false("format_version" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+})
+
+test_that("two versions of one dataset can differ in how they were stored", {
+  # The same data saved twice under different serialization versions is one
+  # content row and two version rows, so this has to live on the version.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("p", "1.0", FALSE, "C1"); a$format_version <- 2L
+  b <- .mk_ds_row("p", "1.1", TRUE,  "C1"); b$format_version <- 3L
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, rbind(a, b), "p"))
+
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM bioc_dataset_contents")$n, 1L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT version, format_version FROM bioc_dataset_versions ORDER BY version")
+  expect_equal(got$format_version, c(2L, 3L))
+})
+
+test_that("what the analyzer describes reaches the tables that hold it", {
+  # Every one of these was read, carried through the frame, and then dropped at
+  # the write because the column list had not heard of it.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$mean <- 2.5; row$sd <- 1.25; row$q1 <- 1.5; row$q3 <- 3.5
+  row$sort_order <- "ascending"; row$n_zero <- 0L; row$p_zero <- 0
+  row$levels <- '["a","b"]'; row$is_ordered <- TRUE
+  row$frame_class <- "tibble"; row$dt_key <- '["id"]'
+  row$inner_nrow_total <- 2000L; row$element_names <- '["train","test"]'
+  row$dimnames <- '[{"margin":1,"labels":["A","B"]}]'
+  row$index_delta <- 1; row$index_regular <- TRUE; row$ts_span <- 3.5
+  row$resolution <- "[0.5,0.5]"; row$nodata_value <- -9999; row$in_memory <- TRUE
+  row$n_nonzero <- 6L; row$skewness <- 1.5; row$n_outliers <- 2L
+  row$title <- "Readings from an instrument"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents")
+  expect_equal(got$mean, 2.5)
+  expect_equal(got$sd, 1.25)
+  expect_equal(got$sort_order, "ascending")
+  expect_equal(got$inner_nrow_total, 2000L)
+  expect_equal(got$n_nonzero, 6L)
+  expect_equal(got$nodata_value, -9999)
+  expect_equal(got$skewness, 1.5)
+  expect_true(all(c("levels", "dimnames", "dt_key", "element_names", "resolution",
+                    "index_delta", "ts_span", "n_outliers", "frame_class")
+                  %in% names(got)))
+
+  # A title belongs to the package's documentation, not to the bytes: two
+  # packages carrying identical data may describe it differently.
+  ident <- DBI::dbGetQuery(con, "SELECT title FROM bioc_datasets")
+  expect_equal(ident$title, "Readings from an instrument")
+  expect_false("title" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+})
+
+test_that("versions describing different things still bind into one frame", {
+  # .datasets_frame carries the fields its records actually had, so two versions
+  # of one package differ in width as soon as they differ in what they hold.
+  # Plain rbind stops on that, and the caller reads the error as the whole
+  # package failing: it loses its summary, functions and edges too, and five
+  # consecutive failures exclude it from the pipeline for good.
+  v1 <- .datasets_frame(list(list(rec = "dataset", name = "s", class = "S4:X", nrow = 1L)))
+  v2 <- .datasets_frame(list(list(rec = "dataset", name = "d", class = "data.frame",
+                                  nrow = 3L, has_rownames = TRUE)))
+  expect_false(ncol(v1) == ncol(v2))
+  bound <- .rbind_datasets(list(v1, v2))
+  expect_equal(nrow(bound), 2L)
+  expect_true("has_rownames" %in% names(bound))
+  expect_true(is.na(bound$has_rownames[bound$name == "s"]))
+  expect_null(.rbind_datasets(list()))
+})
+
+test_that("a record's fields are carried through the frame rather than a fixed list", {
+  # The fixed list silently dropped every field added since it was written, so a
+  # richer scan cost its own runtime and changed nothing in the database.
+  ds <- parse_analyzer_records(c(
+    '{"rec":"summary","package":"p","version":"1.0"}',
+    paste0('{"rec":"dataset","name":"m","content_fp":"C1","class":"dgCMatrix",',
+           '"kind":"sparse_matrix","density":0.125,"n_stored":3,"matrix_uplo":"L",',
+           '"object_system":"S4","is_spatial":false,"origin_dir":"data",',
+           '"title":"A sparse thing"}')
+  ))$datasets
+
+  expect_equal(ds$density, 0.125)
+  expect_equal(ds$n_stored, 3L)
+  expect_equal(ds$matrix_uplo, "L")
+  expect_equal(ds$object_system, "S4")
+  expect_false(ds$is_spatial)
+  expect_equal(ds$origin_dir, "data")
+  expect_equal(ds$title, "A sparse thing")
+  # The base shape downstream code addresses by name is still there in full.
+  expect_true(all(names(.DATASET_BASE_COLS) %in% names(ds)))
+})

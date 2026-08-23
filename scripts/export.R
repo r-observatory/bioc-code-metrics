@@ -164,6 +164,156 @@ metrics_fingerprint <- function(summary_df) {
 # (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
 # The heavy row_sketch lives in its own table (kept out of the merge allowlist).
 
+# Columns of a dataset record that describe the data itself, and so belong on
+# the content-addressed row shared by every copy of it. Anything that can differ
+# between two files holding identical bytes is deliberately absent: which file
+# it came from, how it was compressed, which directory it sat in. Putting one of
+# those here would give two identical datasets two content rows and break the
+# dedup the table exists for.
+#
+# Types are declared rather than inferred from whatever a shard happens to
+# carry. A shard whose every density is missing would otherwise fix that column
+# as text for good, and the column would then read back as text forever.
+.DATASET_CONTENT_COLS <- c(
+  class = "TEXT", kind = "TEXT", nrow = "INTEGER", ncol = "INTEGER",
+  length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
+  n_missing_total = "INTEGER", columns = "TEXT", has_rownames = "INTEGER",
+  shape_fp = "TEXT",
+  dim = "TEXT", n_dim = "INTEGER", has_dimnames = "INTEGER",
+  n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
+  matrix_value_type = "TEXT", matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT",
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER", index_class = "TEXT",
+  geom_type = "TEXT", is_geometry = "INTEGER", n_geometries = "INTEGER",
+  is_spatial = "INTEGER",
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT", bbox = "TEXT",
+  n_layers = "INTEGER", object_system = "TEXT", s4_package = "TEXT",
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
+
+  # What a column or a grid holds, on the same terms summary() reports it.
+  type = "TEXT", mean = "REAL", median = "REAL", q1 = "REAL", q3 = "REAL",
+  sd = "REAL", col_min = "REAL", col_max = "REAL",
+  skewness = "REAL", kurtosis = "REAL",
+  n_outliers = "INTEGER", n_outliers_low = "INTEGER", n_outliers_high = "INTEGER",
+  mode_value = "REAL", mode_share = "REAL",
+  n_true = "INTEGER", n_false = "INTEGER",
+  min_nchar = "INTEGER", max_nchar = "INTEGER", n_blank = "INTEGER",
+  n_zero = "INTEGER", p_zero = "REAL",
+  n_infinite = "INTEGER", max_infinite = "INTEGER", min_infinite = "INTEGER",
+  is_integer_valued = "INTEGER", sort_order = "TEXT",
+  n_missing_leading = "INTEGER", n_missing_trailing = "INTEGER",
+  max_missing_run = "INTEGER",
+  summary_over = "TEXT",
+
+  # Written down beside the values rather than computed from them.
+  levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
+  is_factor = "INTEGER", is_ordered = "INTEGER",
+
+  # Which kind of table, and how it is keyed and grouped.
+  frame_class = "TEXT", is_grouped = "INTEGER",
+  dt_key = "TEXT", dt_indices = "TEXT",
+  group_vars = "TEXT", n_groups = "INTEGER",
+
+  # What a list holds. The inner row count is the one that matters: a nested
+  # table reports its group count as its rows.
+  element_names = "TEXT", element_class = "TEXT", element_classes = "TEXT",
+  element_len_min = "INTEGER", element_len_max = "INTEGER",
+  element_len_total = "INTEGER", max_depth = "INTEGER",
+  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER", inner_names = "TEXT",
+  inner_schema_varies = "INTEGER",
+
+  # The labels along the margins of a grid, without which a table of counts
+  # cannot be read.
+  dimnames = "TEXT",
+
+  # How evenly a series is observed.
+  ts_span = "REAL", index_span = "REAL", index_tz = "TEXT",
+  index_delta = "REAL", index_regular = "INTEGER",
+  index_n_gaps = "INTEGER", index_max_gap = "REAL",
+  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
+
+  # Spatial and raster detail.
+  geom_dimension = "TEXT", n_empty = "INTEGER",
+  resolution = "TEXT", nodata_value = "REAL", in_memory = "INTEGER",
+  layer_names = "TEXT", layer_min = "TEXT", layer_max = "TEXT",
+
+  # Which kind of missing, and which end an infinity runs to. Both are
+  # column-level too and ride in the columns JSON; these are for the objects
+  # that are one vector rather than a table.
+  n_nan = "INTEGER", n_infinite_pos = "INTEGER", n_infinite_neg = "INTEGER",
+
+  # A broken-down time: how many fields it is stored in, and the years it
+  # covers, which is what is recoverable without rebuilding the instants.
+  n_fields = "INTEGER", year_min = "INTEGER", year_max = "INTEGER",
+
+  # Sparse and graph.
+  n_nonzero = "INTEGER", n_vertices = "INTEGER", n_edges = "INTEGER",
+  directed = "INTEGER",
+
+  # A list's elements profiled the way a frame's columns are, in the same
+  # shape, so one renderer serves both.
+  elements = "TEXT",
+  # dplyr's rowwise state, which was in the class chain and never recorded.
+  is_rowwise = "INTEGER",
+
+  # Per element rather than reduced across the list. The aggregates cannot say
+  # how big any one slot was, which is the question a list of folds raises.
+  element_lens = "TEXT", element_inner_nrow = "TEXT",
+
+  # Where a grid's variation runs. A summary over every cell reads a matrix and
+  # its transpose identically; the means along each margin do not. Fourteen
+  # columns whatever the size of the matrix, because the margins are summarised
+  # rather than stored.
+  row_mean_min = "REAL", row_mean_q1 = "REAL", row_mean_median = "REAL",
+  row_mean_mean = "REAL", row_mean_q3 = "REAL", row_mean_max = "REAL",
+  row_mean_sd = "REAL",
+  col_mean_min = "REAL", col_mean_q1 = "REAL", col_mean_median = "REAL",
+  col_mean_mean = "REAL", col_mean_q3 = "REAL", col_mean_max = "REAL",
+  col_mean_sd = "REAL"
+)
+
+# How one file happened to store the data, which is not a property of the data.
+# The same table saved twice can differ in all of these: R's serialization
+# format has versions, and version 3 cannot be read by R before 3.5.0, so this
+# is the difference between a dataset a reader can open and one they cannot.
+.DATASET_VERSION_COLS <- c(
+  format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
+  # A file that is not what its name says: which separator would work, and how
+  # many columns it would give. A property of this file, not of the data.
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
+)
+
+# Where a dataset was found. Not a property of its contents: the same data can
+# sit under data/ in one package and inst/extdata in another, and only the first
+# is loadable by name.
+.DATASET_IDENTITY_COLS <- c(
+  origin_dir = "TEXT",
+  # The title of the help page documenting this dataset. Not a property of the
+  # data: two packages carrying identical bytes may document them differently,
+  # or one may not document them at all.
+  title = "TEXT"
+)
+
+#' Add any dataset column the analyzer now emits that the table has not seen.
+#' Mirrors what bioc_code_summary already does for its own new columns; without
+#' it the widened CREATE only ever applies to a database built from nothing.
+.ensure_dataset_columns <- function(con) {
+  add <- function(table, spec) {
+    if (!table %in% DBI::dbListTables(con)) return(invisible(NULL))
+    existing <- DBI::dbListFields(con, table)
+    for (col in setdiff(names(spec), existing)) {
+      DBI::dbExecute(con, sprintf('ALTER TABLE %s ADD COLUMN "%s" %s',
+                                  table, col, spec[[col]]))
+    }
+    invisible(NULL)
+  }
+  add("bioc_dataset_contents", .DATASET_CONTENT_COLS)
+  add("bioc_dataset_versions", .DATASET_VERSION_COLS)
+  add("bioc_datasets", .DATASET_IDENTITY_COLS)
+  invisible(NULL)
+}
+
 .ensure_dataset_tables <- function(con) {
   tables <- DBI::dbListTables(con)
   if (!"bioc_datasets" %in% tables) {
@@ -190,6 +340,11 @@ metrics_fingerprint <- function(summary_df) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
   }
+  # The analyzer describes more of a dataset over time, and those fields arrive
+  # as columns that do not exist yet. This is also what widens the narrow CREATEs
+  # above to the full declared shape, so a database being built from nothing and
+  # one downloaded from the last release end up with the same columns.
+  .ensure_dataset_columns(con)
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
   DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
   invisible(NULL)
@@ -262,12 +417,16 @@ metrics_fingerprint <- function(summary_df) {
   # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
   ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
   cts <- df[!duplicated(ck), , drop = FALSE]
+  content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
+  ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
   DBI::dbExecute(con,
-    "INSERT OR IGNORE INTO bioc_dataset_contents
-       (content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol, n_missing_total, columns)
-     VALUES (?,?,?,?,?,?,?,?,?)",
-    params = list(cts$content_fp, cts$schema_fp, cts$fp_algo_version, cts$class,
-                  cts$kind, cts$nrow, cts$ncol, cts$n_missing_total, cts$columns))
+    sprintf("INSERT OR IGNORE INTO bioc_dataset_contents (%s) VALUES (%s)",
+            paste(sprintf('"%s"', ins_cols), collapse = ", "),
+            paste(rep("?", length(ins_cols)), collapse = ", ")),
+    params = lapply(ins_cols, function(k) {
+      v <- cts[[k]]
+      if (is.logical(v)) as.integer(v) else v
+    }))
 
   ids <- DBI::dbGetQuery(con,
     "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
@@ -285,7 +444,10 @@ metrics_fingerprint <- function(summary_df) {
   }
 
   # 3. Version links (package was wiped above, so a plain append is idempotent).
-  ver <- df[, c("package", "name", "version", "content_id", "format", "compression", "confidence", "is_current"), drop = FALSE]
+  ver_cols <- c("package", "name", "version", "content_id", "format",
+                "compression", "confidence", "is_current",
+                intersect(names(.DATASET_VERSION_COLS), names(df)))
+  ver <- df[, ver_cols, drop = FALSE]
   DBI::dbAppendTable(con, "bioc_dataset_versions", ver)
 
   # 4. Identity, one per (package, name), stamped with the current version's content.
@@ -295,6 +457,9 @@ metrics_fingerprint <- function(summary_df) {
     idn <- data.frame(package = cur$package, name = cur$name, file = cur$file,
                       internal = cur$internal, current_version = cur$version,
                       current_content_id = cur$content_id, stringsAsFactors = FALSE)
+    for (k in intersect(names(.DATASET_IDENTITY_COLS), names(cur))) {
+      idn[[k]] <- cur[[k]]
+    }
     DBI::dbAppendTable(con, "bioc_datasets", idn)
   }
   invisible(NULL)

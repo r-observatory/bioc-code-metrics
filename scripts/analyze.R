@@ -738,11 +738,7 @@ analyze_package <- function(repo_dir, package) {
     .empty_edges_df()
   }
 
-  datasets_df <- if (length(datasets_rows) > 0L) {
-    do.call(rbind, datasets_rows)
-  } else {
-    .empty_datasets_df()
-  }
+  datasets_df <- .rbind_datasets(datasets_rows) %||% .empty_datasets_df()
 
   summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
 
