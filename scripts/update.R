@@ -260,10 +260,10 @@
   }
   if (!"analyzer_version" %in% fields) {
     # Nothing on these rows says which build produced them, so none of them can
-    # be shown to match the one running now. This is taken once per database:
-    # the clear queues those packages, and .stamp_analyzer_version records the
-    # running build on everything the shard writes, so the column is there to
-    # compare against from the next run onwards.
+    # be shown to match the one running now. The column arrives with the first
+    # row the analyzer produces, and a database holding nothing but fallback
+    # rows never grows it: that database also has no scan marker to clear, so
+    # this clears nothing on every run rather than the same rows forever.
     return(DBI::dbExecute(con,
       "UPDATE bioc_code_summary SET datasets_scanned = NULL
         WHERE datasets_scanned IS NOT NULL"))
@@ -275,38 +275,64 @@
     params = list(current_version))
 }
 
+# Address one summary row the way the shard's producers name it. Package names
+# and version strings cannot contain a carriage return, so the pair survives
+# being flattened into one key.
+.analyzer_row_keys <- function(package, versions) {
+  versions <- as.character(versions)
+  if (length(versions) == 0L) return(character(0L))
+  paste(as.character(package), versions, sep = "\r")
+}
+
 #' Record on a shard's summary rows which analyzer build scanned them.
 #'
 #' .invalidate_stale_dataset_scans compares this column against the build about
-#' to run, and treats a table without it as a table of rows produced by an
-#' unknown build, clearing every marker. That clear is only a one-off if the
-#' column then appears, and until now the only thing that put it there was the
-#' analyzer's own summary record: rows written by any other path, including the
-#' pure-R fallback the pipeline is built to tolerate, arrived without it. On
-#' such a database the column never appeared, so the clear repeated on every
-#' run, the whole universe went back in the queue every run, and the pipeline
-#' reported a change and republished a dated release on runs where nothing at
-#' all had moved.
+#' to run, and treats a scanned row that names no build as one it cannot show
+#' to be current, so it is cleared again, re-queued, re-analysed, and the run
+#' reports a change on a universe where nothing changed. analyze_package stamps
+#' the build on the rows the analyzer's own output named and leaves the rest to
+#' be filled in here, where the run knows which build it is running.
 #'
-#' The value is the build the run had available, which is what staleness is
-#' about: re-running the same build over a row it already scanned finds the same
-#' thing, whether that scan went through the binary or fell back. What the
-#' analyzer reported about itself is left alone.
+#' Only the rows the analyzer produced. The pure-R fallback writes rows too,
+#' and putting the running build on one of those says the analyzer collected
+#' data the analyzer never saw. It is the same false claim datasets_scanned is
+#' withheld to avoid, on the same row, so the column would contradict the
+#' marker beside it. Nothing is lost by leaving those rows blank:
+#' .invalidate_stale_dataset_scans only reads rows that carry a scan marker,
+#' and a fallback row carries none, so it is never compared against a build in
+#' the first place. What used to keep such a row out of the queue was the
+#' stamp; what keeps it out now is the count of attempts that did not read it.
 #'
-#' Records nothing when the running build cannot be determined, matching the
-#' invalidation, which also stands aside rather than acting on a guess.
-.stamp_analyzer_version <- function(summary_df, current_version) {
+#' What the analyzer reported about itself is left alone: overwriting it would
+#' erase the one signal that tells a row collected by an older build from one
+#' collected by this one.
+#'
+#' @param current_version The build about to run, from rpkg_analyzer_version().
+#'   NA when there is no binary to ask, in which case nothing is written: a
+#'   guess would make every row look current and stop the queue noticing an
+#'   upgrade at all.
+#' @param produced Keys, from .analyzer_row_keys(), of the rows the analyzer
+#'   binary produced. Empty by default, which stamps nothing: a caller that
+#'   cannot say which rows the analyzer wrote must not answer for it.
+#' @return summary_df, with analyzer_version filled on those rows where it was
+#'   missing.
+.stamp_analyzer_version <- function(summary_df, current_version,
+                                    produced = character(0L)) {
   if (is.null(summary_df) || nrow(summary_df) == 0L) return(summary_df)
   if (is.null(current_version) || length(current_version) != 1L ||
       is.na(current_version) || !nzchar(current_version)) {
     return(summary_df)
   }
+  if (length(produced) == 0L) return(summary_df)
+  if (!all(c("package", "version") %in% names(summary_df))) return(summary_df)
+  mine <- .analyzer_row_keys(summary_df$package, summary_df$version) %in% produced
   stored <- if ("analyzer_version" %in% names(summary_df)) {
     as.character(summary_df$analyzer_version)
   } else {
     rep(NA_character_, nrow(summary_df))
   }
-  stored[is.na(stored) | !nzchar(stored)] <- current_version
+  gap <- mine & (is.na(stored) | !nzchar(stored))
+  stored[gap] <- as.character(current_version)
   summary_df$analyzer_version <- stored
   summary_df
 }
@@ -626,6 +652,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
   shard_failures       <- character(0L)
+  # Which of the rows about to be written the analyzer binary produced, keyed
+  # by package and version. Only those get the running build stamped on them.
+  shard_binary_keys    <- character(0L)
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
@@ -683,7 +712,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     .done(TRUE, "ok", nrow(res$summary))
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
-         functions = res$functions, edges = res$edges, datasets = res$datasets)
+         functions = res$functions, edges = res$edges, datasets = res$datasets,
+         binary_versions = res$binary_versions)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -706,6 +736,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_functions_list[[pkg]] <- r$functions
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
+      shard_binary_keys <- c(shard_binary_keys,
+                             .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
       # Analysed, but was it read? A package the analyzer did not read carries
       # none of the fields the backfill queues wait on, and that attempt is
@@ -729,10 +761,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
 
   # Which build scanned these rows is what the next run's staleness check reads,
-  # and a row that does not say reads as one an unknown build produced. Recorded
-  # here, where the run knows which binary it had, rather than left to whatever
-  # the per-package analysis happened to return.
-  fresh_summary <- .stamp_analyzer_version(fresh_summary, analyzer_version)
+  # and a scanned row that does not say reads as one an unknown build produced.
+  # Recorded here, where the run knows which binary it had, on the rows the
+  # analyzer actually produced and on no others.
+  fresh_summary <- .stamp_analyzer_version(fresh_summary, analyzer_version,
+                                           shard_binary_keys)
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,

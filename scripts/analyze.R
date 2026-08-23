@@ -519,7 +519,9 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #'
 #' @param repo_dir  Path to the cloned git repository.
 #' @param package   Package name string.
-#' @return Named list: $summary, $churn, $api, $functions, $edges.
+#' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
+#'   and $binary_versions: the versions whose metrics the analyzer binary
+#'   produced, as opposed to the pure-R fallback.
 analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
@@ -533,6 +535,11 @@ analyze_package <- function(repo_dir, package) {
   # frame cannot tell you: a package that ships no data and a package nothing
   # looked at both produce none.
   datasets_read      <- logical(nrow(versions_df))
+  # Whether the analyzer binary produced each version's metrics, or the pure-R
+  # fallback did. The caller stamps the running build on the rows collected by
+  # the analyzer and must not stamp the others, and once the summary rows are
+  # in one frame nothing about a row says which path wrote it.
+  from_binary        <- logical(nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -609,6 +616,7 @@ analyze_package <- function(repo_dir, package) {
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
       metrics <- analyze_with_binary(tmp)
+      binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)
       } else if (is.null(metrics[["analyzer_version"]])) {
@@ -617,6 +625,12 @@ analyze_package <- function(repo_dir, package) {
         # Taken from the binary rather than from its output, so a build that
         # does not report itself still leaves the column behind and the
         # re-scan queue can still settle.
+        #
+        # The column says which analyzer build collected the row, and it is
+        # written here and in the shard's own stamp, both on rows the binary
+        # produced. It is empty on a row the pure-R fallback wrote, which is
+        # not a gap to be filled: nothing named rpkg-analyzer was involved,
+        # and a build named there would say the opposite.
         metrics[["analyzer_version"]] <- rpkg_analyzer_version()
       }
 
@@ -709,7 +723,8 @@ analyze_package <- function(repo_dir, package) {
 
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row, datasets_read = !is.null(detail_ds))
+           datasets_row = datasets_row, datasets_read = !is.null(detail_ds),
+           from_binary = binary_ran)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -718,6 +733,7 @@ analyze_package <- function(repo_dir, package) {
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
     datasets_read[[i]]      <- isTRUE(iter$datasets_read)
+    from_binary[[i]]        <- isTRUE(iter$from_binary)
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -797,6 +813,11 @@ analyze_package <- function(repo_dir, package) {
     api       = api_df,
     functions = functions_df,
     edges     = edges_df,
-    datasets  = datasets_df
+    datasets  = datasets_df,
+    # The versions the analyzer binary produced, which is the only thing that
+    # tells those summary rows from the ones the pure-R fallback wrote once
+    # they are in the same frame. The caller stamps the running build on these
+    # and leaves the rest naming nobody.
+    binary_versions = as.character(versions_df$version[from_binary])
   )
 }

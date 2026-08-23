@@ -568,36 +568,85 @@ test_that("a scanned row records which build scanned it and which generation it 
   expect_equal(unique(result$datasets$fp_algo_version), FP_ALGO_VERSION)
 })
 
-# --- the run has to record which build scanned its rows -----------------------
-# The stale-scan check reads bioc_code_summary.analyzer_version, and clears
-# every marker for as long as that column is absent. Nothing guarantees the
-# column ever arrives: it reaches the table only when the per-package summary
-# happens to carry it, which is a property of what analyze_package returned
-# rather than of the run. A run that writes rows without recording the build it
-# scanned under leaves the check with nothing to compare, so the clear repeats
-# on the next run, and the one after, and the whole universe is queued again
-# every time.
+# --- the build a row was collected under, on the rows the analyzer produced ---
+# The stale-scan check reads bioc_code_summary.analyzer_version, and reads a
+# scanned row that names no build as one it cannot show to be current, so a
+# scanned row has to name the build that scanned it or the clear repeats on the
+# next run, and the one after, and the whole universe is queued again every
+# time.
+#
+# It has to name it only when the analyzer really produced it. Writing the
+# running build onto a row the pure-R fallback produced claims a producer that
+# produced nothing, which is the same false claim datasets_scanned is withheld
+# to avoid, and the two would then disagree about the same row.
 
 .ds_run_io <- function() list(
   package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
                                        stringsAsFactors = FALSE),
   clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
 
-# analyze_package without the analyzer version its own binary would have put
-# there, which is what any older stored row looks like.
-.ds_stub_analyze <- function() {
+# What build the stored rows name, if the column is there to name one at all.
+# A database whose every row came from the fallback never grows the column,
+# which is the same answer as a column full of NULLs and has to read as one.
+.ds_named_builds <- function(con) {
+  if (!"analyzer_version" %in% DBI::dbListFields(con, "bioc_code_summary")) {
+    return(NA_character_)
+  }
+  as.character(
+    DBI::dbGetQuery(con, "SELECT analyzer_version FROM bioc_code_summary")[[1L]])
+}
+
+# A package the analyzer read: the dataset marker and the build that earned it
+# arrive together, because the reader that sets one is the producer that names
+# the other. This is the shape analyze_package can actually return.
+.ds_stub_analyze <- function(version = "0.4.0-test") {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
   assign("analyze_package", function(dest, pkg) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
-      latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
-      stringsAsFactors = FALSE),
-    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL),
+      latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
+      analyzer_version = version, stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL,
+    binary_versions = "1.0"),
     envir = env)
   old
 }
 
-test_that("a run records the analyzer build on rows that arrived without one", {
+# The other shape: the pure-R fallback ran, so there is no scan and no build.
+.ds_stub_fallback <- function() {
+  env <- environment(run_update)
+  old <- get("analyze_package", envir = env)
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L,
+      latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = TRUE,
+      stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL,
+    binary_versions = character(0L)),
+    envir = env)
+  old
+}
+
+test_that("the run fills the build in on a row the analyzer produced without one", {
+  df <- data.frame(package = c("a", "b"), version = c("1.0", "1.0"),
+                   analyzer_version = c(NA_character_, NA_character_),
+                   stringsAsFactors = FALSE)
+  got <- .stamp_analyzer_version(df, "0.4.0-test", .analyzer_row_keys("a", "1.0"))
+  expect_equal(got$analyzer_version, c("0.4.0-test", NA_character_))
+})
+
+test_that("a row the analyzer did not produce is left naming nobody", {
+  # The pure-R fallback wrote this row. Stamping the running build on it would
+  # say the analyzer collected data the analyzer never saw, and the re-scan
+  # queue would then read a fallback row as one it has no reason to re-scan.
+  df <- data.frame(package = "a", version = "1.0",
+                   analyzer_version = NA_character_, stringsAsFactors = FALSE)
+  got <- .stamp_analyzer_version(df, "0.4.0-test")
+  expect_true(is.na(got$analyzer_version))
+  expect_true(is.na(.stamp_analyzer_version(
+    df, "0.4.0-test", .analyzer_row_keys("a", character(0L)))$analyzer_version))
+})
+
+test_that("a run records the analyzer build on the rows the analyzer produced", {
   skip_on_os("windows")
   stub_dir <- tempfile("bcm_stub_")
   dir.create(stub_dir)
@@ -605,7 +654,7 @@ test_that("a run records the analyzer build on rows that arrived without one", {
   withr::local_envvar(
     RPKG_ANALYZER_BIN = .write_versioned_stub(stub_dir, character(0L), "0.4.0-test"))
 
-  old <- .ds_stub_analyze()
+  old <- .ds_stub_analyze(version = NA_character_)
   on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
 
   out <- withr::local_tempdir()
@@ -613,7 +662,6 @@ test_that("a run records the analyzer build on rows that arrived without one", {
 
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
   on.exit(DBI::dbDisconnect(con), add = TRUE)
-  expect_true("analyzer_version" %in% DBI::dbListFields(con, "bioc_code_summary"))
   expect_equal(
     DBI::dbGetQuery(con, "SELECT analyzer_version FROM bioc_code_summary")[[1L]],
     "0.4.0-test")
@@ -641,4 +689,90 @@ test_that("the scan marker survives a second run over the same universe", {
     DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1L]], 1L)
   expect_equal(m2$n_fresh, 0L)
   expect_false(m2$changed)
+})
+
+test_that("a row the analyzer stamped keeps the build it names", {
+  # The run fills a gap; it does not restate what the analyzer already said.
+  # Overwriting would erase the one signal that tells a row collected by an
+  # older build from one collected by this one.
+  df <- data.frame(package = c("a", "b"), version = c("1.0", "1.0"),
+                   analyzer_version = c("0.2.0", NA_character_),
+                   stringsAsFactors = FALSE)
+  got <- .stamp_analyzer_version(df, "0.4.0-test",
+                                 .analyzer_row_keys("a", "1.0"))
+  expect_equal(got$analyzer_version, c("0.2.0", NA_character_))
+})
+
+test_that("a run that cannot name its analyzer stamps nothing", {
+  # Writing a guess would make every row look current and stop the re-scan
+  # queue from ever noticing an upgrade.
+  df <- data.frame(package = "a", version = "1.0",
+                   analyzer_version = NA_character_, stringsAsFactors = FALSE)
+  expect_true(is.na(.stamp_analyzer_version(
+    df, NA_character_, .analyzer_row_keys("a", "1.0"))$analyzer_version))
+  expect_false("analyzer_version" %in%
+                 names(.stamp_analyzer_version(
+                   data.frame(package = "a", stringsAsFactors = FALSE),
+                   NA_character_)))
+})
+
+test_that("a fallback row reaches the database naming no build at all", {
+  skip_on_os("windows")
+  stub_dir <- tempfile("bcm_stub_")
+  dir.create(stub_dir)
+  on.exit(unlink(stub_dir, recursive = TRUE), add = TRUE)
+  withr::local_envvar(
+    RPKG_ANALYZER_BIN = .write_versioned_stub(stub_dir, character(0L), "0.4.0-test"))
+
+  old <- .ds_stub_fallback()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  run_update(.ds_run_io(), out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  # Neither half of the claim. A row with no scan and a build against it says
+  # the analyzer was here and read nothing, which is the state this pipeline
+  # cannot tell from a package that ships no data.
+  expect_true(all(is.na(.ds_named_builds(con))))
+  expect_true(all(is.na(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1L]])))
+})
+
+test_that("a package the installed analyzer cannot read names no build either", {
+  # The same thing without a stub in the way: a real analyze_package, a real
+  # binary that answers --version and fails on the package.
+  skip_on_os("windows")
+  stub_dir <- tempfile("bcm_stub_")
+  dir.create(stub_dir)
+  on.exit(unlink(stub_dir, recursive = TRUE), add = TRUE)
+  stub <- file.path(stub_dir, "failing-analyzer.sh")
+  writeLines(c("#!/bin/sh",
+               'if [ "$1" = "--version" ]; then',
+               '  echo "rpkg-analyzer 0.4.0-test"',
+               "  exit 0",
+               "fi",
+               "exit 1"), stub)
+  Sys.chmod(stub, mode = "0755")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+
+  out  <- withr::local_tempdir()
+  repo <- file.path(withr::local_tempdir(), "pkgA_src")
+  .make_one_version_repo(repo)
+  io <- list(
+    package_list = function() data.frame(package = "mypkg", latest_version = "1.0",
+                                         stringsAsFactors = FALSE),
+    clone = function(pkg, dest) {
+      file.copy(repo, dirname(dest), recursive = TRUE)
+      file.rename(file.path(dirname(dest), basename(repo)), dest)
+      TRUE
+    })
+  run_update(io, out, shard_size = 10L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_true(all(is.na(.ds_named_builds(con))))
+  expect_true(all(is.na(
+    DBI::dbGetQuery(con, "SELECT datasets_scanned FROM bioc_code_summary")[[1L]])))
 })
