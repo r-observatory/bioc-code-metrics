@@ -15,6 +15,29 @@ SHARD_SIZE         <- 100L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"
 
+# How many times a package may be handed to the analyzer without being read
+# before the backfill queues stop asking for it. The same shape as
+# MAX_CLONE_FAILURES, for the same reason: a package with no way of leaving a
+# queue keeps the pipeline reporting a change forever and publishing a dated
+# release for a database that has not moved.
+#
+# The queues it governs are the ones only the analyzer can satisfy. n_fns_r and
+# the dataset rows come from the binary and from nowhere else, so a package the
+# pure-R fallback analysed carries neither, and both queues hand it straight
+# back. Nothing about the package changes between one such run and the next.
+#
+# Lower than the clone cap because the two failures are not alike. A clone
+# fails on the network, so the next attempt is a genuinely different one and
+# five of them are worth making. A read fails on what the package contains, and
+# one build's answer is the same every time it is asked: the second attempt is
+# there for a run that failed for a reason other than the package, a killed
+# worker or a timeout, and a third would only collect the same answer again.
+#
+# Not a permanent verdict. The record carries the build that could not read the
+# package, and a later build clears it, so the retirement lasts exactly as long
+# as the reader it was measured against.
+MAX_ANALYZER_READ_ATTEMPTS <- 2L
+
 SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"

@@ -312,6 +312,11 @@ test_that("open_or_init_db on existing DB is idempotent and returns a valid conn
   expect_true(DBI::dbIsValid(con2))
   tables <- DBI::dbListTables(con2)
   expect_true("bioc_metrics_failures" %in% tables)
+  # The path a downloaded release takes: a database built by an earlier run
+  # has to come back holding the tables added since, or the run that opens it
+  # records nothing and every queue it feeds keeps handing back the same
+  # packages.
+  expect_true("bioc_analyzer_read_attempts" %in% tables)
 })
 
 # ---------------------------------------------------------------------------

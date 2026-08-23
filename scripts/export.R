@@ -491,10 +491,12 @@ open_or_init_data_db <- function(path) {
 
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The three non-summary tables
-#' (bioc_code_churn, bioc_api_history, bioc_metrics_failures) are created with
-#' fixed schemas and indexes on first open. bioc_code_summary is created lazily
-#' by upsert_shard the first time data is written (its schema is dynamic).
+#' If the file does not yet exist it is created. The four non-summary tables
+#' (bioc_code_churn, bioc_api_history, bioc_metrics_failures,
+#' bioc_analyzer_read_attempts) are created with fixed schemas and indexes on
+#' first open, so a database downloaded from an older release gains the ones it
+#' does not have yet. bioc_code_summary is created lazily by upsert_shard the
+#' first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
 #' @return An open DBI connection. The caller is responsible for calling
@@ -531,6 +533,21 @@ open_or_init_db <- function(path) {
         package              TEXT PRIMARY KEY,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
         last_attempt         TEXT
+      )")
+  }
+
+  # Packages handed to the analyzer that it did not read. The fields the
+  # backfill queues wait on (n_fns_r, the dataset rows) come from the binary
+  # alone, so a package the pure-R fallback analysed carries none of them and
+  # both queues hand it back on every run for good. analyzer_version is the
+  # build that could not read it, so a later build can ask again.
+  if (!"bioc_analyzer_read_attempts" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE bioc_analyzer_read_attempts (
+        package          TEXT PRIMARY KEY,
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        analyzer_version TEXT,
+        last_attempt     TEXT
       )")
   }
 
@@ -734,8 +751,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param ver_table   Table to count rows from for n_versions.
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
-#' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
-#'   n_universe/n_remaining may be NULL.
+#' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
+#'   bootstrap_complete, n_datasets_unreadable). n_universe/n_remaining and
+#'   n_datasets_unreadable may be NULL, in which case they are left out.
 #' @return A named list matching the MANIFEST SCHEMA.
 #' @param last_changed ISO-8601 timestamp of the last run that actually moved the
 #'   data, or NULL when this run did. Kept separate from the generation time
@@ -831,7 +849,15 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       n_analyzed         = bootstrap$n_analyzed,
       n_universe         = bootstrap$n_universe,
       n_remaining        = bootstrap$n_remaining,
-      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
+      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete),
+      # How many packages the pipeline has stopped asking for datasets: asked
+      # to the cap under this analyzer build and never read. Kept beside
+      # bootstrap_complete because completion is measured against the code
+      # analysis, so it reads true while these packages sit unread. The number
+      # does not come down on its own, which is what makes it worth publishing:
+      # it says what the corpus is missing for good, until a build that can
+      # read them arrives.
+      n_datasets_unreadable = bootstrap$n_datasets_unreadable
     )
   )
 }

@@ -81,11 +81,131 @@
     params = list(MAX_CLONE_FAILURES))$package
 }
 
+# ---------------------------------------------------------------------------
+# The third state of a scan
+# ---------------------------------------------------------------------------
+# datasets_scanned answers two of the three states a package can be in: the
+# reader ran (whatever it found, zero rows included), or nothing looked. The
+# third is a package the reader was asked for and could not read, which the
+# marker cannot say without claiming a scan that did not happen. Recorded here
+# instead, in the shape this pipeline already uses for a package that cannot be
+# cloned: a count, a cap, and no place in the queue past it.
+#
+# Both backfill queues need it, because both wait on fields only the analyzer
+# produces: n_fns_r and the dataset rows. A package the pure-R fallback
+# analysed carries neither, so each queue hands it straight back, every run,
+# for good. `changed` never goes false and the workflow publishes a dated
+# release for a database that has not moved.
+
+# Did the analyzer read this package? datasets_scanned is the answer: the
+# dataset reader runs exactly when the binary produced the version's metrics,
+# and the marker is written on the latest-version row, so any row carrying it
+# says the binary read the version this package's queue position is about.
+# Tolerant of the column being absent, NA, logical or integer, because it
+# crosses SQLite in both directions.
+.analyzer_read_package <- function(summary_df) {
+  if (is.null(summary_df) || !is.data.frame(summary_df) ||
+      nrow(summary_df) == 0L || !"datasets_scanned" %in% names(summary_df)) {
+    return(FALSE)
+  }
+  v <- suppressWarnings(as.logical(summary_df$datasets_scanned))
+  any(!is.na(v) & v)
+}
+
+# Count one attempt that did not read the package, against the build that made
+# it. The build is part of the record: an attempt says nothing about a reader
+# other than the one that made it.
+.record_analyzer_read_attempt <- function(con, pkg, analyzer_version = NA_character_) {
+  if (!"bioc_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  ver <- if (is.null(analyzer_version) || length(analyzer_version) != 1L ||
+             is.na(analyzer_version) || !nzchar(analyzer_version)) {
+    NA_character_
+  } else {
+    as.character(analyzer_version)
+  }
+  now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  existing <- DBI::dbGetQuery(con,
+    "SELECT attempts FROM bioc_analyzer_read_attempts WHERE package = ?",
+    params = list(pkg))
+  if (nrow(existing) == 0L) {
+    DBI::dbExecute(con,
+      "INSERT INTO bioc_analyzer_read_attempts
+         (package, attempts, analyzer_version, last_attempt)
+       VALUES (?, 1, ?, ?)",
+      params = list(pkg, ver, now_str))
+  } else {
+    DBI::dbExecute(con,
+      "UPDATE bioc_analyzer_read_attempts
+       SET attempts = attempts + 1, analyzer_version = ?, last_attempt = ?
+       WHERE package = ?",
+      params = list(ver, now_str, pkg))
+  }
+  invisible(NULL)
+}
+
+# Forget a package's attempts, because something read it. A count that survived
+# a successful read would retire a package that failed once on a bad day sooner
+# than the cap says.
+.clear_analyzer_read_attempts <- function(con, pkg) {
+  if (!"bioc_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  DBI::dbExecute(con,
+    "DELETE FROM bioc_analyzer_read_attempts WHERE package = ?",
+    params = list(pkg))
+  invisible(NULL)
+}
+
+# Drop attempts made by any build other than the one running.
+#
+# The count is the verdict of one reader, and a verdict that outlives its
+# reader retires a package for good on the say-so of a build nobody runs any
+# more. The row it protects is not re-queued by .invalidate_stale_dataset_scans
+# either, since that one only clears markers and this package has none, so this
+# is the only thing that gives a new build the chance to read it.
+#
+# Does nothing when the running build cannot be named, for the same reason
+# .invalidate_stale_dataset_scans does nothing: a run with no binary records
+# its attempts against no build, and clearing those on the next such run would
+# reset the count every time and the queue would never drain.
+.forget_other_builds_read_attempts <- function(con, current_version) {
+  if (!"bioc_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(0L)
+  if (is.null(current_version) || length(current_version) != 1L ||
+      is.na(current_version) || !nzchar(current_version)) {
+    return(0L)
+  }
+  DBI::dbExecute(con,
+    "DELETE FROM bioc_analyzer_read_attempts
+      WHERE analyzer_version IS NULL OR analyzer_version <> ?",
+    params = list(as.character(current_version)))
+}
+
+# Packages the backfill queues have stopped asking about.
+.analyzer_read_exhausted <- function(con) {
+  if (!"bioc_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(character(0L))
+  as.character(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_analyzer_read_attempts WHERE attempts >= ?",
+    params = list(MAX_ANALYZER_READ_ATTEMPTS))$package)
+}
+
+#' How many packages the pipeline has stopped asking for datasets.
+#'
+#' Every one of these is honestly unread, because the reader that would have
+#' scanned them is the binary that could not read them at all. What makes the
+#' number worth publishing is that it does not come down on its own: it is what
+#' the deliberate slow convergence costs, and if it climbs, the reader is
+#' failing on packages rather than on one.
+.n_datasets_unreadable <- function(con) {
+  length(.analyzer_read_exhausted(con))
+}
+
 #' Packages needing a metrics backfill: those with a stored row where the
 #' sentinel column is NULL, or every stored package when that column has not been
-#' added yet. Restricted to the current universe and excluding permanent
-#' failures.
+#' added yet. Restricted to the current universe and excluding the packages the
+#' caller names.
 #'
+#' @param perm_fail_pkgs Packages to leave out whatever their sentinel says.
+#'   Permanent clone failures on every call, and on the dataset queue the
+#'   packages this analyzer build has already asked for and could not read:
+#'   both are packages a queue has no way of finishing.
 #' @param latest_only When FALSE (default), a package is flagged if ANY of its
 #'   rows has a NULL sentinel. Correct for a per-version sentinel like n_fns_r.
 #'   When TRUE, the NULL check is confined to the package's latest-version row
@@ -338,6 +458,9 @@ default_io <- function() {
 #' @param recollect When TRUE, re-analyzes only packages whose stored rows
 #'   predate the binary metrics (a sentinel column is NULL). Nothing is wiped:
 #'   rows are upserted in place, so the served DB stays complete throughout.
+#'   Not filtered by the analyzer read attempts, unlike the scheduled path: an
+#'   operator asking for a backfill by name is asking for the packages the
+#'   scheduled run has given up on as well.
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                        recollect = FALSE) {
@@ -423,17 +546,6 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       !identical(as.character(lv), as.character(stored_v))
     }, logical(1L))
     changed <- as.character(universe$package[is_todo])
-    # Also drain any packages whose rows predate the binary metrics, so a normal
-    # scheduled run finishes the one-time backfill and then reverts to just the
-    # changed packages once none remain.
-    backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs)
-    # And drain any package with a version row that predates all-versions detail
-    # (detail_scanned IS NULL on ANY row). Re-analyzing fills per-version detail
-    # and marks every row, so it converges; a package re-analyzed once is never
-    # re-flagged, even if some versions produced zero functions.
-    detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
-                                        sentinel = "detail_scanned",
-                                        latest_only = FALSE)
     # An analyzer upgrade changes what a scan finds, so rows produced by an older
     # build are stale even though they are marked scanned. Clearing the marker on
     # those puts them back in the queue below, which drains a shard at a time and
@@ -442,12 +554,43 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (n_stale > 0L) {
       message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
     }
+    # The same change gives back the packages the previous build could not read.
+    # Their rows carry no marker to invalidate, so this is the only thing that
+    # puts them in front of a new reader. Before the queues are read, so this
+    # run is the one that asks again.
+    n_retry <- .forget_other_builds_read_attempts(con, analyzer_version)
+    if (n_retry > 0L) {
+      message(sprintf("packages to re-read under this analyzer: %d", n_retry))
+    }
+    # The packages this build has already been given MAX_ANALYZER_READ_ATTEMPTS
+    # times and did not read. Both backfill queues below wait on fields only the
+    # binary produces, so both would hand these back every run for good. They
+    # are excluded the same way and in the same place a package that cannot be
+    # cloned is, because it is the same problem: a package with no way out of a
+    # queue keeps every run reporting a change. The changed-version path above
+    # is deliberately not filtered, because a new release is a new question and
+    # answering it clears the record.
+    unread_pkgs <- .analyzer_read_exhausted(con)
+    # Also drain any packages whose rows predate the binary metrics, so a normal
+    # scheduled run finishes the one-time backfill and then reverts to just the
+    # changed packages once none remain.
+    backfill <- .recollect_todo(con, universe$package,
+                                c(perm_fail_pkgs, unread_pkgs))
+    # And drain any package with a version row that predates all-versions detail
+    # (detail_scanned IS NULL on ANY row). Re-analyzing fills per-version detail
+    # and marks every row, so it converges; a package re-analyzed once is never
+    # re-flagged, even if some versions produced zero functions. Not filtered by
+    # the read attempts: this marker is written by the run itself under either
+    # producer, so the queue drains without the analyzer.
+    detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+                                        sentinel = "detail_scanned",
+                                        latest_only = FALSE)
     # And drain any package whose latest-version row predates the dataset reader
     # (datasets_scanned IS NULL), so bioc_datasets fills in without a manual
     # recollect. Also latest-row-scoped, so it converges once re-analyzed.
-    dataset_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
-                                        sentinel = "datasets_scanned",
-                                        latest_only = TRUE)
+    dataset_backfill <- .recollect_todo(
+      con, universe$package, c(perm_fail_pkgs, unread_pkgs),
+      sentinel = "datasets_scanned", latest_only = TRUE)
     todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
   }
 
@@ -564,6 +707,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
       .reset_failure(con, pkg)
+      # Analysed, but was it read? A package the analyzer did not read carries
+      # none of the fields the backfill queues wait on, and that attempt is
+      # what eventually takes it out of them. A package that was read starts
+      # over from nothing, so one bad run does not count against the next.
+      if (.analyzer_read_package(r$summary)) {
+        .clear_analyzer_read_attempts(con, pkg)
+      } else {
+        .record_analyzer_read_attempt(con, pkg, analyzer_version)
+      }
     }
   }
 
@@ -662,7 +814,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
-                    bootstrap_complete = bootstrap_complete)
+                    bootstrap_complete = bootstrap_complete,
+                    n_datasets_unreadable = .n_datasets_unreadable(con))
 
   # When this run moved nothing, the moment the data last moved is whatever the
   # previous manifest recorded. Carrying it forward is what lets last_checked
