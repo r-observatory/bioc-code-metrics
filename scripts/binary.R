@@ -51,10 +51,6 @@ rpkg_analyzer_bin <- function() {
   })
 }
 
-# Build the per-dataset detail frame from parsed "dataset" records. Scalar
-# fields become columns; the nested `columns` and `row_sketch` are kept as JSON
-# strings (as .flatten_summary does for nested values). Column order matches
-# .empty_datasets_df in analyze.R (minus the package/version stamp).
 # The columns a dataset frame always has, whether or not this shard's records
 # happen to mention them, with the type each takes when empty. Downstream code
 # addresses these by name, so a shard where nothing carried a row_sketch must
@@ -89,6 +85,11 @@ rpkg_analyzer_bin <- function() {
   }))
 }
 
+# Build the per-dataset detail frame from parsed "dataset" records. Scalar
+# fields become columns; nested values such as `columns` and `row_sketch` are
+# kept as JSON strings (as .flatten_summary does for the summary record). The
+# base columns lead in the order .empty_datasets_df declares, minus the
+# package/version stamp that analyze.R applies later.
 .datasets_frame <- function(recs) {
   # Carry whatever the analyzer emits rather than a fixed list of names. The
   # list version silently dropped every field added since it was written, so a
