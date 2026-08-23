@@ -188,13 +188,43 @@
 
 #' How many packages the pipeline has stopped asking for datasets.
 #'
-#' Every one of these is honestly unread, because the reader that would have
-#' scanned them is the binary that could not read them at all. What makes the
-#' number worth publishing is that it does not come down on its own: it is what
-#' the deliberate slow convergence costs, and if it climbs, the reader is
-#' failing on packages rather than on one.
+#' A subset of .n_datasets_unscanned(): every one of these is honestly unread,
+#' because the reader that would have scanned them is the binary that could not
+#' read them at all. The difference is that this number does not come down on
+#' its own, which is the fact worth publishing. It is what the deliberate slow
+#' convergence costs, and if it climbs, the reader is failing on packages
+#' rather than on one.
 .n_datasets_unreadable <- function(con) {
   length(.analyzer_read_exhausted(con))
+}
+
+#' How many packages the dataset scan has never reached.
+#'
+#' The marker lives on the latest-version row, beside latest_release_date, so
+#' the question is scoped the same way .recollect_todo scopes the backfill it
+#' feeds: a package counts when its latest row has no marker.
+#'
+#' Deliberately NOT filtered by permanent failures or by the current universe,
+#' unlike the to-do pool. Those are exactly the packages that will never be
+#' scanned and so never appear in a queue, which is what makes them invisible:
+#' bootstrap_complete goes true and stays true with them still unscanned. This
+#' is the number that says how many.
+#'
+#' @return Package count. Zero when there is nothing to measure yet; every
+#'   package when the marker column does not exist, because before the first
+#'   write that carries it nothing has been scanned.
+.n_datasets_unscanned <- function(con) {
+  if (!"bioc_code_summary" %in% DBI::dbListTables(con)) return(0L)
+  fields <- DBI::dbListFields(con, "bioc_code_summary")
+  if (!"latest_release_date" %in% fields) return(0L)
+  sql <- if ("datasets_scanned" %in% fields) {
+    "SELECT COUNT(DISTINCT package) n FROM bioc_code_summary
+      WHERE latest_release_date IS NOT NULL AND datasets_scanned IS NULL"
+  } else {
+    "SELECT COUNT(DISTINCT package) n FROM bioc_code_summary
+      WHERE latest_release_date IS NOT NULL"
+  }
+  as.integer(DBI::dbGetQuery(con, sql)$n %||% 0L)
 }
 
 #' Packages needing a metrics backfill: those with a stored row where the
@@ -848,6 +878,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete,
+                    n_datasets_unscanned = .n_datasets_unscanned(con),
                     n_datasets_unreadable = .n_datasets_unreadable(con))
 
   # When this run moved nothing, the moment the data last moved is whatever the

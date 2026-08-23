@@ -37,3 +37,29 @@ test_that("run_update writes both manifests and the changed-packages file", {
   expect_identical(dm$n_packages, 1L)
   expect_true("pkgA" %in% read_changed_packages(file.path(out, "changed-packages.txt")))
 })
+
+test_that("both manifests report the packages no dataset scan reached", {
+  # bootstrap_complete is true here and the package has never been dataset
+  # scanned. Only the new count says so, and it has to reach the file: the log
+  # line that would have said it scrolls away with the run.
+  old <- analyze_package
+  assign("analyze_package", function(dest, pkg) list(
+    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+      latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = 1L,
+      stringsAsFactors = FALSE),
+    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL,
+    binary_versions = character(0L)),
+    envir = environment(run_update))
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  run_update(.fake_io2(), out, shard_size = 10L)
+
+  cm <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))
+  expect_true(cm$bootstrap$bootstrap_complete)
+  expect_identical(cm$bootstrap$n_datasets_unscanned, 1L)
+  # Both series carry it: whoever is reading the dataset manifest is the one
+  # asking how much of the catalog was ever looked at.
+  dm <- jsonlite::fromJSON(file.path(out, "data-manifest.json"))
+  expect_identical(dm$bootstrap$n_datasets_unscanned, 1L)
+})

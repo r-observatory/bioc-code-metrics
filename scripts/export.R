@@ -752,8 +752,9 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
-#'   bootstrap_complete, n_datasets_unreadable). n_universe/n_remaining and
-#'   n_datasets_unreadable may be NULL, in which case they are left out.
+#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable).
+#'   n_universe/n_remaining and the two dataset counts may be NULL, in which
+#'   case they are left out.
 #' @return A named list matching the MANIFEST SCHEMA.
 #' @param last_changed ISO-8601 timestamp of the last run that actually moved the
 #'   data, or NULL when this run did. Kept separate from the generation time
@@ -850,6 +851,11 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       n_universe         = bootstrap$n_universe,
       n_remaining        = bootstrap$n_remaining,
       bootstrap_complete = isTRUE(bootstrap$bootstrap_complete),
+      # A different question from bootstrap_complete, and one it hides:
+      # completion is measured against the code analysis, so it reads true
+      # while packages sit with no dataset scan at all and no queue that will
+      # ever pick them up.
+      n_datasets_unscanned = bootstrap$n_datasets_unscanned,
       # How many packages the pipeline has stopped asking for datasets: asked
       # to the cap under this analyzer build and never read. Kept beside
       # bootstrap_complete because completion is measured against the code
