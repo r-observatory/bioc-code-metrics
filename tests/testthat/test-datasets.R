@@ -377,3 +377,26 @@ test_that("a record's fields are carried through the frame rather than a fixed l
   # The base shape downstream code addresses by name is still there in full.
   expect_true(all(names(.DATASET_BASE_COLS) %in% names(ds)))
 })
+
+test_that("a padded frame writes without carrying its padding into the wrong type", {
+  # Padding fills an absent column with a logical NA, and most of the columns it
+  # can land in are declared TEXT or REAL. Writing that must leave a NULL rather
+  # than fixing the column's type or failing the whole shard.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  wide   <- .mk_wide_row(version = "1.1")
+  narrow <- .mk_ds_row("p", "1.0", FALSE, "C0")
+  narrow$fp_algo_version <- 3L
+  df <- .rbind_datasets(list(narrow, wide))
+  expect_equal(nrow(df), 2L)
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT content_fp, matrix_shape, density FROM bioc_dataset_contents ORDER BY content_fp")
+  expect_equal(got$content_fp, c("C0", "C1"))
+  expect_true(is.na(got$matrix_shape[got$content_fp == "C0"]))
+  expect_equal(got$matrix_shape[got$content_fp == "C1"], "symmetric")
+  expect_equal(got$density[got$content_fp == "C1"], 0.125)
+  # The identity row still comes from the current version, padding or not.
+  expect_equal(DBI::dbGetQuery(con, "SELECT origin_dir FROM bioc_datasets")$origin_dir, "data")
+})
