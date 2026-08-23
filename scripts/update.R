@@ -355,6 +355,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
             call. = FALSE, immediate. = TRUE)
   }
 
+  # Read once, and use the same answer for both halves of the re-scan queue:
+  # the build the stored rows are compared against, and the build stamped on
+  # the rows this shard writes. Asking twice would let a binary swapped
+  # mid-run clear markers it then never restores.
+  analyzer_version <- rpkg_analyzer_version()
+
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
   db_path      <- file.path(out_dir, DB_FILENAME)
@@ -432,7 +438,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # build are stale even though they are marked scanned. Clearing the marker on
     # those puts them back in the queue below, which drains a shard at a time and
     # settles once every row carries the running build's version.
-    n_stale <- .invalidate_stale_dataset_scans(con, rpkg_analyzer_version())
+    n_stale <- .invalidate_stale_dataset_scans(con, analyzer_version)
     if (n_stale > 0L) {
       message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
     }
@@ -574,7 +580,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # and a row that does not say reads as one an unknown build produced. Recorded
   # here, where the run knows which binary it had, rather than left to whatever
   # the per-package analysis happened to return.
-  fresh_summary <- .stamp_analyzer_version(fresh_summary, rpkg_analyzer_version())
+  fresh_summary <- .stamp_analyzer_version(fresh_summary, analyzer_version)
 
   if (length(fresh_pkgs) > 0L) {
     # Write dataset rows before the code summary stamps datasets_scanned = TRUE,
