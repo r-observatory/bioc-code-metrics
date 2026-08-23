@@ -30,12 +30,18 @@ test_that("a first run has nothing to check", {
   expect_identical(res$notes, character(0L))
 })
 
-test_that("an advertised database that came back empty stops the run", {
+test_that("an advertised database with nothing in it yet does not stop the run", {
+  # A database that holds no rows is what the first run of a cold bootstrap
+  # publishes for whichever series its first shard had nothing for, and the
+  # release it publishes stays latest. Refusing on the count alone was a state
+  # with no way out: run 2 refuses, so does run 3, and force_full is the wipe
+  # this check exists to prevent.
   out <- withr::local_tempdir()
-  .pf_code_db(file.path(out, DB_FILENAME), 0L)
-  v <- preflight_prior_dbs(out, "code")$violations
-  expect_true(length(v) > 0L)
-  expect_true(any(grepl("no rows", v)))
+  con <- open_or_init_data_db(file.path(out, DATA_DB_FILENAME))
+  DBI::dbDisconnect(con)
+  res <- preflight_prior_dbs(out, "data")
+  expect_identical(res$violations, character(0L))
+  expect_identical(res$checked, "data")
 })
 
 test_that("an advertised database that never landed stops the run", {
@@ -146,22 +152,95 @@ test_that("preflight reports which series it actually looked at", {
 
 test_that("a file that is not a database at all stops the run", {
   # A download that stops partway leaves bytes on disk that SQLite will not
-  # open. That has to read as "holds nothing", not as an R error nobody can act
-  # on.
+  # open. That is the one thing a file can say for itself about a lost
+  # download, and it has to read as a refusal rather than as an R error nobody
+  # can act on.
   out <- withr::local_tempdir()
   writeLines("not a database", file.path(out, DB_FILENAME))
   v <- preflight_prior_dbs(out, "code")$violations
   expect_true(length(v) > 0L)
-  expect_true(any(grepl("no rows", v)))
+  expect_true(any(grepl("not a readable database", v, fixed = TRUE)))
 })
 
 test_that("the data series is checked on its own tables", {
   out <- withr::local_tempdir()
   con <- open_or_init_data_db(file.path(out, DATA_DB_FILENAME))
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id) VALUES ('p', 'd', '1.0', 1)")
   DBI::dbDisconnect(con)
+  write_manifest(file.path(out, "prev-data-manifest.json"),
+                 .pf_manifest(series = "data", n_packages = 0, n_versions = 9))
   v <- preflight_prior_dbs(out, "data")$violations
   expect_true(length(v) > 0L)
   expect_true(any(grepl("bioc_dataset_versions", v, fixed = TRUE)))
+})
+
+# ---------------------------------------------------------------------------
+# The baseline measured from a database whose manifest never landed
+# ---------------------------------------------------------------------------
+
+test_that("a release carrying a database and no manifest gets a baseline measured from it", {
+  # publish_metrics uploads four assets in one non-atomic --clobber, so a run
+  # that died in that window leaves a release with its database and no
+  # manifest. The database is right there and it is the thing worth protecting,
+  # so measure it rather than have nothing to check against.
+  out <- withr::local_tempdir()
+  .pf_code_db(file.path(out, DB_FILENAME), 4L)
+
+  notes <- ensure_prior_baseline(out)
+  expect_true(length(notes) > 0L)
+  expect_true(any(grepl("code-manifest.json", notes, fixed = TRUE)))
+
+  mpath <- file.path(out, "prev-code-manifest.json")
+  expect_true(file.exists(mpath))
+  m <- jsonlite::fromJSON(mpath)
+  expect_identical(m$series, "code")
+  expect_equal(m$n_packages, 4)
+  expect_equal(m$n_versions, 4)
+  expect_identical(m$measured_from, DB_FILENAME)
+
+  # And the run may then build on it.
+  expect_identical(preflight_prior_dbs(out, "code")$violations, character(0L))
+})
+
+test_that("a measured baseline is a real floor for the run after it", {
+  # The point of measuring is not to make the refusal go away. A database that
+  # then comes back holding less than what was measured is still refused.
+  out <- withr::local_tempdir()
+  .pf_code_db(file.path(out, DB_FILENAME), 9L)
+  ensure_prior_baseline(out)
+
+  unlink(file.path(out, DB_FILENAME))
+  .pf_code_db(file.path(out, DB_FILENAME), 2L)
+  v <- preflight_prior_dbs(out, "code")$violations
+  expect_true(length(v) > 0L)
+  expect_true(any(grepl("bioc_code_summary", v, fixed = TRUE)))
+})
+
+test_that("a published manifest is never replaced by a measured one", {
+  # Absence of a record is not evidence that nothing was lost, but a record
+  # saying the database used to be bigger is, and the check has to keep seeing
+  # it.
+  out <- withr::local_tempdir()
+  .pf_code_db(file.path(out, DB_FILENAME), 2L)
+  write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
+
+  expect_identical(ensure_prior_baseline(out), character(0L))
+  m <- jsonlite::fromJSON(file.path(out, "prev-code-manifest.json"))
+  expect_equal(m$n_packages, 4)
+  expect_true(length(preflight_prior_dbs(out, "code")$violations) > 0L)
+})
+
+test_that("a database with nothing to measure yields no baseline", {
+  # An empty database and one that never arrived have to stay
+  # indistinguishable here: writing a baseline of zero would publish a floor of
+  # zero as though it were a record of what the release held.
+  out <- withr::local_tempdir()
+  expect_null(derive_baseline_manifest("code", file.path(out, DB_FILENAME)))
+  .pf_code_db(file.path(out, DB_FILENAME), 0L)
+  expect_null(derive_baseline_manifest("code", file.path(out, DB_FILENAME)))
+  expect_identical(ensure_prior_baseline(out), character(0L))
+  expect_false(file.exists(file.path(out, "prev-code-manifest.json")))
 })
 
 # ---------------------------------------------------------------------------

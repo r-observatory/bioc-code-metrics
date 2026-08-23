@@ -19,6 +19,13 @@
 # the comparison holds only before the first shard, because every later shard
 # has legitimately added rows to the same file while prev-*-manifest.json still
 # describes yesterday's release.
+#
+# Two things happen here, in this order. A release that published a database
+# and no manifest gets a baseline measured from that database, because the
+# publish is four assets in one non-atomic --clobber and can be interrupted
+# between them. Then each database is compared against the manifest that
+# shipped with it, and only a database that did not come back at all, or one
+# holding LESS than its manifest recorded, stops the run.
 
 # The two series the download step brings back, named once. `expected` names
 # the ones whose DATABASE the resolved release advertised, and the downloaded
@@ -52,14 +59,19 @@
 # 1e+05), which is not a number an operator can compare against a release.
 .pf_fmt <- function(x) sprintf("%.0f", as.numeric(x))
 
-# Count rows and distinct packages in one database file. A file that is not
-# there, a table that is not in it, and a file SQLite refuses to read all count
-# zero. The last one matters: a download that stops partway leaves bytes on
-# disk that are not a database, and "holds nothing" is both true of it and a
-# far more useful thing to say than "file is not a database".
+# Count rows and distinct packages in one database file, and say whether the
+# file was a database at all.
+#
+# `readable` is the only thing a file can say for itself about a lost download.
+# A download that stops partway leaves bytes on disk that SQLite will not read,
+# and that is a fact about the transfer. Zero rows is not: a database this
+# pipeline published can genuinely hold none, so the counts are evidence to
+# compare against a baseline rather than a verdict on their own.
 .pf_db_counts <- function(db_path, ver_table, pkg_table) {
-  none <- list(n_versions = 0, n_packages = 0)
+  none <- list(readable = FALSE, n_versions = 0, n_packages = 0)
   if (!file.exists(db_path)) return(none)
+  size <- as.numeric(file.info(db_path)$size)
+  if (length(size) != 1L || is.na(size) || size <= 0) return(none)
   # Opening a file that is not a database succeeds and warns; it is the first
   # query that fails. Both are expected here and both mean the same thing.
   con <- tryCatch(suppressWarnings(DBI::dbConnect(RSQLite::SQLite(), db_path)),
@@ -67,11 +79,13 @@
   if (is.null(con)) return(none)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  present <- tryCatch(DBI::dbListTables(con), error = function(e) character(0L))
+  present <- tryCatch(DBI::dbListTables(con), error = function(e) NULL)
+  if (is.null(present)) return(none)
   count <- function(sql) {
     tryCatch(as.numeric(DBI::dbGetQuery(con, sql)$n), error = function(e) 0)
   }
   list(
+    readable = TRUE,
     n_versions = if (ver_table %in% present) {
       count(sprintf('SELECT COUNT(*) n FROM "%s"', ver_table))
     } else 0,
@@ -185,6 +199,73 @@ prior_db_notes <- function(series, counts, prior, tables) {
   out
 }
 
+#' A baseline measured from a downloaded database, for a release that
+#' published no manifest.
+#'
+#' The publish is not atomic (four assets, one --clobber, each existing asset
+#' deleted before its replacement lands), so a run that died in that window can
+#' leave a release carrying its database and no code-manifest.json. There was
+#' nothing to check such a database against, so it was checked against the row
+#' count alone and a release that lost one asset was refused every day after,
+#' since the same release stays latest.
+#'
+#' The database is right there and it is the thing worth protecting, so measure
+#' it. The result is a real floor for prior_db_violations(): a database that
+#' then comes back holding less than what was measured is still refused.
+#'
+#' Returns NULL when there is nothing to measure. An absent, empty or
+#' unreadable database is exactly what a lost download leaves, and a baseline
+#' of zero would publish a floor of zero as though it were a record of what the
+#' release held.
+#'
+#' @param series  "code" or "data".
+#' @param db_path Path to the downloaded database.
+#' @return A manifest-shaped list, or NULL.
+derive_baseline_manifest <- function(series, db_path) {
+  spec <- Filter(function(s) identical(s$series, series), .preflight_specs())
+  if (length(spec) != 1L) return(NULL)
+  spec <- spec[[1L]]
+  counts <- .pf_db_counts(db_path, spec$ver_table, spec$pkg_table)
+  if (!isTRUE(counts$readable)) return(NULL)
+  if (counts$n_versions <= 0 || counts$n_packages <= 0) return(NULL)
+
+  list(schema_version = 1L, series = series,
+       measured_from = basename(db_path),
+       db_bytes = round(as.numeric(file.info(db_path)$size)),
+       n_packages = counts$n_packages, n_versions = counts$n_versions)
+}
+
+#' Give a series a baseline when the prior release published none.
+#'
+#' Writes prev-<series>-manifest.json from the downloaded database, and only
+#' when that file is absent. A manifest that IS present is never replaced, even
+#' when it disagrees with the database: absence of a record is not evidence
+#' that nothing was lost, but a record saying the database used to be bigger
+#' is, and prior_db_violations() has to keep seeing it.
+#'
+#' @param out_dir Directory holding the downloaded assets.
+#' @return Character vector of notes describing what was measured, empty when
+#'   every series already had a published manifest or had nothing to measure.
+ensure_prior_baseline <- function(out_dir) {
+  notes <- character(0L)
+  for (spec in .preflight_specs()) {
+    mpath <- file.path(out_dir, spec$manifest)
+    if (file.exists(mpath)) next
+    derived <- derive_baseline_manifest(spec$series, file.path(out_dir, spec$db))
+    if (is.null(derived)) next
+    jsonlite::write_json(derived, mpath, auto_unbox = TRUE, pretty = TRUE)
+    notes <- c(notes, sprintf(paste0(
+      "the prior release carries %s but no %s, which is what an interrupted ",
+      "`gh release upload --clobber` leaves. The baseline for this run was ",
+      "measured from the database instead: %s packages, %s rows in %s. ",
+      "Re-upload the manifest that belongs with that database so the next run ",
+      "has a published record to check against."),
+      spec$db, spec$manifest_asset, .pf_fmt(derived$n_packages),
+      .pf_fmt(derived$n_versions), spec$ver_table))
+  }
+  notes
+}
+
 #' Check every database the resolved release advertised.
 #'
 #' A series is checked when the resolved release advertised its database OR its
@@ -224,13 +305,20 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
     } else NULL
     tables <- list(ver_table = spec$ver_table, pkg_table = spec$pkg_table)
 
-    # The row-count gate. The release this run resolved left evidence that it
-    # carries this series, so an empty database is not a first run: it is a
-    # download that failed, a file that arrived truncated past the workflow's
+    # The download gate. The release this run resolved left evidence that it
+    # carries this series, so a file that is absent, empty, or not a database
+    # is a download that failed, one that arrived truncated past the workflow's
     # size check, or an asset the previous publish never finished uploading.
     # Continuing from here would analyse a shard into nothing and publish that
     # as latest.
-    if (counts$n_versions <= 0) {
+    #
+    # Row counts are deliberately not part of this. A database that opens and
+    # holds no rows is also what the first run of a cold bootstrap publishes
+    # for whichever series its first shard had nothing for, and that release
+    # stays latest, so refusing on the count made a legitimate empty database a
+    # state with no way out. What the rows are compared against is the baseline
+    # below, which is measured from the database when no manifest came back.
+    if (!isTRUE(counts$readable)) {
       why <- if (advertised) {
         sprintf("the release this run resolved advertises %s", spec$db)
       } else {
@@ -238,9 +326,9 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
                 spec$manifest_asset, spec$db)
       }
       violations <- c(violations, sprintf(
-        paste0("%s, and what came back holds no rows in %s. This run would ",
-               "rebuild from an empty database and publish it as latest."),
-        why, spec$ver_table))
+        paste0("%s, and what came back is not a readable database. This run ",
+               "would rebuild from nothing and publish it as latest."),
+        why))
       next
     }
 
@@ -293,8 +381,11 @@ if (identical(sys.nframe(), 0L)) {
   out_dir  <- if (length(args) >= 1L) args[1L] else "out"
   expected <- if (length(args) >= 2L) args[-1L] else character(0L)
 
+  derived <- ensure_prior_baseline(out_dir)
   checked <- preflight_prior_dbs(out_dir, expected)
-  for (n in checked$notes) cat(sprintf("::warning::%s\n", n), file = stderr())
+  for (n in c(derived, checked$notes)) {
+    cat(sprintf("::warning::%s\n", n), file = stderr())
+  }
   if (length(checked$violations) > 0L) {
     for (p in checked$violations) cat(sprintf("::error::%s\n", p), file = stderr())
     stop("the state this run is meant to build on did not come back intact; ",
