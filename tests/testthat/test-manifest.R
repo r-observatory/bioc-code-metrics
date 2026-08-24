@@ -253,3 +253,39 @@ test_that("a database with no dataset marker at all counts every package as unsc
 
   expect_identical(.n_datasets_unscanned(con), 2L)
 })
+
+test_that("the bootstrap block counts the datasets the reader could not measure", {
+  # These are in the catalog and have no profile behind them, which is a
+  # coverage figure and not a row count. It only lived in a line the shard
+  # printed, so a shard where the number jumps scrolled away with the run.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  DBI::dbExecute(con,
+    "INSERT INTO bioc_dataset_versions (package, name, version, content_id, is_current)
+     VALUES ('a', 'd', '1.0', 1, 1),
+            ('b', 'e', '1.0', NULL, 1),
+            ('c', 'f', '1.0', NULL, 1)")
+
+  expect_identical(.n_datasets_unmeasured(con), 2L)
+
+  m <- build_manifest(
+    con, series = "data", repo = "r-observatory/bioc-code-metrics",
+    db_filename = "bioc-data-metrics.db", db_bytes = 4096L,
+    tables = "bioc_dataset_versions",
+    fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
+    pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
+    stat_table = "bioc_dataset_contents", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unmeasured = 2L))
+
+  expect_identical(m$bootstrap$n_datasets_unmeasured, 2L)
+  # The denominator is beside it: the count of links the table holds.
+  expect_identical(m$tables$bioc_dataset_versions, 3L)
+})
+
+test_that("a database with no dataset link table counts nothing unmeasured", {
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  expect_identical(.n_datasets_unmeasured(con), 0L)
+})

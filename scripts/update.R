@@ -227,6 +227,30 @@
   as.integer(DBI::dbGetQuery(con, sql)$n %||% 0L)
 }
 
+#' How many datasets are in the catalog with no profile behind them.
+#'
+#' A dataset the analyzer described and could not fingerprint keeps its identity
+#' row and its version link and gets no content row, because the content table
+#' is addressed by fingerprint and there is nothing to key such a record on.
+#' That is the right answer and it is also a coverage figure: an S4 object with
+#' no reader, a raster packed into bytes, an .R script under data/. A shard
+#' where the number climbs is the reader losing objects it used to measure.
+#'
+#' Taken over every version link rather than the current ones alone, because a
+#' version that stopped being measurable is the same finding as a package that
+#' never was, and the denominator beside it in the manifest is the count of
+#' links the same table holds.
+#'
+#' Reads the dataset database, not the code one. Zero where the link table does
+#' not exist yet, which is a database built from nothing before its first write.
+#'
+#' @return Count of version links naming no profile.
+.n_datasets_unmeasured <- function(con) {
+  if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(0L)
+  as.integer(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_versions WHERE content_id IS NULL")$n %||% 0L)
+}
+
 #' Packages needing a metrics backfill: those with a stored row where the
 #' sentinel column is NULL, or every stored package when that column has not been
 #' added yet. Restricted to the current universe and excluding the packages the
@@ -879,7 +903,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_remaining = length(remaining_after),
                     bootstrap_complete = bootstrap_complete,
                     n_datasets_unscanned = .n_datasets_unscanned(con),
-                    n_datasets_unreadable = .n_datasets_unreadable(con))
+                    n_datasets_unreadable = .n_datasets_unreadable(con),
+                    # From the dataset database rather than this one: it is a
+                    # count of catalog entries, not of packages.
+                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
 
   # When this run moved nothing, the moment the data last moved is whatever the
   # previous manifest recorded. Carrying it forward is what lets last_checked

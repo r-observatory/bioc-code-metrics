@@ -1139,7 +1139,15 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       # does not come down on its own, which is what makes it worth publishing:
       # it says what the corpus is missing for good, until a build that can
       # read them arrives.
-      n_datasets_unreadable = bootstrap$n_datasets_unreadable
+      n_datasets_unreadable = bootstrap$n_datasets_unreadable,
+      # How many datasets are in the catalog with nothing behind them: the
+      # reader described them and could not fingerprint them, so they have an
+      # identity row and a version link and no profile. Unlike the two counts
+      # above it is per dataset rather than per package, and the table count
+      # beside it in this same file is its denominator. It is here rather than
+      # only in a line the shard prints because that line scrolls away with the
+      # run, and a shard where this number jumps is the one worth seeing.
+      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured
     )
   )
 }
