@@ -713,12 +713,22 @@ metrics_fingerprint <- function(summary_df) {
   # profile carrying multi-byte text is not planned for as smaller than it is,
   # and SQLite answers it off the record header without reading the value: on a
   # 923 MB table this pass is a tenth of a second and allocates nothing.
-  weigh <- paste(sprintf('COALESCE(LENGTH(CAST("%s" AS BLOB)), 0)', read_names),
-                 collapse = " + ")
+  #
+  # Added up in groups of 64 and finished in R, because SQLite stops at an
+  # expression a thousand deep and one chain of column lengths is exactly that
+  # deep. The profile is 148 columns and gains a few each time the reader
+  # describes more, so a single chain is a migration that works until the spec
+  # crosses a line nobody is watching, and then fails whole.
+  groups <- split(read_names, (seq_along(read_names) - 1L) %/% 64L)
+  sums   <- vapply(seq_along(groups), function(g) sprintf(
+    "%s AS w%d",
+    paste(sprintf('COALESCE(LENGTH(CAST("%s" AS BLOB)), 0)', groups[[g]]),
+          collapse = " + "), g), character(1L))
   plan <- DBI::dbGetQuery(con, sprintf(
-    "SELECT content_id, %s AS w FROM bioc_dataset_contents ORDER BY content_id",
-    weigh))
-  runs <- rle(.dataset_rekey_batches(plan$w))
+    "SELECT content_id, %s FROM bioc_dataset_contents ORDER BY content_id",
+    paste(sums, collapse = ", ")))
+  weight <- rowSums(as.matrix(plan[, sprintf("w%d", seq_along(groups)), drop = FALSE]))
+  runs <- rle(.dataset_rekey_batches(weight))
   ends <- cumsum(runs$lengths)
   for (b in seq_along(ends)) {
     lo <- plan$content_id[[ends[[b]] - runs$lengths[[b]] + 1L]]

@@ -1480,6 +1480,30 @@ test_that("a re-key that died part-way through leaves a database that still open
   expect_false("bioc_dataset_contents_new" %in% DBI::dbListTables(con))
 })
 
+test_that("a wide profile table can still be weighed", {
+  # What a row weighs is asked of SQLite one column at a time and added up, and
+  # SQLite stops at an expression a thousand deep. The profile is 148 columns
+  # and gains a few every time the reader describes more, so a sum written as
+  # one chain is a migration that works until the spec crosses a line nobody
+  # is watching, and then fails whole.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  filler <- sprintf('"f%04d" TEXT', seq_len(1200L))
+  DBI::dbExecute(con, sprintf("CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, columns TEXT, %s,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))", paste(filler, collapse = ", ")))
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+    (content_id, content_fp, schema_fp, fp_algo_version, nrow) VALUES (1, 'C1', 'S1', 1, 3)")
+
+  expect_no_error(.rekey_dataset_contents(con))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents WHERE profile_fp IS NOT NULL")$n, 1L)
+})
+
 test_that("the re-key nests inside the transaction the writer already opened", {
   # It is reached two ways: from the open, with no transaction, and from the
   # writer, from inside one. Whatever holds the rebuild together has to be
