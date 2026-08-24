@@ -1510,3 +1510,37 @@ test_that("a profile table the re-key cannot read stops the run rather than losi
     UNIQUE (content_fp, schema_fp, fp_algo_version))')
   expect_error(.rekey_dataset_contents(con), "cannot re-key bioc_dataset_contents")
 })
+
+test_that("the digest describes the row as it is stored, not as it arrived", {
+  # SQLite has no NaN: RSQLite writes one as NULL, so a record holding NaN and
+  # a record holding nothing store the same row. Digesting them apart would
+  # give one stored profile two keys and two identical rows.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  a$mean <- NaN
+  b$mean <- NA_real_
+  expect_equal(.dataset_profile_fp(a), .dataset_profile_fp(b))
+
+  DBI::dbWithTransaction(
+    con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 1L)
+
+  # An infinity is a value SQLite does store, so it stays its own profile.
+  c1 <- .mk_ds_row("qqq", "1.0", TRUE, "C1"); c1$mean <- Inf
+  expect_false(identical(.dataset_profile_fp(c1), .dataset_profile_fp(b)))
+})
+
+test_that("the same text in two encodings is one profile", {
+  # A character value reaches the digest as bytes. The same characters marked
+  # latin1 and marked UTF-8 are different bytes and the same text, and they
+  # store as the same text, so they have to digest alike.
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  a$label <- "café"
+  b$label <- iconv("café", "UTF-8", "latin1")
+  expect_false(identical(charToRaw(a$label), charToRaw(b$label)))
+  expect_equal(.dataset_profile_fp(a), .dataset_profile_fp(b))
+})

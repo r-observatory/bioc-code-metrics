@@ -416,11 +416,19 @@ metrics_fingerprint <- function(summary_df) {
 #' because it is the signal behind "the same data ships in N packages" and a
 #' surrogate keyed finer would undercount that.
 #'
-#' Absent fields contribute nothing rather than a placeholder, so declaring a
-#' column the analyzer does not emit yet leaves every existing digest alone.
-#' Doubles are rendered at full precision one element at a time: format() would
-#' choose a width from whatever else is in the shard, which would make the same
-#' value digest differently in two runs.
+#' Encoding, chosen so that a value can only ever hash to itself and so that
+#' the digest describes the row as it is stored:
+#'   - a present field folds in its name, the byte length of its value and the
+#'     value, so no value can impersonate a separator or another field;
+#'   - a field that is missing, and a field the shard's frame does not carry at
+#'     all, both contribute nothing. A shard is one analyzer invocation per
+#'     package, so a raster field is a column in a shard that read a raster and
+#'     absent in one that did not, and the same record has to digest alike in
+#'     both. It also means declaring a column the analyzer does not emit yet
+#'     leaves every digest already in the table alone;
+#'   - doubles are rendered at full precision one element at a time. format()
+#'     would choose a width from whatever else is in the shard, so the same
+#'     value would digest differently in two runs.
 #'
 #' @param df Data frame of dataset records, or of content rows read back.
 #' @return Character vector of 64-character lower-case hex digests, one per row.
@@ -433,11 +441,23 @@ metrics_fingerprint <- function(summary_df) {
 
   parts <- lapply(cols, function(k) {
     v <- df[[k]]
+    # Logicals become integers first, because that is what the writer stores
+    # and a field arrives from the parser as either, depending on whether one
+    # package's records left it empty.
     if (is.logical(v)) v <- as.integer(v)
-    # NaN is a value the reader can report and NA is the absence of one, so a
-    # double keeps its NaN and loses only its NA.
-    absent <- if (is.double(v)) is.na(v) & !is.nan(v) else is.na(v)
-    s <- if (is.double(v)) sprintf("%.17g", v) else as.character(v)
+    # is.na() and not is.nan(): SQLite has no NaN and RSQLite writes one as
+    # NULL, so a record holding NaN and a record holding nothing store the same
+    # row and have to digest alike. An infinity does store, and keeps its own.
+    absent <- is.na(v)
+    s <- if (is.double(v)) {
+      sprintf("%.17g", v)
+    } else if (is.character(v)) {
+      # As bytes, so the same characters marked latin1 and marked UTF-8 are one
+      # value rather than two: they store as the same text.
+      enc2utf8(v)
+    } else {
+      as.character(v)
+    }
     s[absent] <- ""
     # Each field carries its own leading separator rather than the join
     # supplying one, so an absent field contributes literally nothing and not
