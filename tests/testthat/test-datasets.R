@@ -920,6 +920,61 @@ test_that("the fields the analyzer reports about empty slots and time zones are 
   expect_equal(got$tz, "Europe/Berlin")
 })
 
+test_that("a list the reader cut short is published saying it was cut", {
+  # The reader lists fifty levels and fifty level counts and no more, and says
+  # which of the two it cut. Both markers are top-level fields of a dataset
+  # record, so the frame carries them and the spec decides whether they reach
+  # SQLite. Without them a three hundred level factor is published with a fifty
+  # entry window of its levels and nothing anywhere saying the list is a
+  # window: the reader told the truth and the pipeline threw it away.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  df <- rbind(.mk_ds_row("p", "1.0", TRUE, "C1", name = "cut"),
+              .mk_ds_row("p", "1.0", TRUE, "C2", name = "whole"))
+  df$is_factor <- 1L
+  df$n_levels  <- c(300L, 2L)
+  df$levels    <- c(sprintf('["%s"]', paste(sprintf("L%03d", 1:50), collapse = '","')),
+                    '["a","b"]')
+  # As the analyzer emits them: written only where it cut something, absent
+  # everywhere else.
+  df$levels_truncated       <- c(TRUE, NA)
+  df$level_counts_truncated <- c(TRUE, NA)
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p"))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT d.name, c.n_levels, c.levels_truncated, c.level_counts_truncated
+       FROM bioc_datasets d
+       JOIN bioc_dataset_contents c ON c.content_id = d.current_content_id
+      ORDER BY d.name")
+  expect_equal(got$name, c("cut", "whole"))
+  # The row whose list is a window says so, beside the count that says how many
+  # entries the window is missing.
+  expect_equal(got$levels_truncated[[1L]], 1L)
+  expect_equal(got$level_counts_truncated[[1L]], 1L)
+  expect_equal(got$n_levels[[1L]], 300L)
+  # And a list the reader gave whole is not marked, so the marker means what it
+  # says rather than being on every row.
+  expect_true(is.na(got$levels_truncated[[2L]]))
+  expect_true(is.na(got$level_counts_truncated[[2L]]))
+})
+
+test_that("a margin the reader cut short keeps its marker inside the labels", {
+  # The third cut the reader makes. It is written into the dimnames array
+  # beside the labels it belongs to rather than as a field of its own, so it
+  # travels in the dimnames value and needs no column: the check is that the
+  # array reaches SQLite whole, marker included.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, "C1")
+  row$dimnames <- paste0(
+    '[{"margin":1,"n_labels":60,"labels":["r01","r02"],"labels_truncated":true}]')
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT dimnames FROM bioc_dataset_contents")$dimnames
+  expect_true(grepl('"labels_truncated":true', got, fixed = TRUE))
+  expect_true(grepl('"n_labels":60', got, fixed = TRUE))
+})
+
 # --- how deep the column profile goes -------------------------------------
 # The analyzer stopped truncating a wide object's column list and started
 # saying instead how much of one a record carries: full, reduced, none or

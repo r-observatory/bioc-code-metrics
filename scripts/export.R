@@ -233,6 +233,16 @@ metrics_fingerprint <- function(summary_df) {
   levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
   is_factor = "INTEGER", is_ordered = "INTEGER",
 
+  # Whether the two lists above are the whole list or a window onto it. The
+  # reader writes fifty entries and no more, and says which of the two it cut;
+  # it writes nothing where it cut nothing, so a value here is always TRUE and
+  # a NULL is a list given whole. Without them a three hundred level factor is
+  # published carrying fifty of its levels with n_levels beside them saying
+  # three hundred, and nothing saying which fifty or that the rest exist. The
+  # count is not the marker: a `levels` value can be short because the reader
+  # cut it or because the factor is small, and only these tell those apart.
+  levels_truncated = "INTEGER", level_counts_truncated = "INTEGER",
+
   # How a frame is grouped and keyed, all of it attributes: two frames of the
   # same numbers, one grouped and one not, hash identically.
   is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",

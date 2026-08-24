@@ -70,9 +70,9 @@
 
 # Run the analyzer over the fixture package once per session and return the
 # union of keys seen on rec == "dataset" records, at the top level and nested
-# inside the columns/elements arrays. Nested keys are reported separately
-# because a field that is only ever per column is a different finding from one
-# that is never computed at all.
+# inside the columns/elements/dimnames arrays. Nested keys are reported
+# separately because a field that is only ever per column is a different
+# finding from one that is never computed at all.
 .contract_keys <- local({
   cached <- NULL
   function(bin) {
@@ -112,7 +112,11 @@
           notes = as.character(rec[["notes"]] %||% NA_character_),
           stringsAsFactors = FALSE))
       }
-      for (k in c("columns", "elements")) walk(rec[[k]])
+      # dimnames as well as the two profile arrays: the margin labels are the
+      # third list the reader will cut short, and the marker for that cut is
+      # written inside the array beside the labels rather than as a field of
+      # the record, so a walk that stops at columns and elements cannot see it.
+      for (k in c("columns", "elements", "dimnames")) walk(rec[[k]])
     }
     cached <<- list(top = top, nested = nested, n_records = n_records,
                     depths = depths, fp_by_depth = fp_by_depth,
@@ -175,7 +179,14 @@ test_that("the fixture package exercises every declared dataset family", {
   # Awkward numbers in something grid shaped. A vector holding NaN and both
   # infinities reports n_infinite and nothing finer, and a data frame reports
   # these per column; only a matrix lifts them to the object as a whole.
-  "n_nan", "n_infinite_pos", "n_infinite_neg"
+  "n_nan", "n_infinite_pos", "n_infinite_neg",
+  # A factor with more than fifty levels, and nothing else. Every other factor
+  # shape is under the line the reader cuts at, so a fixture set without one
+  # over it never sees these two fields and cannot tell a column that is
+  # declared from a column that is dropped, which is how they came to be
+  # dropped: the analyzer emitted them, the frame carried them, no spec named
+  # them, and this test had nothing to compare against.
+  "levels_truncated", "level_counts_truncated"
 )
 
 test_that("the fixture reaches the shapes only one object can reach", {
@@ -189,6 +200,22 @@ test_that("the fixture reaches the shapes only one object can reach", {
       "unexercised one: ", paste(unreached, collapse = ", "),
       ". Restore the shape in fixtures/dataset-contract/make.R rather than ",
       "exempting the column."))
+})
+
+test_that("the fixture reaches the one list the reader marks from inside", {
+  keys <- .contract_setup()
+  # The level list and the level counts are marked by a field beside them, so a
+  # spec has to declare a column for each. A margin's labels are marked from
+  # inside the dimnames array, so the marker rides in that one value and needs
+  # no column of its own. Both routes have to stay exercised: if the fixture
+  # stops producing an over-long margin, nothing checks that the array reaches
+  # the database whole and the marker could be lost without a failure.
+  expect_true(
+    "labels_truncated" %in% keys$nested,
+    info = paste("no object in the fixture package has a margin with more",
+                 "labels than the reader will list, so the marker written",
+                 "inside the dimnames array is unexercised. Restore the shape",
+                 "in fixtures/dataset-contract/make.R."))
 })
 
 test_that("the fixture reaches every depth a column list can be written at", {

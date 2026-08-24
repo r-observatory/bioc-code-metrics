@@ -71,6 +71,12 @@ sv(c("aa", "b", "", "cccc", "b"), "words")
 sv(c(TRUE, TRUE, FALSE, NA), "flags")
 sv(factor(c("a", "b", "a", "c")), "just_a_factor")
 sv(factor(c("lo", "hi", "mid"), levels = c("lo", "mid", "hi"), ordered = TRUE), "ranked_factor")
+# A factor with more levels than the reader will list. Past fifty it writes a
+# window and marks the field it cut, and every factor above was under the line,
+# so nothing here reached the marker at all. Sixty levels, each used twice, is
+# the narrowest object that cuts both the declared list and the counts.
+many <- sprintf("L%02d", 1:60)
+sv(factor(rep(many, each = 2L), levels = many), "many_levels")
 sv(as.Date("2020-01-01") + c(0, 1, 2, 40), "gappy_dates")
 # A broken-down time, kept broken down. Arithmetic on a POSIXlt returns a
 # POSIXct, so this has to be written without any, or the object saved here is
@@ -93,6 +99,11 @@ if (requireNamespace("units", quietly = TRUE)) {
 sv(matrix(c(1, 2, 3, 4, 5, 60), nrow = 2,
           dimnames = list(c("r1", "r2"), c("c1", "c2", "c3"))), "named_matrix")
 sv(array(1:24, dim = c(2, 3, 4)), "cube")
+# A margin with more labels than the reader will list, which is the same cut as
+# the level list and is marked inside the dimnames array rather than beside it.
+sv(matrix(seq_len(120), nrow = 60,
+          dimnames = list(sprintf("r%02d", 1:60), c("left", "right"))),
+   "many_labels")
 # The awkward numbers a third time, now in something grid shaped. A grid has no
 # columns to hang a summary on, so its values are summarised as one set of
 # figures for the object, and NaN and the two signed infinities are counted
