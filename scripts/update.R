@@ -918,6 +918,29 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 
+  # What the dataset columns actually hold. A declared column that is NULL for
+  # every row in the corpus is not an honest NA, it is a column nobody is
+  # filling, and it reads to a viewer exactly like a fact that happens to be
+  # unknown. Said in the run output, so the shard that produced it says so, and
+  # counted in the manifest, so the finding outlives the log.
+  #
+  # Only the dataset side has this to report: the code summary's columns are
+  # written from a fixed metric registry and every one of them has a group
+  # behind it, where the dataset columns are a spec held against a reader that
+  # keeps describing more.
+  dataset_coverage <- dataset_column_coverage(data_con)
+  dataset_alerts   <- dataset_coverage_alerts(dataset_coverage)
+  if (length(dataset_alerts) > 0L) {
+    shown <- head(dataset_alerts, 20L)
+    cat(sprintf("dataset coverage: %d of %d declared columns hold nothing for anybody\n  %s\n%s",
+                length(dataset_alerts), nrow(dataset_coverage),
+                paste(shown, collapse = "\n  "),
+                if (length(dataset_alerts) > length(shown))
+                  sprintf("  ... and %d more\n", length(dataset_alerts) - length(shown)) else ""),
+        file = stdout())
+    flush(stdout())
+  }
+
   code_manifest <- build_manifest(
     con, series = "code", repo = PUBLISH_REPO, db_filename = DB_FILENAME,
     db_bytes = code_db_bytes,
@@ -935,7 +958,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
     pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
     stat_table = "bioc_dataset_contents", stat_cols = c("nrow", "ncol"),
-    bootstrap = bootstrap, last_changed = last_changed)
+    bootstrap = bootstrap, last_changed = last_changed,
+    coverage = dataset_coverage)
 
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
