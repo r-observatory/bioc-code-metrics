@@ -1544,3 +1544,21 @@ test_that("the same text in two encodings is one profile", {
   expect_false(identical(charToRaw(a$label), charToRaw(b$label)))
   expect_equal(.dataset_profile_fp(a), .dataset_profile_fp(b))
 })
+
+test_that("the migration that retires a moved column cannot reach a table's own", {
+  # It finds what to drop by intersecting the version table's columns with the
+  # content spec. The version table's own columns are named one by one by the
+  # writer and are not in either spec, so declaring one of them on the content
+  # row would make the migration delete it and empty half the catalog.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  own <- c("package", "name", "version", "content_id", "format", "compression",
+           "confidence", "is_current")
+  expect_true(all(own %in% DBI::dbListFields(con, "bioc_dataset_versions")))
+  expect_equal(intersect(own, names(.DATASET_CONTENT_COLS)), character(0L))
+  # And the identity table's, for the same reason.
+  expect_equal(intersect(c("package", "name", "file", "internal",
+                           "current_version", "current_content_id"),
+                         names(.DATASET_CONTENT_COLS)), character(0L))
+})
