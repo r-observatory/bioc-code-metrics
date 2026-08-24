@@ -1419,11 +1419,12 @@ test_that("re-keying a table of profiles at the cap holds one batch, not the tab
   peak <- gc()[2L, "max used"] * 8
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  # The batch is 32 MiB of profile and the digest holds it about three times
-  # over while it works, so four budgets is the whole working set with room to
-  # spare. Counted in rows this is 48 x 4 MiB read at once, which lands an
-  # order of magnitude above the ceiling.
-  expect_lt(peak - base, 4 * .DATASET_REKEY_BATCH_BYTES)
+  # The batch is one budget of profile, the digest holds it about twice more
+  # while it works, and what R has not collected yet sits on top: three and a
+  # half budgets measured here, and the ceiling is six so another collector can
+  # be less eager without this failing. Counted in rows the same table takes
+  # 558 MB, which is not a matter of headroom.
+  expect_lt(peak - base, 6 * .DATASET_REKEY_BATCH_BYTES)
 
   # And it migrated: every row across, every id kept, every profile its own.
   expect_equal(DBI::dbGetQuery(con,
