@@ -285,7 +285,17 @@ test_that("a column that has moved to the version link is taken off the content 
     (content_fp, schema_fp, fp_algo_version, class, kind, nrow)
     VALUES ('C9', 'S9', 1, 'stale', 'stale', 3)")
 
-  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  first <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p")))
+  # Every dropped column is a full rewrite of the table, so the run says what it
+  # is doing rather than looking like it has hung.
+  expect_true(any(grepl("moving 2 columns off bioc_dataset_contents: class, kind",
+                        first, fixed = TRUE)))
+  # And nothing on the run after it: it is a one-time move, not a daily one.
+  again <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(
+      con, .mk_wide_row(package = "p2"), "p2")))
+  expect_false(any(grepl("moving", again, fixed = TRUE)))
 
   fields <- DBI::dbListFields(con, "bioc_dataset_contents")
   expect_false("class" %in% fields)
@@ -294,7 +304,8 @@ test_that("a column that has moved to the version link is taken off the content 
   expect_equal(DBI::dbGetQuery(con,
     "SELECT nrow FROM bioc_dataset_contents WHERE content_fp = 'C9'")$nrow, 3L)
   expect_equal(DBI::dbGetQuery(con,
-    "SELECT class FROM bioc_dataset_versions")$class, "data.frame")
+    "SELECT class FROM bioc_dataset_versions WHERE package = 'p'")$class,
+    "data.frame")
 })
 
 test_that("how a file stores its data is recorded, not just what it holds", {

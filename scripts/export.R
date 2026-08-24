@@ -448,6 +448,15 @@ metrics_fingerprint <- function(summary_df) {
   if (!"bioc_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
   moved <- intersect(DBI::dbListFields(con, "bioc_dataset_contents"),
                      names(.DATASET_VERSION_COLS))
+  if (!length(moved)) return(invisible(NULL))
+  # SQLite rewrites every row of the table once per dropped column, so on a
+  # database downloaded from a release this is seconds each rather than
+  # nothing, once. Said out loud because a run that stops here otherwise looks
+  # like a run that hung.
+  cat(sprintf("moving %d column%s off bioc_dataset_contents: %s\n",
+              length(moved), if (length(moved) == 1L) "" else "s",
+              paste(moved, collapse = ", ")), file = stdout())
+  flush(stdout())
   for (col in moved) {
     tryCatch(
       DBI::dbExecute(con, sprintf('ALTER TABLE bioc_dataset_contents DROP COLUMN "%s"', col)),
