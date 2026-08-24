@@ -1426,6 +1426,19 @@ test_that("re-keying a table of profiles at the cap holds one batch, not the tab
   # 558 MB, which is not a matter of headroom.
   expect_lt(peak - base, 6 * .DATASET_REKEY_BATCH_BYTES)
 
+  # And the same figure against a ceiling that does not move. The one above is
+  # written as a multiple of the budget, so it rises with the budget and cannot
+  # see the one edit that puts the whole failure back: raise
+  # .DATASET_REKEY_BATCH_BYTES far enough and every row lands in a single batch,
+  # which is the published table read whole, and the ceiling above rises to meet
+  # it and stays green. Measured at 1 GiB of budget that is one batch and 529 MB
+  # of heap, passing a ceiling of 6 GiB. This one is a statement about the runner
+  # rather than about the constant: whatever the budget is set to, migrating a
+  # table of profiles at the cap has to fit here. It sits above the 96 MB the
+  # shipped budget takes and below the 529 MB one batch takes, so it binds only
+  # when the budget stops bounding anything.
+  expect_lt(peak - base, 256 * 1024^2)
+
   # And it migrated: every row across, every id kept, every profile its own.
   expect_equal(DBI::dbGetQuery(con,
     "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, rows)
