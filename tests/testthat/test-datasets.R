@@ -1497,3 +1497,16 @@ test_that("a column taken off the profile table is put back, and off the link", 
       con, .mk_wide_row(package = "p2"), "p2")))
   expect_false(any(grepl("bioc_dataset_versions", again, fixed = TRUE)))
 })
+
+test_that("a profile table the re-key cannot read stops the run rather than losing its key", {
+  # The new key column is declared beside content_fp. A table carrying the old
+  # key and spelling content_fp some other way would otherwise be rebuilt with
+  # no key column at all, which fails later on a name nobody can trace.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, 'CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    "content_fp" TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))')
+  expect_error(.rekey_dataset_contents(con), "cannot re-key bioc_dataset_contents")
+})

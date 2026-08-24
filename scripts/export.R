@@ -583,6 +583,14 @@ metrics_fingerprint <- function(summary_df) {
   create <- sub(old_key, "UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE)
   cols   <- DBI::dbListFields(con, "bioc_dataset_contents")
   if (!"profile_fp" %in% cols) {
+    # Declared beside content_fp, which every table carrying the old key has.
+    # If it is spelled some other way the new CREATE would come out without a
+    # key column at all, so say which CREATE could not be read rather than
+    # failing later on a column nobody declared.
+    if (!grepl("content_fp TEXT NOT NULL", create, fixed = TRUE)) {
+      stop("cannot re-key bioc_dataset_contents: its CREATE does not declare ",
+           "content_fp the way the key migration expects: ", create)
+    }
     create <- sub("content_fp TEXT NOT NULL",
                   "profile_fp TEXT NOT NULL, content_fp TEXT NOT NULL",
                   create, fixed = TRUE)
