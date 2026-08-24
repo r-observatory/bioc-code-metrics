@@ -209,13 +209,13 @@ test_that("fields a newer analyzer describes reach the table that holds them", {
   expect_equal(got$n_stored, 3L)
   expect_equal(got$is_spatial, 1L)         # logicals store as integers
 
-  # Read off the class rather than the cells, so they sit on the record's own
-  # row: the fingerprints cannot tell a symmetric matrix from the general one
-  # holding the same numbers.
-  ver <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_versions")
-  expect_equal(ver$matrix_shape, "symmetric")
-  expect_equal(ver$matrix_uplo, "L")
-  expect_equal(ver$object_system, "S4")
+  # Read off the class rather than the cells. The fingerprints cannot tell a
+  # symmetric matrix from the general one holding the same numbers, so these
+  # sit on the profile only because the key separates two profiles that
+  # disagree on them.
+  expect_equal(got$matrix_shape, "symmetric")
+  expect_equal(got$matrix_uplo, "L")
+  expect_equal(got$object_system, "S4")
 })
 
 test_that("how many elements a vector holds survives the write", {
@@ -269,11 +269,11 @@ test_that("a table created before these fields existed is widened, not skipped",
   expect_equal(DBI::dbGetQuery(con, "SELECT n_stored FROM bioc_dataset_contents")$n_stored, 3L)
 })
 
-test_that("a column that has moved to the version link is taken off the content row", {
-  # class and kind sat on the content row until it was measured that the
-  # fingerprints do not cover either. What is stored there is whichever dataset
-  # first minted the row, it cannot be repaired in place, and leaving it would
-  # let a reader keep believing it.
+test_that("a profile already in the table keeps the row the links name", {
+  # The published table is narrow and keyed on the fingerprints. Widening it
+  # and re-keying it must leave the profiles that are in it addressable: the
+  # version links carry content_id and nothing else, so a row that changes id
+  # is a link pointing at another dataset's data.
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
@@ -282,30 +282,23 @@ test_that("a column that has moved to the version link is taken off the content 
     class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
     UNIQUE (content_fp, schema_fp, fp_algo_version))")
   DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
-    (content_fp, schema_fp, fp_algo_version, class, kind, nrow)
-    VALUES ('C9', 'S9', 1, 'stale', 'stale', 3)")
+    (content_id, content_fp, schema_fp, fp_algo_version, class, kind, nrow)
+    VALUES (7, 'C9', 'S9', 1, 'matrix', 'matrix', 3)")
 
-  first <- capture.output(
-    DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p")))
-  # Every dropped column is a full rewrite of the table, so the run says what it
-  # is doing rather than looking like it has hung.
-  expect_true(any(grepl("moving 2 columns off bioc_dataset_contents: class, kind",
-                        first, fixed = TRUE)))
-  # And nothing on the run after it: it is a one-time move, not a daily one.
-  again <- capture.output(
-    DBI::dbWithTransaction(con, .write_datasets_normalized(
-      con, .mk_wide_row(package = "p2"), "p2")))
-  expect_false(any(grepl("moving", again, fixed = TRUE)))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
 
-  fields <- DBI::dbListFields(con, "bioc_dataset_contents")
-  expect_false("class" %in% fields)
-  expect_false("kind" %in% fields)
-  # The row itself, and everything the fingerprints do cover, is untouched.
+  got <- DBI::dbGetQuery(con,
+    "SELECT content_id, class, nrow FROM bioc_dataset_contents WHERE content_fp = 'C9'")
+  expect_equal(got$content_id, 7L)
+  expect_equal(got$class, "matrix")
+  expect_equal(got$nrow, 3L)
+  # The new row went in beside it rather than over it.
   expect_equal(DBI::dbGetQuery(con,
-    "SELECT nrow FROM bioc_dataset_contents WHERE content_fp = 'C9'")$nrow, 3L)
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 2L)
   expect_equal(DBI::dbGetQuery(con,
-    "SELECT class FROM bioc_dataset_versions WHERE package = 'p'")$class,
-    "data.frame")
+    "SELECT c.class FROM bioc_dataset_versions v
+       JOIN bioc_dataset_contents c ON c.content_id = v.content_id
+      WHERE v.package = 'p'")$class, "data.frame")
 })
 
 test_that("how a file stores its data is recorded, not just what it holds", {
@@ -373,13 +366,13 @@ test_that("what the analyzer describes reaches the tables that hold it", {
   expect_equal(got$skewness, 1.5)
   expect_true("n_outliers" %in% names(got))
 
-  # The rest were read off an attribute or off the class, which neither
-  # fingerprint covers, so they are on the record's own row.
-  ver <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_versions")
-  expect_equal(ver$nodata_value, -9999)
+  # The rest were read off an attribute or off the class. Neither fingerprint
+  # covers them, and they are on the profile all the same, because the key is
+  # the digest of the profile and not the fingerprints.
+  expect_equal(got$nodata_value, -9999)
   expect_true(all(c("levels", "dimnames", "dt_key", "element_names", "resolution",
                     "index_delta", "ts_span", "frame_class")
-                  %in% names(ver)))
+                  %in% names(got)))
 
   # A title belongs to the package's documentation, not to the bytes: two
   # packages carrying identical data may describe it differently.
@@ -445,10 +438,12 @@ test_that("a padded frame writes without carrying its padding into the wrong typ
   expect_equal(got$content_fp, c("C0", "C1"))
   expect_true(is.na(got$summary_over[got$content_fp == "C0"]))
   expect_equal(got$density[got$content_fp == "C1"], 0.125)
-  ver <- DBI::dbGetQuery(con,
-    "SELECT version, matrix_shape FROM bioc_dataset_versions ORDER BY version")
-  expect_true(is.na(ver$matrix_shape[ver$version == "1.0"]))
-  expect_equal(ver$matrix_shape[ver$version == "1.1"], "symmetric")
+  shp <- DBI::dbGetQuery(con,
+    "SELECT v.version, c.matrix_shape FROM bioc_dataset_versions v
+       JOIN bioc_dataset_contents c ON c.content_id = v.content_id
+      ORDER BY v.version")
+  expect_true(is.na(shp$matrix_shape[shp$version == "1.0"]))
+  expect_equal(shp$matrix_shape[shp$version == "1.1"], "symmetric")
   # The identity row still comes from the current version, padding or not.
   expect_equal(DBI::dbGetQuery(con, "SELECT origin_dir FROM bioc_datasets")$origin_dir, "data")
 })
@@ -916,12 +911,13 @@ test_that("the fields the analyzer reports about empty slots and time zones are 
   row$tz <- "Europe/Berlin"
   DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
 
-  # An empty slot is an element like any other and hashes as one, so it sits
-  # with the profile. A time zone is an attribute the cells know nothing about.
-  expect_equal(DBI::dbGetQuery(con,
-    "SELECT n_empty_slots FROM bioc_dataset_contents")$n_empty_slots, 4L)
-  expect_equal(DBI::dbGetQuery(con,
-    "SELECT tz FROM bioc_dataset_versions")$tz, "Europe/Berlin")
+  # Both describe the object, so both sit with the profile. The time zone is an
+  # attribute the cells know nothing about, which is why the key has to be the
+  # digest of the profile and not the fingerprints over the cells.
+  got <- DBI::dbGetQuery(con,
+    "SELECT n_empty_slots, tz FROM bioc_dataset_contents")
+  expect_equal(got$n_empty_slots, 4L)
+  expect_equal(got$tz, "Europe/Berlin")
 })
 
 # --- how deep the column profile goes -------------------------------------
@@ -1002,10 +998,18 @@ test_that("the identity row of an unmeasured dataset names no profile either", {
   expect_equal(idn$name, "packed")
   expect_true(is.na(idn$current_content_id))
   expect_equal(idn$current_version, "1.0")
-  # What kind of thing it is survives, because that is on the version link now
-  # rather than on a content row it does not have.
-  expect_equal(DBI::dbGetQuery(con,
-    "SELECT class FROM bioc_dataset_versions")$class, "PackedSpatRaster")
+  # The link says the package ships it, at which version, and how far the
+  # reader got. What kind of thing it is is on the profile, and this record
+  # does not have one: everything the reader describes about an object now
+  # sits on the profile row, and a record with no fingerprint has no profile
+  # row to sit on. The catalog entry is the whole of what is kept.
+  got <- DBI::dbGetQuery(con,
+    "SELECT package, name, version, content_id, confidence FROM bioc_dataset_versions")
+  expect_equal(got$name, "packed")
+  expect_equal(got$version, "1.0")
+  expect_true(is.na(got$content_id))
+  expect_equal(got$confidence, "exact")
+  expect_false("class" %in% names(got))
 })
 
 test_that("one dataset with no profile does not retire the whole reclaim", {
@@ -1120,6 +1124,9 @@ test_that("the analyzer's four column depths reach the table, or say why they do
 # attribute or off the class vector goes into either.
 
 test_that("two datasets holding the same instants keep their own time zones", {
+  # The cells of a POSIXct are seconds since the epoch, so the same moments
+  # written in two zones share content_fp and schema_fp. One profile row each,
+  # both naming the same fingerprint, and each with its own zone.
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
@@ -1130,83 +1137,12 @@ test_that("two datasets holding the same instants keep their own time zones", {
     con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
 
   got <- DBI::dbGetQuery(con,
-    "SELECT package, tz FROM bioc_dataset_versions ORDER BY package")
+    "SELECT v.package, c.tz, c.content_fp FROM bioc_dataset_versions v
+       JOIN bioc_dataset_contents c ON c.content_id = v.content_id
+      ORDER BY v.package")
   expect_equal(got$package, c("aaa", "zzz"))
   expect_equal(got$tz, c("UTC", "America/Chicago"))
-})
-
-test_that("the record that sorts second is not overwritten by the one that sorts first", {
-  # Every field here was measured against the analyzer at c045665 on a pair of
-  # objects sharing both fingerprints. The pair is written in both orders,
-  # because the defect is invisible in whichever order happens to be right.
-  differing <- list(
-    class             = c("data.frame", "tbl_df/tbl/data.frame"),
-    kind              = c("data.frame", "matrix"),
-    frame_class       = c("data.frame", "tbl_df"),
-    has_rownames      = c(0L, 1L),
-    dimnames          = c(NA_character_, '["r1","r2"]'),
-    label             = c(NA_character_, "A label"),
-    comment           = c(NA_character_, "a note"),
-    levels            = c('["a","b"]', '["a","b","zz"]'),
-    is_ordered        = c(0L, 1L),
-    ts_start          = c(2000, 1990),
-    index_start       = c("2020-01-01", "1999-01-01"),
-    dt_key            = c(NA_character_, "x"),
-    group_vars        = c(NA_character_, '["g"]'),
-    crs_epsg          = c(4326L, 3857L),
-    matrix_value_type = c("logical", "pattern"),
-    in_memory         = c(1L, 0L),
-    inner_names       = c('["aa"]', '["bb"]'),
-    tz                = c("UTC", "America/Chicago"))
-
-  for (rev in c(FALSE, TRUE)) {
-    con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
-    a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
-    b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
-    for (k in names(differing)) {
-      a[[k]] <- differing[[k]][[1L]]
-      b[[k]] <- differing[[k]][[2L]]
-    }
-    rows <- if (rev) rbind(b, a) else rbind(a, b)
-    DBI::dbWithTransaction(
-      con, .write_datasets_normalized(con, rows, c("aaa", "zzz")))
-    # SELECT *, because SQLite reads a double-quoted name it does not know as a
-    # string literal rather than refusing it, and a test that cannot tell a
-    # missing column from a present one is not a test.
-    got <- DBI::dbGetQuery(con,
-      "SELECT * FROM bioc_dataset_versions ORDER BY package")
-    expect_equal(got$package, c("aaa", "zzz"))
-    for (k in names(differing)) {
-      expect_equal(got[[k]], differing[[k]],
-                   info = sprintf("%s, reversed = %s", k, rev))
-    }
-    DBI::dbDisconnect(con)
-  }
-})
-
-test_that("a field the fingerprint cannot cover is not on the content row", {
-  # A regression guard, not a restatement: putting any of these back on the
-  # content-addressed row is the defect, and it is silent until two packages
-  # ship the same numbers.
-  uncovered <- c(
-    "class", "kind", "frame_class", "object_system", "s4_package",
-    "has_rownames", "has_dimnames", "dimnames",
-    "label", "comment", "units", "attrs_other", "tz",
-    "levels", "n_levels", "is_ordered",
-    "is_grouped", "group_vars", "n_groups", "is_rowwise",
-    "dt_key", "dt_indices",
-    "ts_start", "ts_end", "ts_frequency", "frequency", "ts_span",
-    "index_start", "index_end", "index_n", "index_class", "index_span",
-    "index_tz", "index_delta", "index_regular", "index_n_gaps",
-    "index_max_gap", "index_sorted", "index_has_duplicates",
-    "crs_input", "crs_epsg", "crs_wkt",
-    "matrix_shape", "matrix_storage", "matrix_uplo", "matrix_diag",
-    "matrix_value_type",
-    "n_layers", "layer_names", "layer_min", "layer_max", "resolution",
-    "nodata_value", "in_memory",
-    "element_names", "inner_names", "inner_schema_varies")
-  expect_equal(intersect(uncovered, names(.DATASET_CONTENT_COLS)), character(0L))
-  expect_equal(setdiff(uncovered, names(.DATASET_VERSION_COLS)), character(0L))
+  expect_equal(got$content_fp, c("C1", "C1"))
 })
 
 test_that("no dataset field is declared on two tables at once", {
@@ -1424,4 +1360,140 @@ test_that("the fingerprint the catalog groups on keeps an index", {
     "EXPLAIN QUERY PLAN SELECT content_fp, COUNT(*) FROM bioc_dataset_contents
       GROUP BY content_fp")$detail
   expect_true(any(grepl("idx_bioc_dsc_content", plan, fixed = TRUE)))
+})
+
+test_that("what the reader says about the data sits with the data", {
+  # These were taken off the content row while the row was keyed on the
+  # fingerprints, because the fingerprints do not cover them and the row would
+  # have published one dataset's answer for another. The key now covers them,
+  # so they belong back where they describe what they describe, and where the
+  # catalog reads them.
+  described <- c(
+    "class", "kind", "frame_class", "object_system", "s4_package",
+    "has_rownames", "has_dimnames", "dimnames",
+    "label", "comment", "units", "attrs_other", "tz",
+    "levels", "n_levels", "is_ordered",
+    "is_grouped", "group_vars", "n_groups", "is_rowwise",
+    "dt_key", "dt_indices",
+    "ts_start", "ts_end", "ts_frequency", "frequency", "ts_span",
+    "index_start", "index_end", "index_n", "index_class", "index_span",
+    "index_tz", "index_delta", "index_regular", "index_n_gaps",
+    "index_max_gap", "index_sorted", "index_has_duplicates",
+    "crs_input", "crs_epsg", "crs_wkt",
+    "matrix_shape", "matrix_storage", "matrix_uplo", "matrix_diag",
+    "matrix_value_type",
+    "n_layers", "layer_names", "layer_min", "layer_max", "resolution",
+    "nodata_value", "in_memory",
+    "element_names", "inner_names", "inner_schema_varies")
+  expect_equal(setdiff(described, names(.DATASET_CONTENT_COLS)), character(0L))
+  expect_equal(intersect(described, names(.DATASET_VERSION_COLS)), character(0L))
+})
+
+test_that("the version link keeps only what is true of the file", {
+  # A dataset's own row says how one file happened to store it. Everything else
+  # describes the data and is on the profile, which is now keyed finely enough
+  # to hold it.
+  expect_equal(sort(names(.DATASET_VERSION_COLS)),
+               sort(c("format_version", "compressed_bytes", "notes",
+                      "delimiter_looks_like", "delimiter_would_give_ncol")))
+})
+
+test_that("each record keeps its own answer on the row that describes it", {
+  # Every field here was measured against the analyzer at c045665 on a pair of
+  # objects sharing both fingerprints. The pair is written in both orders,
+  # because the defect is invisible in whichever order happens to be right.
+  differing <- list(
+    class             = c("data.frame", "tbl_df/tbl/data.frame"),
+    kind              = c("data.frame", "matrix"),
+    frame_class       = c("data.frame", "tbl_df"),
+    has_rownames      = c(0L, 1L),
+    dimnames          = c(NA_character_, '["r1","r2"]'),
+    label             = c(NA_character_, "A label"),
+    comment           = c(NA_character_, "a note"),
+    levels            = c('["a","b"]', '["a","b","zz"]'),
+    n_levels          = c(2L, 3L),
+    inner_schema_varies = c(0L, 1L),
+    is_ordered        = c(0L, 1L),
+    ts_start          = c(2000, 1990),
+    index_start       = c("2020-01-01", "1999-01-01"),
+    dt_key            = c(NA_character_, "x"),
+    group_vars        = c(NA_character_, '["g"]'),
+    crs_epsg          = c(4326L, 3857L),
+    matrix_value_type = c("logical", "pattern"),
+    in_memory         = c(1L, 0L),
+    inner_names       = c('["aa"]', '["bb"]'),
+    tz                = c("UTC", "America/Chicago"))
+
+  for (rev in c(FALSE, TRUE)) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+    a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+    b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+    for (k in names(differing)) {
+      a[[k]] <- differing[[k]][[1L]]
+      b[[k]] <- differing[[k]][[2L]]
+    }
+    rows <- if (rev) rbind(b, a) else rbind(a, b)
+    DBI::dbWithTransaction(
+      con, .write_datasets_normalized(con, rows, c("aaa", "zzz")))
+    # SELECT *, because SQLite reads a double-quoted name it does not know as a
+    # string literal rather than refusing it, and a test that cannot tell a
+    # missing column from a present one is not a test.
+    got <- DBI::dbGetQuery(con,
+      "SELECT v.package, c.* FROM bioc_dataset_versions v
+         JOIN bioc_dataset_contents c ON c.content_id = v.content_id
+        ORDER BY v.package")
+    expect_equal(got$package, c("aaa", "zzz"), info = sprintf("reversed = %s", rev))
+    for (k in names(differing)) {
+      expect_equal(got[[k]], differing[[k]],
+                   info = sprintf("%s, reversed = %s", k, rev))
+    }
+    DBI::dbDisconnect(con)
+  }
+})
+
+test_that("a column taken off the profile table is put back, and off the link", {
+  # A database written while those fields sat on the version link exists, and
+  # opening it must both restore the column the catalog reads and retire the
+  # copy on the link. Left there, the link's copy would hold whatever the run
+  # that wrote it recorded and would never be updated again, which is the
+  # half-filled column nobody can explain.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY, profile_fp TEXT NOT NULL,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (profile_fp, fp_algo_version))")
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    class TEXT, kind TEXT, tz TEXT, matrix_uplo TEXT, notes TEXT,
+    PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, is_current, class, tz, notes)
+    VALUES ('old', 'd', '0.9', NULL, 1, 'stale', 'stale', 'kept')")
+
+  first <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p")))
+  expect_true(any(grepl("bioc_dataset_versions", first, fixed = TRUE)))
+
+  fields <- DBI::dbListFields(con, "bioc_dataset_versions")
+  expect_false("class" %in% fields)
+  expect_false("tz" %in% fields)
+  expect_false("matrix_uplo" %in% fields)
+  # What the link is genuinely the home of stays, and so does its row.
+  expect_true("notes" %in% fields)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT notes FROM bioc_dataset_versions WHERE package = 'old'")$notes, "kept")
+  expect_true(all(c("class", "kind", "tz", "matrix_uplo")
+                  %in% DBI::dbListFields(con, "bioc_dataset_contents")))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT matrix_uplo FROM bioc_dataset_contents")$matrix_uplo, "L")
+
+  # A one-time move, not a daily one.
+  again <- capture.output(
+    DBI::dbWithTransaction(con, .write_datasets_normalized(
+      con, .mk_wide_row(package = "p2"), "p2")))
+  expect_false(any(grepl("bioc_dataset_versions", again, fixed = TRUE)))
 })

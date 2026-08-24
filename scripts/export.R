@@ -164,36 +164,41 @@ metrics_fingerprint <- function(summary_df) {
 # everything that profile records, shared across versions AND packages. The
 # heavy row_sketch lives in its own table (kept out of the merge allowlist).
 
-# Columns of a dataset record that the fingerprints on this row actually cover,
-# and so belong on the content-addressed row shared by every copy of that data.
+# What a dataset record says about the data itself, and so belongs on the
+# profile row shared by every copy of that data.
 #
-# What they cover is exact, and it is narrower than "describes the data".
-# content_fp is a hash over, for each column in order, the column's type name
-# followed by the bytes of each of its cells; schema_fp is over `name:type` per
-# column. Between them they cover the column count, the column order, the column
-# names, the column types, the column lengths and the cell values. A field the
-# analyzer read off an attribute or off the class vector is in neither, however
-# much it describes the data: a time zone, a class, a series start, a
-# projection, a factor's declared levels and a table's row names are all
-# invisible to both hashes.
+# What decides this list is what the field describes, not what a fingerprint
+# covers, and that is a change. It used to be decided by coverage, because the
+# row was keyed on the two fingerprints and they are narrower than "describes
+# the data": content_fp is a hash over each column's type name and the bytes of
+# its cells, schema_fp is over `name:type` per column, and between them they
+# reach the cells, the column count, order, names, types and lengths and
+# nothing else. A time zone, a class, a series start, a projection, a factor's
+# declared levels and a table's row names are invisible to both. The row is
+# written with INSERT OR IGNORE from whichever record reaches it first, so any
+# field the key did not separate was published for every dataset sharing the
+# key with the answer belonging to one of them.
 #
-# That is what decides this list rather than "is it a property of the data",
-# because of how the row is written. It goes in with INSERT OR IGNORE from
-# `df[!duplicated(ck), ]` after a sort on (package, name, version, internal), so
-# whichever record sorts first supplies every column here, for every dataset
-# that ever shares the row, and the winner does not change once the row exists.
-# A field the fingerprints do not cover would therefore publish one dataset's
-# answer against another dataset's data, and which one won would come down to
-# shard order. Those fields are declared in .DATASET_VERSION_COLS instead, on
-# the record's own row, where each dataset keeps its own answer.
+# The key is now a digest of the whole recorded profile, so two records that
+# differ in any of this get two rows and neither is handed the other's
+# measurement. That is what lets these fields sit here, where they describe
+# what they describe and where the catalog reads them.
 #
-# The two profile arrays are the exception, and it is deliberate rather than an
-# oversight: see the note on `columns` at the foot of this list.
+# It also reaches what no relocation could. The per-column time zone, label,
+# comment, units, declared levels and projection ride inside the `columns` and
+# `elements` arrays, which are the profile payload and by far the largest
+# values written here: a per-version copy of them is exactly the duplication
+# this table exists to remove, so they could never move to the version link.
+# Keying on the digest separates them where moving them could not.
 #
 # Types are declared rather than inferred from whatever a shard happens to
 # carry. A shard whose every density is missing would otherwise fix that column
 # as text for good, and the column would then read back as text forever.
 .DATASET_CONTENT_COLS <- c(
+  # What the object calls itself, and what shape of thing it is.
+  class = "TEXT", kind = "TEXT", frame_class = "TEXT",
+  object_system = "TEXT", s4_package = "TEXT",
+
   nrow = "INTEGER", ncol = "INTEGER",
   length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
   n_missing_total = "INTEGER", columns = "TEXT",
@@ -222,24 +227,68 @@ metrics_fingerprint <- function(summary_df) {
   # row were read the same way and the word is the same for both.
   summary_over = "TEXT",
 
-  # A factor's used labels are its cell values, so a count against each of them
-  # is covered. The vocabulary it declares is not: a spare level nobody used
-  # changes `levels` and `n_levels` and changes no cell, and both are on the
-  # version link. `is_factor` follows from `type`, which is hashed.
-  level_counts = "TEXT", is_factor = "INTEGER",
+  # What a factor uses and what it declares. A spare level nobody used changes
+  # `levels` and `n_levels` and changes no cell, which is why this pair could
+  # not be separated by the fingerprints and had to be separated by the key.
+  levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
+  is_factor = "INTEGER", is_ordered = "INTEGER",
+
+  # How a frame is grouped and keyed, all of it attributes: two frames of the
+  # same numbers, one grouped and one not, hash identically.
+  is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",
+  is_rowwise = "INTEGER", dt_key = "TEXT", dt_indices = "TEXT",
+
+  # Labels rather than values. Row names, dimension names and the margin labels
+  # of a grid are written beside the cells and none of them is hashed.
+  has_rownames = "INTEGER", has_dimnames = "INTEGER", dimnames = "TEXT",
+
+  # Whatever else was written beside the values.
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
+
+  # The time zone an instant is stored in. The cells of a POSIXct are seconds
+  # since the epoch, so the same moments written in two zones hash the same and
+  # read as two different local times. index_tz below is the zone of a series'
+  # index, a different field on a different kind of object.
+  tz = "TEXT",
 
   # What a list holds. The inner row count is the one that matters: a nested
-  # table reports its group count as its rows. The element names and the inner
-  # column names are on the version link, being names of things rather than the
-  # things.
+  # table reports its group count as its rows.
   element_class = "TEXT", element_classes = "TEXT",
   element_len_min = "INTEGER", element_len_max = "INTEGER",
   element_len_total = "INTEGER", max_depth = "INTEGER",
   inner_nrow_total = "INTEGER", inner_ncol = "INTEGER",
+  # The names a list files its slots under, and the columns of an inner table.
+  element_names = "TEXT", inner_names = "TEXT",
+  inner_schema_varies = "INTEGER",
 
-  # Spatial detail that is read off the coordinates rather than off the
-  # projection written beside them.
+  # Where a series starts and how often it is sampled. The `tsp` attribute is
+  # not hashed, so twelve monthly readings from 2000 and the same twelve read as
+  # quarterly readings from 1990 hold the same numbers.
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
+  ts_span = "REAL",
+
+  # The index of an indexed series, which is an attribute beside the values
+  # rather than a column of them, and every figure taken off it.
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER",
+  index_class = "TEXT", index_span = "REAL", index_tz = "TEXT",
+  index_delta = "REAL", index_regular = "INTEGER",
+  index_n_gaps = "INTEGER", index_max_gap = "REAL",
+  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
+
+  # Spatial detail read off the coordinates, and the projection written beside
+  # them. The coordinates are hashed and the projection is not, so a bounding
+  # box of the same numbers can mean two different places.
   geom_dimension = "TEXT", n_empty = "INTEGER",
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT",
+
+  # How a matrix is held, all of it read off the class rather than the cells.
+  matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT", matrix_value_type = "TEXT",
+
+  # Raster metadata, read off the object's slots.
+  n_layers = "INTEGER", layer_names = "TEXT", layer_min = "TEXT",
+  layer_max = "TEXT", resolution = "TEXT", nodata_value = "REAL",
+  in_memory = "INTEGER",
 
   # Which kind of missing, and which end an infinity runs to. Both are
   # column-level too and ride in the columns JSON; these are for the objects
@@ -247,8 +296,7 @@ metrics_fingerprint <- function(summary_df) {
   n_nan = "INTEGER", n_infinite_pos = "INTEGER", n_infinite_neg = "INTEGER",
 
   # A broken-down time: how many fields it is stored in, and the years it
-  # covers, which is what is recoverable without rebuilding the instants. The
-  # fields are the object's own values, so two records on this row agree.
+  # covers, which is what is recoverable without rebuilding the instants.
   n_fields = "INTEGER", year_min = "INTEGER", year_max = "INTEGER",
 
   # Sparse and graph. All four are counted off the values themselves.
@@ -285,17 +333,11 @@ metrics_fingerprint <- function(summary_df) {
   # profile rather than a gap in it, and `structural` is every column named and
   # typed with nothing counted, because no value was read. ncol is the true
   # width at every depth.
-  #
-  # Here rather than on the version link because all four follow from the data:
-  # the first three from the width, the homogeneity of the columns and the cell
-  # count, and `structural` from the length of one column. Two records sharing
-  # this row were read at the same depth, necessarily.
   column_detail = "TEXT",
 
   # Slots of a list that hold nothing at all. They count towards its length and
   # they draw as nothing, so a list of ten with four of them empty is not the
-  # list its length says it is. An empty slot is an element like any other and
-  # hashes as one.
+  # list its length says it is.
   n_empty_slots = "INTEGER",
 
   # How many bytes of column profile this row does NOT carry. Zero on a row
@@ -307,114 +349,24 @@ metrics_fingerprint <- function(summary_df) {
   columns_refused_bytes = "INTEGER"
 )
 
-# `columns` and `elements` are the two arrays above that carry material the
-# fingerprints do not reach, and they stay here anyway.
+# How one file happened to store the data, which is not a property of the data
+# at all: the same table saved twice can differ in every one of these. R's
+# serialization format has versions, and a version 3 file cannot be read by R
+# before 3.5.0, so this is the difference between a dataset a reader can open
+# and one they cannot.
 #
-# Every statistic in either is taken off the cells, and those are covered. What
-# is not covered is the handful of per-entry fields read off an attribute:
-# a column's `label`, `comment`, `units`, `attrs_other`, its declared `levels`
-# and `is_ordered`, the time zone of a POSIXct column, and the projection on a
-# geometry column. Measured against the analyzer at c045665, a frame of the same
-# instants written in two zones and a frame whose factor declares one spare
-# level both share this row and differ inside `columns`.
-#
-# Moving the arrays to the version link would fix that and cost far more than
-# it is worth: `columns` is the largest value the pipeline writes, large enough
-# to need a refusal bound of its own, and a per-version copy of it is exactly
-# the duplication this table exists to remove. So the record-level answer for
-# every one of those properties is on the version link, where it is each
-# dataset's own, and the array's copy of it is the profile of whichever dataset
-# minted the row. A reader wanting the truth for a given dataset reads the
-# column beside its version, not the array.
-
-# What is true of this record rather than of the data behind it.
-#
-# Two kinds of thing live here. The first is how one file happened to store the
-# data, which is not a property of the data at all: the same table saved twice
-# can differ in all of it, and R's serialization format has versions, where
-# version 3 cannot be read by R before 3.5.0, so this is the difference between
-# a dataset a reader can open and one they cannot.
-#
-# The second is everything the analyzer read off an attribute or off the class
-# vector. Those describe the data and the fingerprints still do not cover them,
-# so they cannot sit on a row two datasets share: see the head of
-# .DATASET_CONTENT_COLS. Each was measured against the analyzer at c045665 on a
-# pair of objects that share both fingerprints and disagree on the field.
+# Nothing describing the data belongs here. That was tried, for the fields the
+# fingerprints do not cover, and it could not work: it could not reach the two
+# profile arrays, which carry the same properties per column and cannot be
+# copied per version; it left `levels`, `n_levels` and `inner_schema_varies`
+# colliding anyway; and it took `class` and `kind` away from the table the
+# catalog reads them off. Keying the profile row on its own digest fixes all of
+# that at once, and this list goes back to being about the file.
 .DATASET_VERSION_COLS <- c(
   format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
   # A file that is not what its name says: which separator would work, and how
   # many columns it would give. A property of this file, not of the data.
-  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER",
-
-  # What the object calls itself. A data.frame and a tibble over the same
-  # columns hash identically, and so do a symmetric Matrix and the general one
-  # holding the same cells, so none of these can sit on a shared row. Keeping
-  # them here also means a record the reader could not fingerprint still says
-  # what kind of thing it is, which is most of what is knowable about an S4
-  # object nobody could open.
-  class = "TEXT", kind = "TEXT", frame_class = "TEXT",
-  object_system = "TEXT", s4_package = "TEXT",
-
-  # Labels rather than values. Row names, dimension names and the margin labels
-  # of a grid are all written beside the cells and none of them is hashed, so a
-  # table of counts and the same table with its margins named share a row.
-  has_rownames = "INTEGER", has_dimnames = "INTEGER", dimnames = "TEXT",
-
-  # Whatever was written beside the values. None of it is hashed, so a frame
-  # carrying a comment and the same frame without one share a row.
-  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
-
-  # The time zone an instant is stored in. The cells of a POSIXct column are
-  # seconds since the epoch, so the same moments written in two zones hash the
-  # same and read as two different local times. index_tz below it is the zone of
-  # a series' index, which is a different field on a different kind of object.
-  tz = "TEXT",
-
-  # What a factor declares, as against what it uses. A spare level nobody used
-  # changes neither a cell nor a type. `level_counts` and `is_factor` are on the
-  # content row, being a count off the cells and a consequence of the type.
-  levels = "TEXT", n_levels = "INTEGER", is_ordered = "INTEGER",
-
-  # How a frame is grouped and keyed. All of it is attributes: two frames of the
-  # same numbers, one grouped and one not, hash identically.
-  is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",
-  is_rowwise = "INTEGER", dt_key = "TEXT", dt_indices = "TEXT",
-
-  # Where a series starts and how often it is sampled. The `tsp` attribute is
-  # not hashed, so twelve monthly readings from 2000 and the same twelve read as
-  # quarterly readings from 1990 are one row.
-  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
-  ts_span = "REAL",
-
-  # The index of an indexed series, which is an attribute beside the values
-  # rather than a column of them, and every figure taken off it.
-  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER",
-  index_class = "TEXT", index_span = "REAL", index_tz = "TEXT",
-  index_delta = "REAL", index_regular = "INTEGER",
-  index_n_gaps = "INTEGER", index_max_gap = "REAL",
-  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
-
-  # The projection. The coordinates are hashed and the projection they are in is
-  # not, so the same points in two projections share a row, and a bounding box
-  # of the same numbers means two different places.
-  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT",
-
-  # How a matrix is held, all of it read off the class rather than the cells.
-  matrix_shape = "TEXT", matrix_storage = "TEXT",
-  matrix_uplo = "TEXT", matrix_diag = "TEXT", matrix_value_type = "TEXT",
-
-  # Raster metadata, read off the object's slots. Every raster record measured
-  # carries no fingerprint at all, so on the content row these would describe
-  # nothing and reach nobody.
-  n_layers = "INTEGER", layer_names = "TEXT", layer_min = "TEXT",
-  layer_max = "TEXT", resolution = "TEXT", nodata_value = "REAL",
-  in_memory = "INTEGER",
-
-  # The names of a list's slots and of an inner table's columns. A list's
-  # elements are hashed and the names it files them under are not, so two lists
-  # of the same things under different names are one row.
-  element_names = "TEXT", inner_names = "TEXT",
-  inner_schema_varies = "INTEGER"
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
 )
 
 # Where a dataset was found. Not a property of its contents: the same data can
@@ -519,43 +471,45 @@ metrics_fingerprint <- function(summary_df) {
   out
 }
 
-#' Take off the content row the columns that now belong to the version link.
+#' Take off the version link the columns that describe the data, not the file.
 #'
-#' Every one of them is a field the fingerprints on that row do not cover, so
-#' the value stored there is whichever dataset first minted the row, standing
-#' for every dataset that shares it. It cannot be repaired in place and it
-#' cannot be believed, so it goes.
+#' They were moved there while the profile row was keyed on the fingerprints
+#' and so could not hold them, and a database written in that state exists.
+#' The profile row is keyed on its own digest now and holds them again, and the
+#' copy on the link would otherwise sit there carrying whatever the run that
+#' wrote it recorded, never written again and never removed: a column half
+#' filled with values from a schema nobody can look up.
 #'
-#' Not copied across first, even where the row has one version link and the
-#' value is therefore that dataset's own, because a row can outlive the record
-#' that minted it and nothing distinguishes the two cases. The version link
-#' fills in from the analyzer as each package is scanned again, which the
-#' analyzer-version invalidation already forces on an upgrade, so the gap is
-#' the convergence window rather than a hole left open.
+#' Not copied onto the profile row first. A profile row can outlive the record
+#' that minted it and nothing distinguishes that case from the one where the
+#' link's value is the row's own, so copying would carry a wrong answer
+#' forward. The profile fills in from the analyzer as each package is scanned
+#' again, which the analyzer-version invalidation already forces on an upgrade,
+#' so the gap is the convergence window rather than a hole left open.
 #'
-#' Identified as columns on the contents table that are declared on the version
-#' link: nothing else can produce that overlap. A one-time no-op afterwards.
-.drop_relocated_content_columns <- function(con) {
-  if (!"bioc_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
-  moved <- intersect(DBI::dbListFields(con, "bioc_dataset_contents"),
-                     names(.DATASET_VERSION_COLS))
+#' Identified as columns on the version table that are declared on the content
+#' row: nothing else can produce that overlap. A one-time no-op afterwards.
+.drop_relocated_version_columns <- function(con) {
+  if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  moved <- intersect(DBI::dbListFields(con, "bioc_dataset_versions"),
+                     names(.DATASET_CONTENT_COLS))
   if (!length(moved)) return(invisible(NULL))
   # SQLite rewrites every row of the table once per dropped column, so on a
   # database downloaded from a release this is seconds each rather than
   # nothing, once. Said out loud because a run that stops here otherwise looks
   # like a run that hung.
-  cat(sprintf("moving %d column%s off bioc_dataset_contents: %s\n",
+  cat(sprintf("moving %d column%s off bioc_dataset_versions: %s\n",
               length(moved), if (length(moved) == 1L) "" else "s",
               paste(moved, collapse = ", ")), file = stdout())
   flush(stdout())
   for (col in moved) {
     tryCatch(
-      DBI::dbExecute(con, sprintf('ALTER TABLE bioc_dataset_contents DROP COLUMN "%s"', col)),
+      DBI::dbExecute(con, sprintf('ALTER TABLE bioc_dataset_versions DROP COLUMN "%s"', col)),
       error = function(e) {
         # SQLite refuses to drop a column an index or a constraint names. None
         # of these is one, and a refusal is worth saying out loud rather than
         # leaving a column nobody can explain.
-        cat(sprintf("could not drop %s from bioc_dataset_contents: %s\n",
+        cat(sprintf("could not drop %s from bioc_dataset_versions: %s\n",
                     col, conditionMessage(e)), file = stdout())
       })
   }
@@ -575,7 +529,7 @@ metrics_fingerprint <- function(summary_df) {
     }
     invisible(NULL)
   }
-  .drop_relocated_content_columns(con)
+  .drop_relocated_version_columns(con)
   add("bioc_dataset_contents", .DATASET_CONTENT_COLS)
   add("bioc_dataset_versions", .DATASET_VERSION_COLS)
   add("bioc_datasets", .DATASET_IDENTITY_COLS)
