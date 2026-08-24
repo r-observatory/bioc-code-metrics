@@ -1217,3 +1217,211 @@ test_that("no dataset field is declared on two tables at once", {
   expect_equal(intersect(names(.DATASET_VERSION_COLS),
                          names(.DATASET_IDENTITY_COLS)), character(0L))
 })
+
+test_that("two profiles that differ inside the columns array get a row each", {
+  # The residual no relocation could reach. `columns` is the profile payload
+  # and the reason this table exists, so it cannot move to the version link,
+  # and the fingerprints do not cover the per-column time zone, label, comment,
+  # units or declared levels that ride inside it. Two frames of the same
+  # instants written in two zones share content_fp and schema_fp and differ
+  # only here, and the row published one of them under both.
+  utc <- paste0('[{"name":"t","type":"POSIXct","tz":"UTC",',
+                '"attrs_other":[{"name":"tzone","values":["UTC"]}]}]')
+  chi <- paste0('[{"name":"t","type":"POSIXct","tz":"America/Chicago",',
+                '"attrs_other":[{"name":"tzone","values":["America/Chicago"]}]}]')
+  for (rev in c(FALSE, TRUE)) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+    a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+    b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+    a$columns <- utc
+    b$columns <- chi
+    rows <- if (rev) rbind(b, a) else rbind(a, b)
+    DBI::dbWithTransaction(
+      con, .write_datasets_normalized(con, rows, c("aaa", "zzz")))
+
+    got <- DBI::dbGetQuery(con,
+      "SELECT v.package, c.columns
+         FROM bioc_dataset_versions v
+         JOIN bioc_dataset_contents c ON c.content_id = v.content_id
+        ORDER BY v.package")
+    expect_equal(got$package, c("aaa", "zzz"), info = sprintf("reversed = %s", rev))
+    expect_equal(got$columns, c(utc, chi), info = sprintf("reversed = %s", rev))
+    DBI::dbDisconnect(con)
+  }
+})
+
+test_that("the same data in two packages is still one fingerprint", {
+  # content_fp is the user-facing signal, and splitting the row must not split
+  # it: the two rows below hold the same bytes profiled two ways, and anything
+  # grouping on content_fp still sees one dataset shipped twice.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  a$columns <- '[{"name":"t","tz":"UTC"}]'
+  b$columns <- '[{"name":"t","tz":"America/Chicago"}]'
+  DBI::dbWithTransaction(
+    con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
+
+  got <- DBI::dbGetQuery(con,
+    "SELECT COUNT(*) rows, COUNT(DISTINCT content_fp) fps
+       FROM bioc_dataset_contents")
+  expect_equal(got$rows, 2L)
+  expect_equal(got$fps, 1L)
+})
+
+test_that("one profile written twice is still one row", {
+  # The dedup is the point of the table and the digest must not weaken it: two
+  # packages shipping byte-identical data profiled identically share the row.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  DBI::dbWithTransaction(
+    con, .write_datasets_normalized(con, rbind(a, b), c("aaa", "zzz")))
+
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 1L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT content_id) n FROM bioc_dataset_versions")$n, 1L)
+})
+
+test_that("a profile digest stands over every field the row records", {
+  # The digest is what makes the row unique, so it has to be on the row, it has
+  # to be declared NOT NULL, and it has to be the uniqueness key. A key still
+  # naming only the fingerprints is the defect back again.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, a, "aaa"))
+
+  expect_true("profile_fp" %in% DBI::dbListFields(con, "bioc_dataset_contents"))
+  fp <- DBI::dbGetQuery(con, "SELECT profile_fp FROM bioc_dataset_contents")$profile_fp
+  expect_equal(nchar(fp), 64L)
+
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  expect_true(grepl("profile_fp TEXT NOT NULL", sql, fixed = TRUE))
+  expect_true(grepl("UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE))
+  expect_false(grepl("UNIQUE (content_fp, schema_fp, fp_algo_version)", sql,
+                     fixed = TRUE))
+})
+
+test_that("the digest separates values that would otherwise run together", {
+  # Field values are folded in with their name and their length, so a pair of
+  # rows whose text merely shifts across a field boundary cannot be told they
+  # hold the same profile.
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- .mk_ds_row("zzz", "1.0", TRUE, "C1")
+  a$sort_order   <- "ab"
+  a$summary_over <- "c"
+  b$sort_order   <- "a"
+  b$summary_over <- "bc"
+  expect_false(identical(.dataset_profile_fp(a), .dataset_profile_fp(b)))
+})
+
+test_that("a field the record does not carry does not move the digest", {
+  # A column the analyzer has never emitted is absent rather than NA-valued,
+  # and declaring one must not re-mint every row in the table.
+  a <- .mk_ds_row("aaa", "1.0", TRUE, "C1")
+  b <- a
+  b$n_vertices <- NA_integer_
+  expect_equal(.dataset_profile_fp(a), .dataset_profile_fp(b))
+})
+
+test_that("a database keyed by fingerprint alone is re-keyed in place", {
+  # The deployed database is keyed (content_fp, schema_fp, fp_algo_version).
+  # The incremental path opens that file, so the new key has to arrive by
+  # migration or it only ever applies to a database built from nothing.
+  path <- tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "CREATE INDEX idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (package, name, version))")
+  for (i in 1:50) {
+    DBI::dbExecute(con,
+      "INSERT INTO bioc_dataset_contents
+         (content_id, content_fp, schema_fp, fp_algo_version, nrow, columns)
+       VALUES (?, ?, 'S1', 1, ?, ?)",
+      params = list(i, sprintf("C%03d", i), i, sprintf('[{"name":"c%d"}]', i)))
+    DBI::dbExecute(con,
+      "INSERT INTO bioc_dataset_versions
+         (package, name, version, content_id, is_current)
+       VALUES (?, 'd', '1.0', ?, 1)",
+      params = list(sprintf("p%03d", i), i))
+  }
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  expect_true(grepl("UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE))
+  # Every row and every link comes across, and the ids the links name still
+  # point at the same profile.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 50L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_versions")$n, 50L)
+  got <- DBI::dbGetQuery(con,
+    "SELECT content_id, content_fp, nrow FROM bioc_dataset_contents ORDER BY content_id")
+  expect_equal(got$content_id, 1:50)
+  expect_equal(got$content_fp, sprintf("C%03d", 1:50))
+  expect_equal(got$nrow, 1:50)
+  # Backfilled rather than left NULL: the column is the key and a table of
+  # NULLs is a table with no key at all.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents WHERE profile_fp IS NULL")$n, 0L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT profile_fp) n FROM bioc_dataset_contents")$n, 50L)
+  # The index the rebuild drops with the table is back.
+  expect_true("idx_bioc_dsc_schema" %in% DBI::dbGetQuery(con,
+    "SELECT name FROM sqlite_master WHERE type = 'index'")$name)
+})
+
+test_that("re-keying a database twice changes nothing the second time", {
+  path <- tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+    (content_id, content_fp, schema_fp, fp_algo_version, nrow)
+    VALUES (1, 'C1', 'S1', 1, 3)")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  first <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents")
+  DBI::dbDisconnect(con)
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_equal(DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents"), first)
+})
+
+test_that("the fingerprint the catalog groups on keeps an index", {
+  # content_fp led the old uniqueness key and was indexed by it for free. It no
+  # longer leads any key, and "the same data ships in N packages" groups on it,
+  # which without an index is a scan of every profile in the catalog.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  idx <- DBI::dbGetQuery(con,
+    "SELECT name FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'bioc_dataset_contents'")$name
+  expect_true("idx_bioc_dsc_content" %in% idx)
+  plan <- DBI::dbGetQuery(con,
+    "EXPLAIN QUERY PLAN SELECT content_fp, COUNT(*) FROM bioc_dataset_contents
+      GROUP BY content_fp")$detail
+  expect_true(any(grepl("idx_bioc_dsc_content", plan, fixed = TRUE)))
+})

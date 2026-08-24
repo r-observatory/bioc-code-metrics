@@ -160,9 +160,9 @@ metrics_fingerprint <- function(summary_df) {
 # ---- dataset tables (normalized, content-addressed) -------------------------
 # Datasets are split three ways so identical content is stored once, not per
 # version: an identity row per (package, name), a per-version link that carries
-# only a small integer content_id, and a content-addressed profile keyed by
-# (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
-# The heavy row_sketch lives in its own table (kept out of the merge allowlist).
+# only a small integer content_id, and a profile keyed by the digest of
+# everything that profile records, shared across versions AND packages. The
+# heavy row_sketch lives in its own table (kept out of the merge allowlist).
 
 # Columns of a dataset record that the fingerprints on this row actually cover,
 # and so belong on the content-addressed row shared by every copy of that data.
@@ -428,6 +428,97 @@ metrics_fingerprint <- function(summary_df) {
   title = "TEXT"
 )
 
+# How a profile digest is built. The pair separator joins a field's name, the
+# byte length of its value and the value; the field separator joins the pairs.
+# Both are control characters, which JSON escapes rather than carries, so
+# neither can appear inside a value the analyzer emits. The length is folded in
+# so that text shifting across a field boundary cannot produce the same input
+# from two different profiles.
+.DATASET_DIGEST_PAIR_SEP  <- "\x1e"
+.DATASET_DIGEST_FIELD_SEP <- "\x1f"
+
+# How much profile text one digest pass concatenates at a time. The values
+# being hashed include the column profile, which is bounded at
+# MAX_DATASET_COLUMNS_BYTES per row and nothing smaller, so hashing a whole
+# table in one vectorized pass would hold a second copy of it in memory.
+.DATASET_DIGEST_CHUNK_BYTES <- 16 * 1024^2
+
+#' Digest the profile a dataset record carries, field by field.
+#'
+#' This is the uniqueness key of the content-addressed row, and it exists
+#' because the fingerprints beside it are not one. content_fp is a hash over
+#' each column's type name and cell bytes and schema_fp is over `name:type`,
+#' so between them they cover the cells, the column count, order, names, types
+#' and lengths, and nothing else. Everything the reader took off an attribute
+#' or off the class vector is invisible to both: a time zone, a class, a series
+#' start, a projection, a factor's declared levels, a table's row names.
+#'
+#' The row is written with INSERT OR IGNORE from the first record that reaches
+#' it, so a key that does not separate those fields hands every later dataset
+#' sharing the key whichever answer the first one had. Digesting the whole
+#' recorded profile means two profiles that differ in any recorded way get two
+#' rows, and no dataset is ever handed another's measurement.
+#'
+#' It is not a replacement for content_fp and does not change what it means.
+#' content_fp stays exactly as the reader computes it and stays on the row,
+#' because it is the signal behind "the same data ships in N packages" and a
+#' surrogate keyed finer would undercount that.
+#'
+#' Absent fields contribute nothing rather than a placeholder, so declaring a
+#' column the analyzer does not emit yet leaves every existing digest alone.
+#' Doubles are rendered at full precision one element at a time: format() would
+#' choose a width from whatever else is in the shard, which would make the same
+#' value digest differently in two runs.
+#'
+#' @param df Data frame of dataset records, or of content rows read back.
+#' @return Character vector of 64-character lower-case hex digests, one per row.
+.dataset_profile_fp <- function(df) {
+  n <- nrow(df)
+  if (n == 0L) return(character(0L))
+  cols <- sort(intersect(c("content_fp", "schema_fp", names(.DATASET_CONTENT_COLS)),
+                         names(df)))
+  if (!length(cols)) return(rep(NA_character_, n))
+
+  parts <- lapply(cols, function(k) {
+    v <- df[[k]]
+    if (is.logical(v)) v <- as.integer(v)
+    # NaN is a value the reader can report and NA is the absence of one, so a
+    # double keeps its NaN and loses only its NA.
+    absent <- if (is.double(v)) is.na(v) & !is.nan(v) else is.na(v)
+    s <- if (is.double(v)) sprintf("%.17g", v) else as.character(v)
+    s[absent] <- ""
+    # Each field carries its own leading separator rather than the join
+    # supplying one, so an absent field contributes literally nothing and not
+    # an empty slot: a column declared before the analyzer emits it must not
+    # move the digest of every row already in the table.
+    out <- paste0(.DATASET_DIGEST_FIELD_SEP, k, .DATASET_DIGEST_PAIR_SEP,
+                  nchar(s, type = "bytes"), .DATASET_DIGEST_PAIR_SEP, s)
+    out[absent] <- ""
+    out
+  })
+
+  weight <- rep(0, n)
+  for (p in parts) weight <- weight + nchar(p, type = "bytes")
+
+  out <- character(n)
+  lo <- 1L
+  while (lo <= n) {
+    hi  <- lo
+    acc <- weight[[lo]]
+    while (hi < n && acc + weight[[hi + 1L]] <= .DATASET_DIGEST_CHUNK_BYTES) {
+      hi  <- hi + 1L
+      acc <- acc + weight[[hi]]
+    }
+    idx  <- seq.int(lo, hi)
+    keys <- do.call(paste0, lapply(parts, `[`, idx))
+    out[idx] <- vapply(keys, function(k)
+      digest::digest(k, algo = "sha256", serialize = FALSE),
+      character(1L), USE.NAMES = FALSE)
+    lo <- hi + 1L
+  }
+  out
+}
+
 #' Take off the content row the columns that now belong to the version link.
 #'
 #' Every one of them is a field the fingerprints on that row do not cover, so
@@ -488,6 +579,84 @@ metrics_fingerprint <- function(summary_df) {
   add("bioc_dataset_contents", .DATASET_CONTENT_COLS)
   add("bioc_dataset_versions", .DATASET_VERSION_COLS)
   add("bioc_datasets", .DATASET_IDENTITY_COLS)
+  # After the widening, so the digest of an existing row is taken over the
+  # shape the row will keep rather than over a narrower one it is about to
+  # leave. Columns added just above are NULL on every existing row and an
+  # absent field contributes nothing, so the two give the same answer, but the
+  # order says which one is meant.
+  .rekey_dataset_contents(con)
+  invisible(NULL)
+}
+
+#' Key the content-addressed table on the profile digest rather than on the
+#' fingerprints.
+#'
+#' The deployed database is keyed (content_fp, schema_fp, fp_algo_version), and
+#' the incremental path opens that file rather than building one, so the new
+#' key arrives here or it only ever applies to a database built from nothing.
+#'
+#' A UNIQUE is part of the CREATE and cannot be altered in place, so the table
+#' is rebuilt from its own CREATE with the key phrase replaced and profile_fp
+#' declared beside content_fp. Every column it has picked up since comes across
+#' by name, and every row comes across with its content_id, which the version
+#' links name. The indexes the DROP takes with it are recreated by the caller.
+#'
+#' Existing rows are digested rather than left NULL: the column is the key, and
+#' a key column full of NULLs is not a key. The digests cannot collide, because
+#' the old UNIQUE guarantees the rows differ in content_fp or schema_fp and
+#' both are folded into the digest.
+#'
+#' Rows are copied in bounded batches. The profile of one dataset runs to
+#' megabytes, so reading the table whole to digest it would hold the published
+#' catalog in memory twice.
+#'
+#' A one-time no-op once the key is the digest.
+.rekey_dataset_contents <- function(con) {
+  if (!"bioc_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  sql <- DBI::dbGetQuery(con,
+    "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  old_key <- "UNIQUE (content_fp, schema_fp, fp_algo_version)"
+  if (length(sql) != 1L || is.na(sql) || !grepl(old_key, sql, fixed = TRUE)) {
+    return(invisible(NULL))
+  }
+  n <- as.integer(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n)
+  cat(sprintf("re-keying bioc_dataset_contents on the profile digest: %d row%s\n",
+              n, if (n == 1L) "" else "s"), file = stdout())
+  flush(stdout())
+
+  create <- sub(old_key, "UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE)
+  cols   <- DBI::dbListFields(con, "bioc_dataset_contents")
+  if (!"profile_fp" %in% cols) {
+    create <- sub("content_fp TEXT NOT NULL",
+                  "profile_fp TEXT NOT NULL, content_fp TEXT NOT NULL",
+                  create, fixed = TRUE)
+  }
+  create <- sub("bioc_dataset_contents", "bioc_dataset_contents_new", create,
+                fixed = TRUE)
+  DBI::dbExecute(con, create)
+
+  copy_cols <- unique(c("profile_fp", setdiff(cols, "profile_fp")))
+  ins <- sprintf("INSERT INTO bioc_dataset_contents_new (%s) VALUES (%s)",
+                 paste(sprintf('"%s"', copy_cols), collapse = ", "),
+                 paste(rep("?", length(copy_cols)), collapse = ", "))
+  read_cols <- paste(sprintf('"%s"', setdiff(cols, "profile_fp")), collapse = ", ")
+  batch <- 200L
+  offset <- 0L
+  repeat {
+    chunk <- DBI::dbGetQuery(con, sprintf(
+      "SELECT %s FROM bioc_dataset_contents ORDER BY content_id LIMIT %d OFFSET %d",
+      read_cols, batch, offset))
+    if (nrow(chunk) == 0L) break
+    chunk$profile_fp <- .dataset_profile_fp(chunk)
+    DBI::dbExecute(con, ins, params = lapply(copy_cols, function(k) chunk[[k]]))
+    offset <- offset + nrow(chunk)
+  }
+
+  DBI::dbExecute(con, "DROP TABLE bioc_dataset_contents")
+  DBI::dbExecute(con,
+    "ALTER TABLE bioc_dataset_contents_new RENAME TO bioc_dataset_contents")
   invisible(NULL)
 }
 
@@ -546,12 +715,16 @@ metrics_fingerprint <- function(summary_df) {
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
   }
+  # Keyed on the digest of the whole recorded profile rather than on the
+  # fingerprints, because the fingerprints do not cover everything the row
+  # records and a key that does not separate two profiles publishes one of them
+  # under both. content_fp is still here and still means what it always meant.
   if (!"bioc_dataset_contents" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
-      content_id INTEGER PRIMARY KEY,
+      content_id INTEGER PRIMARY KEY, profile_fp TEXT NOT NULL,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
       nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
-      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+      UNIQUE (profile_fp, fp_algo_version))")
   }
   if (!"bioc_dataset_sketches" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_sketches (
@@ -562,8 +735,23 @@ metrics_fingerprint <- function(summary_df) {
   # above to the full declared shape, so a database being built from nothing and
   # one downloaded from the last release end up with the same columns.
   .ensure_dataset_columns(con)
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
+  # Each index is created only where the column it names is there. A table
+  # written before that column existed is the case this whole function is for,
+  # and CREATE INDEX on a name SQLite does not know fails the open rather than
+  # the index.
+  idx <- function(name, table, col) {
+    if (!table %in% DBI::dbListTables(con)) return(invisible(NULL))
+    if (!col %in% DBI::dbListFields(con, table)) return(invisible(NULL))
+    DBI::dbExecute(con, sprintf(
+      'CREATE INDEX IF NOT EXISTS %s ON %s("%s")', name, table, col))
+    invisible(NULL)
+  }
+  idx("idx_bioc_dsv_content", "bioc_dataset_versions", "content_id")
+  idx("idx_bioc_dsc_schema",  "bioc_dataset_contents", "schema_fp")
+  # content_fp used to lead the uniqueness key and so had an index for free.
+  # It no longer does, and grouping on it is how the catalog answers "the same
+  # data ships in N packages", which is a scan of the whole table without one.
+  idx("idx_bioc_dsc_content", "bioc_dataset_contents", "content_fp")
   invisible(NULL)
 }
 
@@ -613,9 +801,10 @@ metrics_fingerprint <- function(summary_df) {
   df$internal        <- as.integer(df$internal)
   df$is_current      <- as.integer(df$is_current)
   # Atomic vectors / matrices / S4 have values but no column schema, so schema_fp
-  # is NA. Use an empty string so they still dedup by content and satisfy the
-  # NOT NULL + UNIQUE(content_fp, schema_fp, fp_algo_version) constraint (a NULL
-  # would make every such row distinct and get dropped by INSERT OR IGNORE).
+  # is NA. Use an empty string so they still satisfy the column's NOT NULL and
+  # so two such records read the same way still digest alike: an absent field
+  # and an empty one are different inputs to the profile digest, and a schema_fp
+  # left NA would make every vector its own profile.
   df$schema_fp[is.na(df$schema_fp)] <- ""
 
   # Nothing upstream bounds one column profile, and one pathological value is
@@ -684,16 +873,25 @@ metrics_fingerprint <- function(summary_df) {
     flush(stdout())
   }
 
-  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
+  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct profile.
+  #
+  # Keyed on the digest of everything the row records rather than on the
+  # fingerprints, which cover the cells and the column schema and nothing else.
+  # Under the fingerprints alone, two datasets whose profiles differ in a time
+  # zone, a declared level, a class or a projection resolved to one row, and
+  # whichever record sorted first supplied the answer for both.
+  df$profile_fp <- NA_character_
+  df$profile_fp[fingerprinted] <-
+    .dataset_profile_fp(df[fingerprinted, , drop = FALSE])
   ck <- rep(NA_character_, nrow(df))
-  ck[fingerprinted] <- paste(df$content_fp[fingerprinted],
-                             df$schema_fp[fingerprinted],
+  ck[fingerprinted] <- paste(df$profile_fp[fingerprinted],
                              df$fp_algo_version[fingerprinted], sep = "\x1f")
   cts <- df[fingerprinted & !duplicated(ck), , drop = FALSE]
   df$content_id <- NA_integer_
   if (nrow(cts) > 0L) {
     content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
-    ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
+    ins_cols <- c("profile_fp", "content_fp", "schema_fp", "fp_algo_version",
+                  content_cols)
     DBI::dbExecute(con,
       sprintf("INSERT OR IGNORE INTO bioc_dataset_contents (%s) VALUES (%s)",
               paste(sprintf('"%s"', ins_cols), collapse = ", "),
@@ -707,10 +905,10 @@ metrics_fingerprint <- function(summary_df) {
     # every row that has one. The rest keep NA, which is the whole of what the
     # content-addressed table can say about them.
     ids <- DBI::dbGetQuery(con,
-      "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
+      "SELECT content_id, profile_fp, fp_algo_version FROM bioc_dataset_contents")
     key_map <- stats::setNames(
       ids$content_id,
-      paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
+      paste(ids$profile_fp, ids$fp_algo_version, sep = "\x1f"))
     df$content_id[fingerprinted] <- unname(key_map[ck[fingerprinted]])
   }
 

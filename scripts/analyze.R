@@ -4,11 +4,11 @@
 # This file does NOT auto-source its dependencies so the caller controls order.
 
 # The fingerprint algorithm's generation. It is part of the uniqueness key on
-# bioc_dataset_contents, which is written with INSERT OR IGNORE, so a re-scan of
-# data whose bytes have not changed produces the same content_fp and is silently
-# dropped. Anything that changes what a profile records, rather than what the
-# data is, has to be a new generation or it never reaches the table. Superseded
-# rows are left unreferenced and reclaimed by the contents GC.
+# bioc_dataset_contents, beside the digest of the whole recorded profile, and
+# the table is written with INSERT OR IGNORE. A change in how a fingerprint is
+# computed leaves the digest of an unchanged dataset looking like a profile
+# already in the table, so it has to be a new generation or it never reaches
+# it. Superseded rows are left unreferenced and reclaimed by the contents GC.
 #
 # The number is shared with the CRAN pipeline rather than counted per origin: a
 # Bioconductor package and a CRAN package that ship identical bytes only match

@@ -116,9 +116,9 @@ test_that("data-series fingerprint matches when a package name is a prefix of an
   # tuple-ORDER-BY fingerprint cannot rely on insertion order.
   DBI::dbExecute(con,
     "INSERT INTO bioc_dataset_contents
-       (content_id, content_fp, schema_fp, fp_algo_version, nrow, ncol)
-     VALUES (1, 'cf1', 'sf1', 1, 10, 2),
-            (2, 'cf2', 'sf2', 1, 20, 3)")
+       (content_id, profile_fp, content_fp, schema_fp, fp_algo_version, nrow, ncol)
+     VALUES (1, 'pf1', 'cf1', 'sf1', 1, 10, 2),
+            (2, 'pf2', 'cf2', 'sf2', 1, 20, 3)")
   DBI::dbExecute(con,
     "INSERT INTO bioc_datasets (package, name, file, internal, current_version, current_content_id)
      VALUES ('bioc11pkg', 'd', 'data/d.rda', 0, '1.0', 2),
