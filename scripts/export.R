@@ -395,6 +395,19 @@ metrics_fingerprint <- function(summary_df) {
 # table in one vectorized pass would hold a second copy of it in memory.
 .DATASET_DIGEST_CHUNK_BYTES <- 16 * 1024^2
 
+# How much profile text the re-key migration reads at once, and how many rows
+# it will take to reach it. The migration digests rows that are already stored,
+# so it reads them back, and the same bound applies: one row's column profile
+# runs to MAX_DATASET_COLUMNS_BYTES and nothing smaller. A batch counted in
+# rows is therefore a batch whose size nobody stated, and on a catalog of
+# profiles near the cap it is the published table read whole with the digest's
+# working copies on top of it. Counted in bytes it is what the batch actually
+# holds. The row ceiling is the other end of the same bound: a table of tiny
+# profiles would otherwise bind a quarter of a million values into one
+# statement on its way to the byte budget.
+.DATASET_REKEY_BATCH_BYTES <- 32 * 1024^2
+.DATASET_REKEY_BATCH_ROWS  <- 2000L
+
 #' Digest the profile a dataset record carries, field by field.
 #'
 #' This is the uniqueness key of the content-addressed row, and it exists
@@ -562,6 +575,47 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Group rows into batches bounded by the bytes they carry.
+#'
+#' Greedy and in order, because the rows have to reach the rebuilt table with
+#' their content_id and reading them by a contiguous range of it is a walk down
+#' the primary key rather than a scan per batch.
+#'
+#' A row heavier on its own than the whole budget still has to travel. It takes
+#' a batch to itself: the budget is a ceiling on what a batch adds to a working
+#' set, not a promise that any single row fits under it.
+#'
+#' @param weight   Byte weight of each row, in the order they will be read. A
+#'   weight that could not be taken counts as nothing rather than dropping the
+#'   row out of the plan.
+#' @param max_bytes Byte budget for one batch.
+#' @param max_rows  Row ceiling for one batch.
+#' @return Integer vector, one per row, naming the batch it belongs to. Batch
+#'   numbers start at 1 and rise by one, so the runs are contiguous.
+.dataset_rekey_batches <- function(weight,
+                                   max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                                   max_rows  = .DATASET_REKEY_BATCH_ROWS) {
+  n <- length(weight)
+  if (n == 0L) return(integer(0L))
+  w <- as.numeric(weight)
+  w[is.na(w)] <- 0
+  out  <- integer(n)
+  b    <- 1L
+  acc  <- 0
+  rows <- 0L
+  for (i in seq_len(n)) {
+    if (rows > 0L && (acc + w[[i]] > max_bytes || rows >= max_rows)) {
+      b    <- b + 1L
+      acc  <- 0
+      rows <- 0L
+    }
+    out[[i]] <- b
+    acc  <- acc + w[[i]]
+    rows <- rows + 1L
+  }
+  out
+}
+
 #' Key the content-addressed table on the profile digest rather than on the
 #' fingerprints.
 #'
@@ -580,9 +634,13 @@ metrics_fingerprint <- function(summary_df) {
 #' the old UNIQUE guarantees the rows differ in content_fp or schema_fp and
 #' both are folded into the digest.
 #'
-#' Rows are copied in bounded batches. The profile of one dataset runs to
-#' megabytes, so reading the table whole to digest it would hold the published
-#' catalog in memory twice.
+#' Rows are copied in batches bounded by the bytes they hold rather than by a
+#' count of them. One dataset's column profile runs to MAX_DATASET_COLUMNS_BYTES
+#' and nothing smaller, so a fixed number of rows is a working set nobody stated:
+#' on a catalog of profiles near the cap it is the published table read whole,
+#' with the digest's working copies on top. What each row weighs is asked of
+#' SQLite before any of it is in memory, and the batch that carries it is
+#' whatever fits under the budget.
 #'
 #' A one-time no-op once the key is the digest.
 .rekey_dataset_contents <- function(con) {
@@ -619,21 +677,38 @@ metrics_fingerprint <- function(summary_df) {
                 fixed = TRUE)
   DBI::dbExecute(con, create)
 
-  copy_cols <- unique(c("profile_fp", setdiff(cols, "profile_fp")))
+  read_names <- setdiff(cols, "profile_fp")
+  copy_cols  <- c("profile_fp", read_names)
   ins <- sprintf("INSERT INTO bioc_dataset_contents_new (%s) VALUES (%s)",
                  paste(sprintf('"%s"', copy_cols), collapse = ", "),
                  paste(rep("?", length(copy_cols)), collapse = ", "))
-  read_cols <- paste(sprintf('"%s"', setdiff(cols, "profile_fp")), collapse = ", ")
-  batch <- 200L
-  offset <- 0L
-  repeat {
+  read_cols <- paste(sprintf('"%s"', read_names), collapse = ", ")
+
+  # What every row weighs, asked of SQLite rather than of memory. LENGTH over a
+  # CAST to BLOB is the stored byte count and not a character count, so a
+  # profile carrying multi-byte text is not planned for as smaller than it is,
+  # and SQLite answers it off the record header without reading the value: on a
+  # 923 MB table this pass is a tenth of a second and allocates nothing.
+  weigh <- paste(sprintf('COALESCE(LENGTH(CAST("%s" AS BLOB)), 0)', read_names),
+                 collapse = " + ")
+  plan <- DBI::dbGetQuery(con, sprintf(
+    "SELECT content_id, %s AS w FROM bioc_dataset_contents ORDER BY content_id",
+    weigh))
+  runs <- rle(.dataset_rekey_batches(plan$w))
+  ends <- cumsum(runs$lengths)
+  for (b in seq_along(ends)) {
+    lo <- plan$content_id[[ends[[b]] - runs$lengths[[b]] + 1L]]
+    hi <- plan$content_id[[ends[[b]]]]
+    # By content_id and not LIMIT/OFFSET: content_id is the rowid, so a range
+    # of it is a walk down the primary key, where OFFSET re-walked every row
+    # already copied and made the migration quadratic in the size of the table.
     chunk <- DBI::dbGetQuery(con, sprintf(
-      "SELECT %s FROM bioc_dataset_contents ORDER BY content_id LIMIT %d OFFSET %d",
-      read_cols, batch, offset))
-    if (nrow(chunk) == 0L) break
+      "SELECT %s FROM bioc_dataset_contents
+        WHERE content_id BETWEEN ? AND ? ORDER BY content_id", read_cols),
+      params = list(lo, hi))
     chunk$profile_fp <- .dataset_profile_fp(chunk)
     DBI::dbExecute(con, ins, params = lapply(copy_cols, function(k) chunk[[k]]))
-    offset <- offset + nrow(chunk)
+    rm(chunk)
   }
 
   DBI::dbExecute(con, "DROP TABLE bioc_dataset_contents")

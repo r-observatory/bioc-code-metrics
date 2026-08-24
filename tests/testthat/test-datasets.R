@@ -1345,6 +1345,96 @@ test_that("re-keying a database twice changes nothing the second time", {
   expect_equal(DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents"), first)
 })
 
+test_that("a re-key batch is bounded by the bytes it holds, not by a row count", {
+  # One profile runs to MAX_DATASET_COLUMNS_BYTES and nothing smaller bounds it,
+  # so a batch counted in rows is a batch whose size nobody stated.
+  cap <- MAX_DATASET_COLUMNS_BYTES
+
+  # Every row at the cap: the batch fills on bytes long before any row ceiling.
+  b <- .dataset_rekey_batches(rep(cap, 40L))
+  expect_equal(length(b), 40L)
+  expect_true(all(diff(b) %in% c(0L, 1L)))     # in order, no batch skipped
+  expect_true(all(tapply(rep(cap, 40L), b, sum) <= .DATASET_REKEY_BATCH_BYTES))
+
+  # A row heavier than the whole budget still has to travel. It takes a batch
+  # to itself rather than being left behind or dragging a neighbour with it.
+  w <- c(1000, .DATASET_REKEY_BATCH_BYTES * 3, 1000)
+  b <- .dataset_rekey_batches(w)
+  expect_equal(b, c(1L, 2L, 3L))
+
+  # Small rows are held to the row ceiling, so a table of tiny profiles does
+  # not bind a quarter of a million values into one statement.
+  b <- .dataset_rekey_batches(rep(8, .DATASET_REKEY_BATCH_ROWS * 2L + 5L))
+  expect_equal(max(tabulate(b)), .DATASET_REKEY_BATCH_ROWS)
+
+  # A weight the pre-pass could not take counts as nothing rather than
+  # dropping the row out of the plan.
+  b <- .dataset_rekey_batches(c(NA_real_, 1, NA_real_))
+  expect_equal(b, c(1L, 1L, 1L))
+
+  expect_equal(.dataset_rekey_batches(numeric(0L)), integer(0L))
+})
+
+test_that("re-keying a table of profiles at the cap holds one batch, not the table", {
+  # The worst case the store permits: every row carrying a distinct column
+  # profile at MAX_DATASET_COLUMNS_BYTES. Read whole, that is the published
+  # catalog in memory, and the digest holds two more copies of it while it
+  # works, so the run dies on a CI runner rather than migrating.
+  cap  <- MAX_DATASET_COLUMNS_BYTES
+  rows <- 48L                                  # six batches at the byte budget
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (package, name, version))")
+  unit <- paste(rep("abcdefghij", cap / 10L), collapse = "")
+  DBI::dbExecute(con, "BEGIN")
+  for (i in seq_len(rows)) {
+    # Distinct per row, so the string cache cannot collapse them into one.
+    v <- paste0(sprintf("%08d", i), substring(unit, 9L))
+    DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol,
+       n_missing_total, columns)
+      VALUES (?, ?, 'sf', 2, 'data.frame', 'data.frame', 3, 2, 0, ?)",
+      params = list(i, sprintf("cf%06d", i), v))
+    rm(v)
+  }
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, is_current) VALUES (?, 'd', '1.0', ?, 1)",
+    params = list(sprintf("p%04d", seq_len(rows)), seq_len(rows)))
+  DBI::dbExecute(con, "COMMIT")
+  DBI::dbDisconnect(con)
+  rm(unit)
+
+  gc(reset = TRUE, full = TRUE)
+  base <- gc()[2L, "used"] * 8
+  con  <- open_or_init_data_db(path)
+  peak <- gc()[2L, "max used"] * 8
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  # The batch is 32 MiB of profile and the digest holds it about three times
+  # over while it works, so four budgets is the whole working set with room to
+  # spare. Counted in rows this is 48 x 4 MiB read at once, which lands an
+  # order of magnitude above the ceiling.
+  expect_lt(peak - base, 4 * .DATASET_REKEY_BATCH_BYTES)
+
+  # And it migrated: every row across, every id kept, every profile its own.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, rows)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(DISTINCT profile_fp) n FROM bioc_dataset_contents")$n, rows)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT content_id FROM bioc_dataset_contents ORDER BY content_id")$content_id,
+    seq_len(rows))
+})
+
 test_that("the fingerprint the catalog groups on keeps an index", {
   # content_fp led the old uniqueness key and was indexed by it for free. It no
   # longer leads any key, and "the same data ships in N packages" groups on it,
