@@ -134,6 +134,14 @@
           sprintf(paste("rpkg-analyzer %s emitted no dataset records for the",
                         "fixture package, so there is no contract to check"),
                   rpkg_analyzer_version()))
+  # A build from before the reader declared a reading depth answers a different
+  # contract, and holding it to this one measures the build rather than the
+  # lists. The workflows pin the build that does declare one, so this skips
+  # only in a checkout running an older binary, and it names which.
+  skip_if(!"column_detail" %in% keys$top,
+          sprintf(paste("rpkg-analyzer %s does not declare a column depth, so",
+                        "it predates the contract these lists are held to"),
+                  rpkg_analyzer_version()))
   keys
 }
 
