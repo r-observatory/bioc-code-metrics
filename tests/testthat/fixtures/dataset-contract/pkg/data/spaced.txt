@@ -1,0 +1,3 @@
+grade   sex   score
+    6   M        43
+    7   F        88
