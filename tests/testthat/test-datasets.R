@@ -1435,6 +1435,132 @@ test_that("re-keying a table of profiles at the cap holds one batch, not the tab
     seq_len(rows))
 })
 
+test_that("a re-key that died part-way through leaves a database that still opens", {
+  # Nothing about CREATE, INSERT, DROP, RENAME is atomic on its own, so a run
+  # killed between them leaves the rebuild table behind. The next run then met
+  # its own leftover and stopped, and every run after that stopped the same
+  # way: the database never migrates and the pipeline never publishes again.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  for (i in 1:5) {
+    DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version, nrow, columns)
+      VALUES (?, ?, 'S1', 1, ?, ?)",
+      params = list(i, sprintf("C%03d", i), i, sprintf('[{"name":"c%d"}]', i)))
+  }
+  # Exactly what a killed run leaves: the rebuild table created and part filled,
+  # the original still in place because the DROP never came.
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents_new (
+    content_id INTEGER PRIMARY KEY, profile_fp TEXT NOT NULL,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, columns TEXT,
+    UNIQUE (profile_fp, fp_algo_version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents_new
+    (content_id, profile_fp, content_fp, schema_fp, fp_algo_version, nrow)
+    VALUES (1, 'half written', 'C001', 'S1', 1, 1)")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  expect_true(grepl("UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 5L)
+  # The half written row was the abandoned attempt, not data. It does not
+  # survive into the migrated table.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents WHERE profile_fp = 'half written'")$n, 0L)
+  expect_false("bioc_dataset_contents_new" %in% DBI::dbListTables(con))
+})
+
+test_that("the re-key nests inside the transaction the writer already opened", {
+  # It is reached two ways: from the open, with no transaction, and from the
+  # writer, from inside one. Whatever holds the rebuild together has to be
+  # something that can start a second time.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "CREATE TABLE bioc_datasets (
+    package TEXT NOT NULL, name TEXT NOT NULL, file TEXT, internal INTEGER,
+    current_version TEXT, current_content_id INTEGER, PRIMARY KEY (package, name))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+    (content_id, content_fp, schema_fp, fp_algo_version, class, nrow, columns)
+    VALUES (1, 'C1', 'S1', 2, 'data.frame', 3, '[{\"name\":\"a\"}]')")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, is_current) VALUES ('old', 'd', '1.0', 1, 1)")
+
+  DBI::dbExecute(con, "BEGIN")
+  .write_datasets_normalized(con, .mk_ds_row("newpkg", "1.0", TRUE, "NEW"), "newpkg")
+  DBI::dbExecute(con, "COMMIT")
+
+  expect_true(grepl("UNIQUE (profile_fp, fp_algo_version)", fixed = TRUE,
+    DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 2L)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_versions")$n, 2L)
+})
+
+test_that("a re-key that fails leaves the database as it found it", {
+  # The rebuild is four statements. Stopping between them used to leave the
+  # half built table in the file for the next run to trip over, so the failure
+  # of one run became the failure of every run after it.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
+    content_id INTEGER PRIMARY KEY,
+    content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
+    nrow INTEGER, columns TEXT,
+    UNIQUE (content_fp, schema_fp, fp_algo_version))")
+  for (i in 1:5) {
+    DBI::dbExecute(con, "INSERT INTO bioc_dataset_contents
+      (content_id, content_fp, schema_fp, fp_algo_version, nrow) VALUES (?, ?, 'S1', 1, ?)",
+      params = list(i, sprintf("C%03d", i), i))
+  }
+  before <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_contents ORDER BY content_id")
+
+  orig <- .dataset_profile_fp
+  .dataset_profile_fp <<- function(df) stop("the digest gave out")
+  on.exit(.dataset_profile_fp <<- orig, add = TRUE)
+  expect_error(.rekey_dataset_contents(con), "the digest gave out")
+
+  expect_false("bioc_dataset_contents_new" %in% DBI::dbListTables(con))
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  expect_true(grepl("UNIQUE (content_fp, schema_fp, fp_algo_version)", sql, fixed = TRUE))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT * FROM bioc_dataset_contents ORDER BY content_id"), before)
+
+  # And the run after it migrates, rather than meeting a leftover.
+  .dataset_profile_fp <<- orig
+  .rekey_dataset_contents(con)
+  expect_true(grepl("UNIQUE (profile_fp, fp_algo_version)", fixed = TRUE,
+    DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n, 5L)
+})
+
 test_that("the fingerprint the catalog groups on keeps an index", {
   # content_fp led the old uniqueness key and was indexed by it for free. It no
   # longer leads any key, and "the same data ships in N packages" groups on it,

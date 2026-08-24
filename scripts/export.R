@@ -642,6 +642,12 @@ metrics_fingerprint <- function(summary_df) {
 #' SQLite before any of it is in memory, and the batch that carries it is
 #' whatever fits under the budget.
 #'
+#' The whole rebuild runs inside a savepoint. CREATE, INSERT, DROP and RENAME
+#' are four statements and a run killed between them leaves the rebuild table
+#' behind, which the next run met as its own leftover and stopped on, and so did
+#' every run after it. Inside a savepoint an interrupted run leaves the file
+#' exactly as it found it.
+#'
 #' A one-time no-op once the key is the digest.
 .rekey_dataset_contents <- function(con) {
   if (!"bioc_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
@@ -657,6 +663,24 @@ metrics_fingerprint <- function(summary_df) {
   cat(sprintf("re-keying bioc_dataset_contents on the profile digest: %d row%s\n",
               n, if (n == 1L) "" else "s"), file = stdout())
   flush(stdout())
+
+  # SAVEPOINT and not BEGIN: this also runs from inside the writer's own
+  # transaction, where a second BEGIN is an error.
+  DBI::dbExecute(con, "SAVEPOINT rekey_dataset_contents")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO rekey_dataset_contents"), silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE rekey_dataset_contents"), silent = TRUE)
+  }, add = TRUE)
+
+  # A rebuild table from a run that died before this was atomic. The guard
+  # above has already established that the real table is here and still carries
+  # the old key, so this is an abandoned attempt and not the only copy of
+  # anything. Only ever dropped on that footing: if the original were the one
+  # missing, this function returns above and leaves the leftover alone.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS bioc_dataset_contents_new")
 
   create <- sub(old_key, "UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE)
   cols   <- DBI::dbListFields(con, "bioc_dataset_contents")
@@ -714,6 +738,7 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, "DROP TABLE bioc_dataset_contents")
   DBI::dbExecute(con,
     "ALTER TABLE bioc_dataset_contents_new RENAME TO bioc_dataset_contents")
+  done <- TRUE
   invisible(NULL)
 }
 
