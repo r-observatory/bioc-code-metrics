@@ -482,7 +482,41 @@ metrics_fingerprint <- function(summary_df) {
   invisible(NULL)
 }
 
+#' Let a version link stand without a profile behind it.
+#'
+#' bioc_dataset_versions.content_id was NOT NULL, which is what made "the reader
+#' took no fingerprint" mean "the dataset leaves the catalog". The constraint
+#' cannot be dropped in place, so the table is rebuilt from its own CREATE with
+#' that one phrase removed: every column it has picked up since, and every row,
+#' come across untouched. The index it carries is recreated by the caller.
+#'
+#' A one-time no-op once the constraint is gone.
+.relax_dataset_version_content_id <- function(con) {
+  if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  sql <- DBI::dbGetQuery(con,
+    "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'bioc_dataset_versions'")$sql
+  notnull <- "content_id INTEGER NOT NULL"
+  if (length(sql) != 1L || is.na(sql) || !grepl(notnull, sql, fixed = TRUE)) {
+    return(invisible(NULL))
+  }
+  cols   <- paste(sprintf('"%s"', DBI::dbListFields(con, "bioc_dataset_versions")),
+                  collapse = ", ")
+  create <- sub(notnull, "content_id INTEGER", sql, fixed = TRUE)
+  create <- sub("bioc_dataset_versions", "bioc_dataset_versions_new", create,
+                fixed = TRUE)
+  DBI::dbExecute(con, create)
+  DBI::dbExecute(con, sprintf(
+    "INSERT INTO bioc_dataset_versions_new (%s) SELECT %s FROM bioc_dataset_versions",
+    cols, cols))
+  DBI::dbExecute(con, "DROP TABLE bioc_dataset_versions")
+  DBI::dbExecute(con,
+    "ALTER TABLE bioc_dataset_versions_new RENAME TO bioc_dataset_versions")
+  invisible(NULL)
+}
+
 .ensure_dataset_tables <- function(con) {
+  .relax_dataset_version_content_id(con)
   tables <- DBI::dbListTables(con)
   if (!"bioc_datasets" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_datasets (
@@ -490,10 +524,16 @@ metrics_fingerprint <- function(summary_df) {
       current_version TEXT, current_content_id INTEGER,
       PRIMARY KEY (package, name))")
   }
+  # content_id is nullable: a dataset whose values the reader could not take
+  # comes back with no fingerprints, so there is no content row for it to point
+  # at, and none can be invented without telling two objects that were never
+  # compared that they hold the same data. The link still says the package ships
+  # this dataset at this version, and format, confidence, notes, class and the
+  # rest beside it say what was and was not read.
   if (!"bioc_dataset_versions" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
       package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
-      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
   }
@@ -563,37 +603,6 @@ metrics_fingerprint <- function(summary_df) {
   df$fp_algo_version <- as.integer(df$fp_algo_version)
   df$internal        <- as.integer(df$internal)
   df$is_current      <- as.integer(df$is_current)
-  # Records without a content fingerprint (.R scripts, unreadable, S4 class-only,
-  # and any object read for its shape and not its values) have no profile to
-  # store; keep them out of the normalized tables. The tables are content
-  # addressed, so there is nothing to key such a record on, and inventing a key
-  # would put unlike datasets on one row: the reader once gave a billion cells
-  # across 35 objects four fingerprints between them.
-  #
-  # Dropping them is right. Dropping them in silence is not, because nothing
-  # else in the run says the catalog is missing them, so say how many and which,
-  # and how many of them the reader described at structural depth, which is the
-  # one cause that names itself.
-  keep <- !is.na(df$content_fp) & nzchar(df$content_fp)
-  if (any(!keep)) {
-    gone    <- df[!keep, , drop = FALSE]
-    n_struct <- if ("column_detail" %in% names(gone)) {
-      sum(!is.na(gone$column_detail) & gone$column_detail == "structural")
-    } else 0L
-    named <- sprintf("%s %s", gone$package, gone$name)
-    cat(sprintf("dropped %d dataset record%s with no content fingerprint%s: %s%s\n",
-                nrow(gone), if (nrow(gone) == 1L) "" else "s",
-                if (n_struct > 0L) {
-                  sprintf(" (%d read without their values)", n_struct)
-                } else "",
-                paste(head(named, 5L), collapse = ", "),
-                if (length(named) > 5L)
-                  sprintf(" and %d more", length(named) - 5L) else ""),
-        file = stdout())
-    flush(stdout())
-  }
-  df <- df[keep, , drop = FALSE]
-  if (nrow(df) == 0L) return(invisible(NULL))
   # Atomic vectors / matrices / S4 have values but no column schema, so schema_fp
   # is NA. Use an empty string so they still dedup by content and satisfy the
   # NOT NULL + UNIQUE(content_fp, schema_fp, fp_algo_version) constraint (a NULL
@@ -639,29 +648,66 @@ metrics_fingerprint <- function(summary_df) {
   df <- df[order(df$package, df$name, df$version, df$internal), , drop = FALSE]
   df <- df[!duplicated(paste(df$package, df$name, df$version, sep = "\x1f")), , drop = FALSE]
 
-  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
-  ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
-  cts <- df[!duplicated(ck), , drop = FALSE]
-  content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
-  ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
-  DBI::dbExecute(con,
-    sprintf("INSERT OR IGNORE INTO bioc_dataset_contents (%s) VALUES (%s)",
-            paste(sprintf('"%s"', ins_cols), collapse = ", "),
-            paste(rep("?", length(ins_cols)), collapse = ", ")),
-    params = lapply(ins_cols, function(k) {
-      v <- cts[[k]]
-      if (is.logical(v)) as.integer(v) else v
-    }))
+  # Which records the reader fingerprinted. The ones it did not are objects it
+  # described and could not measure: an S4 object it holds no representation
+  # for, a raster packed into bytes, and an .R script under data/, which only R
+  # can evaluate. Every such record used to be dropped here, whole, so the
+  # dataset left the catalog rather than appearing in it with what is known:
+  # no identity row, no version link, nothing saying the package ships it.
+  #
+  # They still get no content row: that table is addressed by fingerprint, and
+  # a key invented for a record with none would tell two objects that were
+  # never compared that they hold the same data. They get the identity row and
+  # the version link, with no content_id, and the format, the confidence, the
+  # notes and the class beside it say what was read and what was not.
+  fingerprinted <- !is.na(df$content_fp) & nzchar(df$content_fp)
+  if (any(!fingerprinted)) {
+    # Said out loud for the same reason the refusal above is: a dataset in the
+    # catalog with nothing behind it is a coverage figure, and a shard where
+    # that number climbs is the reader losing objects it used to measure.
+    named <- sprintf("%s %s", df$package[!fingerprinted], df$name[!fingerprinted])
+    cat(sprintf("kept %d dataset%s with no profile, unmeasured by the reader: %s%s\n",
+                length(named), if (length(named) == 1L) "" else "s",
+                paste(head(named, 5L), collapse = ", "),
+                if (length(named) > 5L)
+                  sprintf(" and %d more", length(named) - 5L) else ""),
+        file = stdout())
+    flush(stdout())
+  }
 
-  ids <- DBI::dbGetQuery(con,
-    "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
-  key_map <- stats::setNames(
-    ids$content_id,
-    paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
-  df$content_id <- unname(key_map[ck])
+  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
+  ck <- rep(NA_character_, nrow(df))
+  ck[fingerprinted] <- paste(df$content_fp[fingerprinted],
+                             df$schema_fp[fingerprinted],
+                             df$fp_algo_version[fingerprinted], sep = "\x1f")
+  cts <- df[fingerprinted & !duplicated(ck), , drop = FALSE]
+  df$content_id <- NA_integer_
+  if (nrow(cts) > 0L) {
+    content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
+    ins_cols <- c("content_fp", "schema_fp", "fp_algo_version", content_cols)
+    DBI::dbExecute(con,
+      sprintf("INSERT OR IGNORE INTO bioc_dataset_contents (%s) VALUES (%s)",
+              paste(sprintf('"%s"', ins_cols), collapse = ", "),
+              paste(rep("?", length(ins_cols)), collapse = ", ")),
+      params = lapply(ins_cols, function(k) {
+        v <- cts[[k]]
+        if (is.logical(v)) as.integer(v) else v
+      }))
+
+    # Resolve content_id for the fingerprints in this shard and attach it to
+    # every row that has one. The rest keep NA, which is the whole of what the
+    # content-addressed table can say about them.
+    ids <- DBI::dbGetQuery(con,
+      "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
+    key_map <- stats::setNames(
+      ids$content_id,
+      paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
+    df$content_id[fingerprinted] <- unname(key_map[ck[fingerprinted]])
+  }
 
   # 2. Sketches: one INSERT OR IGNORE per content_id.
-  sk <- df[!duplicated(df$content_id) & !is.na(df$row_sketch), c("content_id", "row_sketch"), drop = FALSE]
+  sk <- df[!is.na(df$content_id) & !duplicated(df$content_id) & !is.na(df$row_sketch),
+           c("content_id", "row_sketch"), drop = FALSE]
   if (nrow(sk) > 0L) {
     DBI::dbExecute(con,
       "INSERT OR IGNORE INTO bioc_dataset_sketches (content_id, row_sketch) VALUES (?, ?)",
@@ -691,15 +737,20 @@ metrics_fingerprint <- function(summary_df) {
 }
 
 #' Reclaim content/sketch rows no longer referenced by any version link.
+#'
+#' The subquery leaves out the links that name no profile. NOT IN over a set
+#' holding one NULL is NULL for every row it is asked about, so a single
+#' unmeasured dataset anywhere in the table would quietly retire the whole
+#' reclaim and leave nothing in the log to say so.
 .gc_dataset_contents <- function(con) {
   tables <- DBI::dbListTables(con)
   if (!"bioc_dataset_contents" %in% tables) return(invisible(NULL))
-  DBI::dbExecute(con,
-    "DELETE FROM bioc_dataset_sketches
-      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
-  DBI::dbExecute(con,
-    "DELETE FROM bioc_dataset_contents
-      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
+  referenced <-
+    "SELECT content_id FROM bioc_dataset_versions WHERE content_id IS NOT NULL"
+  DBI::dbExecute(con, sprintf(
+    "DELETE FROM bioc_dataset_sketches WHERE content_id NOT IN (%s)", referenced))
+  DBI::dbExecute(con, sprintf(
+    "DELETE FROM bioc_dataset_contents WHERE content_id NOT IN (%s)", referenced))
   invisible(NULL)
 }
 

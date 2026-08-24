@@ -568,9 +568,19 @@ test_that("a re-scan under a new generation is stored beside the profile it supe
 }
 
 # A one-version repo carrying one dataset at each of the analyzer's four column
-# depths. The skipped one is three columns of nine million values written as a
-# compact sequence, so it costs 200 bytes on disk and the reader never
-# materializes it, which is the documented way into structural depth.
+# depths, and both of the two ways a record can reach structural depth.
+#
+# `skipped` is two columns of nine million values written as a compact
+# sequence, which the reader cannot materialize and cannot hash either, so the
+# record carries no fingerprint at all. `tall` is one column of eight million
+# and one real values past the cell cap: its cells are never read, but its
+# bytes were hashed on the way past, so it carries all three fingerprints taken
+# over those digests. The two are the whole difference between a record that
+# gets a content row and one that cannot have one, and a fixture holding only
+# the first would have said structural means no fingerprint.
+#
+# `tall` costs half a second to write and 124 KB on disk: it is two values
+# repeated, so it compresses to nothing.
 .make_depth_repo <- function(repo) {
   .make_one_version_repo(repo)
   system2("git", c("-C", repo, "checkout", "RELEASE_1_0"),
@@ -587,6 +597,8 @@ test_that("a re-scan under a new generation is stored beside the profile it supe
   save(mixed, file = file.path(d, "mixed.rda"))
   skipped <- data.frame(a = 1:9000000L, b = 1:9000000L)
   save(skipped, file = file.path(d, "skipped.rda"))
+  tall <- data.frame(v = rep_len(c(1.5, 2.5), 8000001L))
+  save(tall, file = file.path(d, "tall.rda"))
   system2("git", c("-C", repo, "add", "."), stdout = FALSE, stderr = FALSE)
   system2("git", c("-C", repo, "commit", "-m", "data"), stdout = FALSE, stderr = FALSE)
   system2("git", c("-C", repo, "checkout", "-"), stdout = FALSE, stderr = FALSE)
@@ -931,27 +943,105 @@ test_that("how deep a record's column profile goes is stored beside the profile"
   expect_true(is.na(got$columns[3L]))
 })
 
-test_that("a record the reader could not fingerprint is kept out of the catalog, and counted", {
-  # A frame at structural depth was read for its shape and never for its
-  # values, so it carries no content fingerprint, and the content-addressed
-  # tables have no identity to store it under. Giving it one would put unlike
-  # datasets on the same row. Dropping it is right; dropping it in silence is
-  # not, because nothing else in the run says the catalog is missing them.
+test_that("a record the reader could not fingerprint is in the catalog, naming no profile", {
+  # An S4 object the reader holds no representation for, a raster packed into
+  # bytes, and an .R script under data/ all come back with no fingerprint. They
+  # were being dropped whole, so the package did not appear to ship them at
+  # all: no identity row, no version link, nothing saying the dataset is there.
+  #
+  # They get no content row, because that table is addressed by fingerprint and
+  # a key invented for a record with none would tell two objects that were
+  # never compared that they hold the same data. They get the rest.
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con))
   df <- rbind(
     .mk_ds_row("p", "1.0", TRUE, "C1", name = "kept"),
-    .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "skipped"),
+    .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "packed"),
     .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "script"))
-  df$column_detail <- c("full", "structural", NA_character_)
+  df$column_detail <- c("full", NA_character_, NA_character_)
 
   said <- capture.output(
     DBI::dbWithTransaction(con, .write_datasets_normalized(con, df, "p")))
 
-  expect_equal(DBI::dbGetQuery(con, "SELECT name FROM bioc_datasets")$name, "kept")
-  expect_true(any(grepl("2 dataset records", said, fixed = TRUE)))
-  expect_true(any(grepl("1 read without", said, fixed = TRUE)))
-  expect_true(any(grepl("p skipped", said, fixed = TRUE)))
+  expect_setequal(DBI::dbGetQuery(con, "SELECT name FROM bioc_datasets")$name,
+                  c("kept", "packed", "script"))
+  got <- DBI::dbGetQuery(con,
+    "SELECT name, content_id, confidence FROM bioc_dataset_versions ORDER BY name")
+  expect_equal(got$name, c("kept", "packed", "script"))
+  expect_true(is.na(got$content_id[got$name == "packed"]))
+  expect_true(is.na(got$content_id[got$name == "script"]))
+  expect_false(is.na(got$content_id[got$name == "kept"]))
+  # One content row, for the one record that has a fingerprint.
+  expect_equal(DBI::dbGetQuery(con, "SELECT count(*) n FROM bioc_dataset_contents")$n, 1L)
+  # Said out loud, because a catalog entry with nothing behind it is a coverage
+  # figure and a shard where the number climbs is the reader losing objects.
+  expect_true(any(grepl("2 datasets", said, fixed = TRUE)))
+  expect_true(any(grepl("p packed", said, fixed = TRUE)))
+})
+
+test_that("the identity row of an unmeasured dataset names no profile either", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "packed")
+  row$class <- "PackedSpatRaster"
+  row$kind <- "object"
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  idn <- DBI::dbGetQuery(con, "SELECT * FROM bioc_datasets")
+  expect_equal(idn$name, "packed")
+  expect_true(is.na(idn$current_content_id))
+  expect_equal(idn$current_version, "1.0")
+  # What kind of thing it is survives, because that is on the version link now
+  # rather than on a content row it does not have.
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT class FROM bioc_dataset_versions")$class, "PackedSpatRaster")
+})
+
+test_that("one dataset with no profile does not retire the whole reclaim", {
+  # NOT IN over a set holding a NULL is NULL for every row it is asked about,
+  # so a single unmeasured dataset anywhere in the table would quietly stop the
+  # reclaim from ever deleting anything, with nothing in the log to say so.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_ds_row("p", "1.0", TRUE, "C1", name = "d"), "p"))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_ds_row("q", "1.0", TRUE, NA_character_, name = "e"), "q"))
+  # p's data changes, orphaning C1.
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_ds_row("p", "1.0", TRUE, "C2", name = "d"), "p"))
+
+  .gc_dataset_contents(con)
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT content_fp FROM bioc_dataset_contents")$content_fp, "C2")
+})
+
+test_that("a version table that forbids a missing profile is rebuilt to allow one", {
+  # The published table declared content_id NOT NULL, which is what made "the
+  # reader took no fingerprint" mean "the dataset leaves the catalog". The
+  # constraint cannot be dropped in place.
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    notes TEXT,
+    PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, format, confidence, is_current, notes)
+    VALUES ('old', 'd', '1.0', 7, 'rda', 'exact', 1, 'kept')")
+
+  DBI::dbWithTransaction(con, .write_datasets_normalized(
+    con, .mk_ds_row("p", "1.0", TRUE, NA_character_, name = "packed"), "p"))
+
+  # Every column the table had picked up, and every row, came across.
+  kept <- DBI::dbGetQuery(con,
+    "SELECT package, content_id, notes FROM bioc_dataset_versions WHERE package = 'old'")
+  expect_equal(kept$content_id, 7L)
+  expect_equal(kept$notes, "kept")
+  expect_true(is.na(DBI::dbGetQuery(con,
+    "SELECT content_id FROM bioc_dataset_versions WHERE package = 'p'")$content_id))
 })
 
 test_that("the analyzer's four column depths reach the table, or say why they do not", {
@@ -973,11 +1063,17 @@ test_that("the analyzer's four column depths reach the table, or say why they do
   expect_equal(unname(depth["uniform"]), "none")
   expect_equal(unname(depth["mixed"]),   "reduced")
   expect_equal(unname(depth["skipped"]), "structural")
+  expect_equal(unname(depth["tall"]),    "structural")
 
-  # The structural one is the only record with no content fingerprint, which is
-  # what keeps it out of the catalog below.
+  # Structural does not mean unfingerprinted. `tall` was never read for its
+  # values and was hashed for its bytes, so it has all three; `skipped` holds a
+  # column the reader could neither read nor hash, and one of those takes the
+  # whole record's identity with it.
   expect_true(is.na(ds$content_fp[ds$name == "skipped"]))
   expect_true(all(!is.na(ds$content_fp[ds$name != "skipped"])))
+  expect_false(is.na(ds$schema_fp[ds$name == "tall"]))
+  expect_false(is.na(ds$shape_fp[ds$name == "tall"]))
+  expect_true(is.na(ds$row_sketch[ds$name == "tall"]))
 
   con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -987,10 +1083,19 @@ test_that("the analyzer's four column depths reach the table, or say why they do
        FROM bioc_datasets d
        JOIN bioc_dataset_contents c ON c.content_id = d.current_content_id
       ORDER BY d.name")
-  expect_setequal(got$name, c("mixed", "narrow", "uniform"))
+  expect_setequal(got$name, c("mixed", "narrow", "tall", "uniform"))
   expect_equal(got$column_detail[got$name == "uniform"], "none")
+  expect_equal(got$column_detail[got$name == "tall"], "structural")
   # ncol is the true width at every depth, whatever the columns array holds.
   expect_equal(got$ncol[got$name == "uniform"], 600L)
+  expect_equal(got$ncol[got$name == "tall"], 1L)
+
+  # And the one record with no fingerprint is in the catalog too, naming no
+  # profile rather than being absent from it.
+  all_ds <- DBI::dbGetQuery(con,
+    "SELECT name, content_id FROM bioc_dataset_versions ORDER BY name")
+  expect_setequal(all_ds$name, c("mixed", "narrow", "skipped", "tall", "uniform"))
+  expect_true(is.na(all_ds$content_id[all_ds$name == "skipped"]))
 })
 
 # --- what the fingerprint covers, and what it cannot -----------------------
