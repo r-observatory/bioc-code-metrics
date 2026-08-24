@@ -1114,6 +1114,95 @@ test_that("a version table that forbids a missing profile is rebuilt to allow on
     "SELECT content_id FROM bioc_dataset_versions WHERE package = 'p'")$content_id))
 })
 
+test_that("a version rebuild that died part-way through leaves a database that still opens", {
+  # The same four statements as the profile re-key, and the same hazard: a run
+  # killed between the CREATE and the RENAME leaves the rebuild table in the
+  # file, and every run after it meets that leftover and stops on it. The
+  # database then never migrates and the pipeline never publishes again.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0, notes TEXT,
+    PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, format, confidence, is_current, notes)
+    VALUES ('old', 'd', '1.0', 7, 'rda', 'exact', 1, 'kept')")
+  # Exactly what a killed run leaves: the rebuild table created and part
+  # filled, the original still in place because the DROP never came.
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions_new (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0, notes TEXT,
+    PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions_new
+    (package, name, version, content_id, is_current)
+    VALUES ('old', 'd', '1.0', 7, 1)")
+  DBI::dbDisconnect(con)
+
+  con <- open_or_init_data_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_versions'")$sql
+  expect_false(grepl("content_id INTEGER NOT NULL", sql, fixed = TRUE))
+  kept <- DBI::dbGetQuery(con,
+    "SELECT content_id, notes FROM bioc_dataset_versions WHERE package = 'old'")
+  expect_equal(kept$content_id, 7L)
+  expect_equal(kept$notes, "kept")
+  expect_false("bioc_dataset_versions_new" %in% DBI::dbListTables(con))
+})
+
+test_that("a version rebuild that fails leaves the database as it found it", {
+  # Four statements again. Stopping between them must not leave the half built
+  # table in the file, or the failure of one run becomes the failure of every
+  # run after it.
+  path <- tempfile(fileext = ".db")
+  on.exit(unlink(path), add = TRUE)
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
+    package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
+    content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+    is_current INTEGER NOT NULL DEFAULT 0, notes TEXT,
+    PRIMARY KEY (package, name, version))")
+  DBI::dbExecute(con, "INSERT INTO bioc_dataset_versions
+    (package, name, version, content_id, is_current, notes)
+    VALUES ('old', 'd', '1.0', 7, 1, 'kept')")
+  before <- DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_versions")
+
+  # The copy in the middle of the rebuild gives out, the way a disk filling up
+  # gives out: the CREATE before it has run and the DROP and RENAME after it
+  # have not.
+  real <- DBI::dbExecute
+  give_out <- TRUE
+  testthat::local_mocked_bindings(
+    dbExecute = function(conn, statement, ...) {
+      if (give_out && grepl("^INSERT INTO bioc_dataset_versions_new", statement)) {
+        stop("the copy gave out")
+      }
+      real(conn, statement, ...)
+    },
+    .package = "DBI")
+  expect_error(.relax_dataset_version_content_id(con), "the copy gave out")
+  give_out <- FALSE
+
+  expect_false("bioc_dataset_versions_new" %in% DBI::dbListTables(con))
+  sql <- DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+     WHERE type = 'table' AND name = 'bioc_dataset_versions'")$sql
+  expect_true(grepl("content_id INTEGER NOT NULL", sql, fixed = TRUE))
+  expect_equal(DBI::dbGetQuery(con, "SELECT * FROM bioc_dataset_versions"), before)
+
+  # And the run after it migrates, rather than meeting a leftover.
+  .relax_dataset_version_content_id(con)
+  expect_false(grepl("content_id INTEGER NOT NULL", fixed = TRUE,
+    DBI::dbGetQuery(con, "SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'bioc_dataset_versions'")$sql))
+  expect_equal(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_versions")$n, 1L)
+})
+
 test_that("the analyzer's four column depths reach the table, or say why they do not", {
   skip_if(!nzchar(rpkg_analyzer_bin()),
           "no rpkg-analyzer binary: set RPKG_ANALYZER_BIN or put one on PATH")

@@ -770,6 +770,13 @@ metrics_fingerprint <- function(summary_df) {
 #' that one phrase removed: every column it has picked up since, and every row,
 #' come across untouched. The index it carries is recreated by the caller.
 #'
+#' The whole rebuild runs inside a savepoint, for the reason the profile re-key
+#' does. CREATE, INSERT, DROP and RENAME are four statements and a run killed
+#' between them leaves the rebuild table behind, which the next run meets as its
+#' own leftover and stops on, and so does every run after it: the database never
+#' migrates and nothing is ever published again. Inside a savepoint an
+#' interrupted run leaves the file exactly as it found it.
+#'
 #' A one-time no-op once the constraint is gone.
 .relax_dataset_version_content_id <- function(con) {
   if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
@@ -785,6 +792,26 @@ metrics_fingerprint <- function(summary_df) {
   create <- sub(notnull, "content_id INTEGER", sql, fixed = TRUE)
   create <- sub("bioc_dataset_versions", "bioc_dataset_versions_new", create,
                 fixed = TRUE)
+
+  # SAVEPOINT and not BEGIN: this runs from inside the writer's own
+  # transaction, where a second BEGIN is an error.
+  DBI::dbExecute(con, "SAVEPOINT relax_dataset_version_content_id")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO relax_dataset_version_content_id"),
+          silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE relax_dataset_version_content_id"),
+        silent = TRUE)
+  }, add = TRUE)
+
+  # A rebuild table from a run that died before this was atomic. The guard
+  # above has already established that the real table is here and still carries
+  # the constraint, so this is an abandoned attempt and not the only copy of
+  # anything. Only ever dropped on that footing: if the original were the one
+  # missing, this function returns above and leaves the leftover alone.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS bioc_dataset_versions_new")
   DBI::dbExecute(con, create)
   DBI::dbExecute(con, sprintf(
     "INSERT INTO bioc_dataset_versions_new (%s) SELECT %s FROM bioc_dataset_versions",
@@ -792,6 +819,7 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, "DROP TABLE bioc_dataset_versions")
   DBI::dbExecute(con,
     "ALTER TABLE bioc_dataset_versions_new RENAME TO bioc_dataset_versions")
+  done <- TRUE
   invisible(NULL)
 }
 
