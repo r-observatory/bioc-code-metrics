@@ -883,9 +883,9 @@ metrics_fingerprint <- function(summary_df) {
         if (is.logical(v)) as.integer(v) else v
       }))
 
-    # Resolve content_id for the fingerprints in this shard and attach it to
-    # every row that has one. The rest keep NA, which is the whole of what the
-    # content-addressed table can say about them.
+    # Resolve content_id for the profiles in this shard and attach it to every
+    # row that has one. The rest keep NA, which is the whole of what the
+    # profile table can say about them.
     ids <- DBI::dbGetQuery(con,
       "SELECT content_id, profile_fp, fp_algo_version FROM bioc_dataset_contents")
     key_map <- stats::setNames(
@@ -894,7 +894,11 @@ metrics_fingerprint <- function(summary_df) {
     df$content_id[fingerprinted] <- unname(key_map[ck[fingerprinted]])
   }
 
-  # 2. Sketches: one INSERT OR IGNORE per content_id.
+  # 2. Sketches: one INSERT OR IGNORE per content_id. The sketch is taken off
+  # the values, so two profiles of the same data hold the same sketch and now
+  # store it twice, once per profile row. Keyed on content_id all the same,
+  # because that is what the version link and the reclaim both name; the cost
+  # is a copy for each of the few profiles that split.
   sk <- df[!is.na(df$content_id) & !duplicated(df$content_id) & !is.na(df$row_sketch),
            c("content_id", "row_sketch"), drop = FALSE]
   if (nrow(sk) > 0L) {
