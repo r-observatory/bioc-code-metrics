@@ -49,7 +49,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p "$HOME/.local/bin"
-          gh release download v0.2.0 --repo r-observatory/rpkg-analyzer \
+          gh release download v0.4.0 --repo r-observatory/rpkg-analyzer \
             --pattern 'rpkg-analyzer-linux-x86_64.tar.gz' --dir /tmp
           tar -xzf /tmp/rpkg-analyzer-linux-x86_64.tar.gz -C "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/rpkg-analyzer"
@@ -77,20 +77,89 @@ jobs:
           DATA_SRC="${METRICS_TAG:-$(latest_tag data)}"
           echo "prior metrics tag: ${METRICS_TAG:-none}; code src: ${CODE_SRC:-none}; data src: ${DATA_SRC:-none}"
 
+          # This pipeline is incremental: the prior release's database IS the
+          # accumulated state, and a run that starts without it rebuilds from
+          # empty and publishes that as latest, green. cran-queue lost 323,063
+          # snapshots covering four months exactly that way on 2026-07-16, when
+          # a single 503 on the asset download was swallowed by `|| true`. So
+          # every fetch below retries, a zero-length file counts as a failed
+          # download, and a release that advertises an asset we cannot get
+          # fails the run. "No prior release" stays distinguishable from "the
+          # download failed" because it is the resolved tag, not the presence
+          # of a file, that says which one we are in, and a cold start (empty
+          # tag) still works.
+          list_assets() {
+            local tag="$1" dest="$2" n
+            for n in 1 2 3 4 5; do
+              if gh release view "$tag" --json assets -q '.assets[].name' > "$dest"; then
+                return 0
+              fi
+              echo "attempt ${n}: could not list the assets of ${tag}"
+              if [ "$n" -lt 5 ]; then sleep $((n * 10)); fi
+            done
+            return 1
+          }
+
+          have_asset() { grep -qxF "$2" "out/.assets-$1"; }
+
+          get_asset() {
+            local tag="$1" name="$2" n
+            for n in 1 2 3 4 5; do
+              rm -f "out/$name"
+              if gh release download "$tag" --pattern "$name" --dir out && [ -s "out/$name" ]; then
+                echo "fetched ${name} from ${tag} ($(stat -c%s "out/$name") bytes)"
+                return 0
+              fi
+              echo "attempt ${n}: ${name} did not arrive from ${tag}, or arrived empty"
+              if [ "$n" -lt 5 ]; then sleep $((n * 10)); fi
+            done
+            echo "::error::${tag} lists ${name} as an asset but five attempts failed to fetch a non-empty copy. Refusing to continue: this run would rebuild from an empty database and publish it as latest."
+            exit 1
+          }
+
+          # The series whose databases the resolved release actually carries.
+          # preflight.R reads this to tell a cold start apart from a download
+          # that came back with nothing in it.
+          EXPECT=""
           if [ -n "$CODE_SRC" ]; then
-            gh release download "$CODE_SRC" --pattern bioc-code-metrics.db --dir out 2>/dev/null || true
-            gh release download "$CODE_SRC" --pattern code-manifest.json --dir out 2>/dev/null \
-              || gh release download "$CODE_SRC" --pattern manifest.json --dir out 2>/dev/null || true
-            [ -f out/code-manifest.json ] && mv out/code-manifest.json out/prev-code-manifest.json || true
-            [ -f out/manifest.json ] && mv out/manifest.json out/prev-code-manifest.json || true
+            if ! list_assets "$CODE_SRC" "out/.assets-${CODE_SRC}"; then
+              echo "::error::could not read the asset list of ${CODE_SRC}; refusing to guess whether it carries a database."
+              exit 1
+            fi
+            if have_asset "$CODE_SRC" bioc-code-metrics.db; then
+              get_asset "$CODE_SRC" bioc-code-metrics.db
+              EXPECT="$EXPECT code"
+            fi
+            # code-manifest.json only. The pre-split manifest.json cannot serve
+            # as a baseline: it carries no series, so preflight.R cannot tell
+            # which database it describes, and a tag whose manifest is missing
+            # gets checked against its own row counts instead.
+            if have_asset "$CODE_SRC" code-manifest.json; then
+              get_asset "$CODE_SRC" code-manifest.json
+              mv out/code-manifest.json out/prev-code-manifest.json
+            fi
           fi
           if [ -n "$DATA_SRC" ]; then
-            gh release download "$DATA_SRC" --pattern bioc-data-metrics.db --dir out 2>/dev/null || true
-            gh release download "$DATA_SRC" --pattern data-manifest.json --dir out 2>/dev/null \
-              || gh release download "$DATA_SRC" --pattern manifest.json --dir out 2>/dev/null || true
-            [ -f out/data-manifest.json ] && mv out/data-manifest.json out/prev-data-manifest.json || true
-            [ -f out/manifest.json ] && mv out/manifest.json out/prev-data-manifest.json || true
+            if [ "$DATA_SRC" != "$CODE_SRC" ] && ! list_assets "$DATA_SRC" "out/.assets-${DATA_SRC}"; then
+              echo "::error::could not read the asset list of ${DATA_SRC}; refusing to guess whether it carries a database."
+              exit 1
+            fi
+            if have_asset "$DATA_SRC" bioc-data-metrics.db; then
+              get_asset "$DATA_SRC" bioc-data-metrics.db
+              EXPECT="$EXPECT data"
+            fi
+            if have_asset "$DATA_SRC" data-manifest.json; then
+              get_asset "$DATA_SRC" data-manifest.json
+              mv out/data-manifest.json out/prev-data-manifest.json
+            fi
           fi
+
+          # A download can succeed and still hand back a file with nothing in
+          # it, so check each database's row counts against the manifest
+          # published with it before any shard writes to it. Rows, not bytes:
+          # the file size moves for reasons that have nothing to do with what
+          # was collected.
+          Rscript scripts/preflight.R out/ $EXPECT
 
           # Snapshot the pre-run package set so the release notes can tag
           # each changed package as new-to-the-catalog vs updated. Always

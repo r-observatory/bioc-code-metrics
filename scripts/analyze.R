@@ -3,6 +3,24 @@
 # Load order: config.R -> git.R -> context.R -> metrics/structure.R -> analyze.R
 # This file does NOT auto-source its dependencies so the caller controls order.
 
+# The fingerprint algorithm's generation. It is part of the uniqueness key on
+# bioc_dataset_contents, beside the digest of the whole recorded profile, and
+# the table is written with INSERT OR IGNORE. A change in how a fingerprint is
+# computed leaves the digest of an unchanged dataset looking like a profile
+# already in the table, so it has to be a new generation or it never reaches
+# it. Superseded rows are left unreferenced and reclaimed by the contents GC.
+#
+# The number is shared with the CRAN pipeline rather than counted per origin: a
+# Bioconductor package and a CRAN package that ship identical bytes only match
+# when both were profiled under the same generation.
+#
+# 1: the original record, being the class, the shape, the columns array and the
+#    fingerprints.
+# 3: everything the current reader describes about a dataset, which is most of
+#    what .DATASET_CONTENT_COLS declares. Generation 2 was CRAN's alone and is
+#    skipped here so both origins land on the same number.
+FP_ALGO_VERSION <- 3L
+
 #' Registry of metric group functions.
 #' Each value is a function(ctx) -> named list of scalar metric values.
 #' Add more groups here when new metric modules are implemented.
@@ -213,8 +231,15 @@ deprecation_signals <- function(ctx) {
 #' @param deprecation_series  list of length nrow(summary_df); each element
 #'   is list(symbols = character, uses_lifecycle = logical) from
 #'   deprecation_signals(ctx).
+#' @param datasets_read  logical; whether the dataset reader actually ran on the
+#'   latest version. It gates datasets_scanned, which is a statement about what
+#'   is in bioc_datasets rather than about what this function was asked to do.
+#'   The default is FALSE because a caller that cannot say the reader ran must
+#'   not claim it did: the marker retires a package from the backfill pool, so
+#'   claiming it wrongly is permanent.
 #' @return Augmented summary_df with cross-version columns appended.
-add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
+add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
+                                      datasets_read = FALSE) {
   n <- nrow(summary_df)
 
   # Normalise a possibly-missing deprecation_series entry to safe defaults.
@@ -413,9 +438,14 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
   summary_df$deprecation_infrastructure_maturity[n] <- dep_maturity
   # detail_scanned on EVERY row (set unconditionally, even for data-only
   # packages with zero functions) so the all-versions backfill converges.
-  # datasets_scanned stays latest-row-only (its backfill is latest-scoped).
+  # datasets_scanned stays latest-row-only (its backfill is latest-scoped), and
+  # unlike detail_scanned it is only written when the dataset reader ran. Every
+  # dataset row comes from the analyzer binary, so a run that fell back to the
+  # pure-R path collected nothing; marking those packages scanned would retire
+  # them from the backfill pool with an empty bioc_datasets and no later run
+  # would ever pick them up again.
   summary_df$detail_scanned          <- TRUE
-  summary_df$datasets_scanned[n]     <- TRUE
+  if (isTRUE(datasets_read)) summary_df$datasets_scanned[n] <- TRUE
 
   summary_df
 }
@@ -489,7 +519,9 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series) {
 #'
 #' @param repo_dir  Path to the cloned git repository.
 #' @param package   Package name string.
-#' @return Named list: $summary, $churn, $api, $functions, $edges.
+#' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
+#'   and $binary_versions: the versions whose metrics the analyzer binary
+#'   produced, as opposed to the pure-R fallback.
 analyze_package <- function(repo_dir, package) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
@@ -499,6 +531,15 @@ analyze_package <- function(repo_dir, package) {
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
+  # Whether the dataset reader ran on each version, which a zero-row dataset
+  # frame cannot tell you: a package that ships no data and a package nothing
+  # looked at both produce none.
+  datasets_read      <- logical(nrow(versions_df))
+  # Whether the analyzer binary produced each version's metrics, or the pure-R
+  # fallback did. The caller stamps the running build on the rows collected by
+  # the analyzer and must not stamp the others, and once the summary rows are
+  # in one frame nothing about a row says which path wrote it.
+  from_binary        <- logical(nrow(versions_df))
   prev_exports       <- NULL
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
@@ -575,8 +616,22 @@ analyze_package <- function(repo_dir, package) {
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
       metrics <- analyze_with_binary(tmp)
+      binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)
+      } else if (is.null(metrics[["analyzer_version"]])) {
+        # Which build produced this row is what lets a later run tell data it
+        # already holds from data a newer build would describe differently.
+        # Taken from the binary rather than from its output, so a build that
+        # does not report itself still leaves the column behind and the
+        # re-scan queue can still settle.
+        #
+        # The column says which analyzer build collected the row, and it is
+        # written here and in the shard's own stamp, both on rows the binary
+        # produced. It is empty on a row the pure-R fallback wrote, which is
+        # not a gap to be filled: nothing named rpkg-analyzer was involved,
+        # and a build named there would say the opposite.
+        metrics[["analyzer_version"]] <- rpkg_analyzer_version()
       }
 
       # Capture per-function / per-call-edge detail before metrics is mutated.
@@ -660,7 +715,7 @@ analyze_package <- function(repo_dir, package) {
       # fingerprint canonicalization so a future change is a planned rebuild.
       datasets_row <- if (!is.null(detail_ds) && nrow(detail_ds) > 0L) {
         cbind(package = package, version = v,
-              is_current = as.integer(is_latest), fp_algo_version = 1L,
+              is_current = as.integer(is_latest), fp_algo_version = FP_ALGO_VERSION,
               detail_ds, stringsAsFactors = FALSE)
       } else {
         .empty_datasets_df()
@@ -668,7 +723,8 @@ analyze_package <- function(repo_dir, package) {
 
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
-           datasets_row = datasets_row)
+           datasets_row = datasets_row, datasets_read = !is.null(detail_ds),
+           from_binary = binary_ran)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -676,6 +732,8 @@ analyze_package <- function(repo_dir, package) {
     functions_rows[[i]]     <- iter$functions_row
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
+    datasets_read[[i]]      <- isTRUE(iter$datasets_read)
+    from_binary[[i]]        <- isTRUE(iter$from_binary)
     prev_exports            <- iter$prev_exports
     deprecation_series[[i]] <- iter$dep_sig
   }
@@ -738,13 +796,16 @@ analyze_package <- function(repo_dir, package) {
     .empty_edges_df()
   }
 
-  datasets_df <- if (length(datasets_rows) > 0L) {
-    do.call(rbind, datasets_rows)
-  } else {
-    .empty_datasets_df()
-  }
+  datasets_df <- .rbind_datasets(datasets_rows) %||% .empty_datasets_df()
 
-  summary_df <- add_cross_version_metrics(summary_df, api_df, deprecation_series)
+  # The marker lives on the latest row, so it is the latest version's scan that
+  # decides it. Reaching for the last element of the vector rather than any() is
+  # deliberate: an older version read while the newest one was not says nothing
+  # about what the package's current row carries.
+  summary_df <- add_cross_version_metrics(
+    summary_df, api_df, deprecation_series,
+    datasets_read = length(datasets_read) > 0L &&
+      isTRUE(datasets_read[[length(datasets_read)]]))
 
   list(
     summary   = summary_df,
@@ -752,6 +813,11 @@ analyze_package <- function(repo_dir, package) {
     api       = api_df,
     functions = functions_df,
     edges     = edges_df,
-    datasets  = datasets_df
+    datasets  = datasets_df,
+    # The versions the analyzer binary produced, which is the only thing that
+    # tells those summary rows from the ones the pure-R fallback wrote once
+    # they are in the same frame. The caller stamps the running build on these
+    # and leaves the rest naming nobody.
+    binary_versions = as.character(versions_df$version[from_binary])
   )
 }

@@ -546,3 +546,33 @@ test_that("analyze_package adds cross-version columns (integration, requires net
     expect_true(all(is.na(sum_df$n_versions[-last])))
   }
 })
+
+# ---------------------------------------------------------------------------
+# 14. datasets_scanned marks a scan that happened, not one that was attempted
+# ---------------------------------------------------------------------------
+
+test_that("the dataset marker stays unset when nothing read the datasets", {
+  # The marker is a convergence sentinel: .recollect_todo re-queues a package
+  # while it is NULL. Setting it on a run that produced no dataset rows retires
+  # the package from the backfill pool forever with nothing collected, which is
+  # exactly what a run without the analyzer binary does to every package it
+  # touches.
+  res <- add_cross_version_metrics(.make_summary(), .make_api(),
+                                   .make_dep_series(), datasets_read = FALSE)
+  expect_true(all(is.na(res$datasets_scanned)))
+})
+
+test_that("the dataset marker lands on the latest row when the reader ran", {
+  res <- add_cross_version_metrics(.make_summary(), .make_api(),
+                                   .make_dep_series(), datasets_read = TRUE)
+  last <- nrow(res)
+  expect_true(isTRUE(res$datasets_scanned[last]))
+  expect_true(all(is.na(res$datasets_scanned[-last])))
+})
+
+test_that("a caller that cannot say whether the reader ran does not claim it did", {
+  # The default has to be the honest one. Every stale-scan guard downstream
+  # reads this column as a statement of fact about what is in bioc_datasets.
+  res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  expect_true(all(is.na(res$datasets_scanned)))
+})

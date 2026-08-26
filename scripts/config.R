@@ -15,6 +15,29 @@ SHARD_SIZE         <- 100L
 MAX_CLONE_FAILURES <- 5L
 WORK_DIR           <- "work"
 
+# How many times a package may be handed to the analyzer without being read
+# before the backfill queues stop asking for it. The same shape as
+# MAX_CLONE_FAILURES, for the same reason: a package with no way of leaving a
+# queue keeps the pipeline reporting a change forever and publishing a dated
+# release for a database that has not moved.
+#
+# The queues it governs are the ones only the analyzer can satisfy. n_fns_r and
+# the dataset rows come from the binary and from nowhere else, so a package the
+# pure-R fallback analysed carries neither, and both queues hand it straight
+# back. Nothing about the package changes between one such run and the next.
+#
+# Lower than the clone cap because the two failures are not alike. A clone
+# fails on the network, so the next attempt is a genuinely different one and
+# five of them are worth making. A read fails on what the package contains, and
+# one build's answer is the same every time it is asked: the second attempt is
+# there for a run that failed for a reason other than the package, a killed
+# worker or a timeout, and a third would only collect the same answer again.
+#
+# Not a permanent verdict. The record carries the build that could not read the
+# package, and a later build clears it, so the retirement lasts exactly as long
+# as the reader it was measured against.
+MAX_ANALYZER_READ_ATTEMPTS <- 2L
+
 SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
@@ -35,6 +58,29 @@ ANALYSIS_CORES <- {
 # file in a metric group (e.g. a catastrophic regex) cannot stall a shard.
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
+
+# The largest column profile a single dataset row may carry, in bytes.
+#
+# Nothing bounded this. The profile is a JSON array with one entry per column,
+# so its size follows the width of what was read, and a file read as something
+# it is not can be read as having millions of columns: three such values in the
+# sibling CRAN pipeline's published data measure 321 MB, 117 MB and 63 MB, from
+# an analyzer that mistook a file with only carriage returns for one very long
+# line. Nothing about that misparse is specific to CRAN, and both pipelines'
+# dataset tables load into the same viewer database.
+#
+# A value that size is not merely large, it is unservable. The viewer's MySQL
+# refuses any single value over max_allowed_packet, whose 32 MiB ceiling is a
+# hard one that cannot be raised, and a write over it fails the load of the
+# whole table rather than of the one row. That has already cost this org three
+# days of cold loads.
+#
+# 4 MiB is an eighth of that ceiling, so a refused row still leaves the rest of
+# the profile room inside a packet, and it is far above what a real schema
+# costs: one column's entry runs to a few hundred bytes, so this is thousands
+# of columns before anything is refused. The bound is aimed at the misparse,
+# not at wide data.
+MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
 
 #' Null/empty coalescing operator.
 #' Returns b when a is NULL, length-0, or a scalar NA.

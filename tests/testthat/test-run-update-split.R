@@ -15,14 +15,16 @@ test_that("run_update produces separate code and data DB files", {
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L,
                          n_fns_r = 1L, latest_release_date = "2026-01-01",
                          datasets_scanned = 1L, detail_scanned = 1L,
+                         analyzer_version = "0.4.0-test",
                          stringsAsFactors = FALSE),
     churn = NULL, api = NULL, functions = NULL, edges = NULL,
     datasets = data.frame(package = pkg, name = "d1", version = "1.0",
       file = "data/d1.rda", internal = 0L, format = "rda", compression = "gzip",
       confidence = "high", class = "data.frame", kind = "table", nrow = 5L,
       ncol = 1L, n_missing_total = 0L, content_fp = "cf", schema_fp = "sf",
-      fp_algo_version = 1L, columns = '["a"]', row_sketch = NA_character_,
-      is_current = 1L, stringsAsFactors = FALSE)
+      fp_algo_version = FP_ALGO_VERSION, columns = '["a"]', row_sketch = NA_character_,
+      is_current = 1L, stringsAsFactors = FALSE),
+    binary_versions = "1.0"
   ), envir = environment(run_update))
   on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
 
@@ -38,4 +40,8 @@ test_that("run_update produces separate code and data DB files", {
   dcon <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, "bioc-data-metrics.db"))
   on.exit(DBI::dbDisconnect(dcon), add = TRUE)
   expect_equal(DBI::dbGetQuery(dcon, "SELECT COUNT(*) n FROM bioc_datasets")$n, 1L)
+  # Same invariant as the manifest test: the scanned row names its reader.
+  expect_equal(
+    DBI::dbGetQuery(ccon, "SELECT analyzer_version FROM bioc_code_summary")[[1L]],
+    "0.4.0-test")
 })

@@ -20,6 +20,22 @@ rpkg_analyzer_bin <- function() {
   unname(Sys.which("rpkg-analyzer"))
 }
 
+#' The version of the analyzer binary that will run, or NA when it cannot be
+#' determined. Data collected by an older build describes less than the same
+#' scan would now, and this is what lets that be noticed.
+rpkg_analyzer_version <- function() {
+  bin <- rpkg_analyzer_bin()
+  if (!nzchar(bin)) return(NA_character_)
+  out <- tryCatch(
+    suppressWarnings(system2(bin, "--version", stdout = TRUE, stderr = FALSE)),
+    error = function(e) character(0L))
+  if (!length(out)) return(NA_character_)
+  # "rpkg-analyzer 0.4.0"
+  v <- sub("^\\s*rpkg-analyzer\\s+", "", out[[1L]])
+  v <- trimws(v)
+  if (!nzchar(v) || identical(v, out[[1L]])) NA_character_ else v
+}
+
 # Extract one scalar field from a parsed NDJSON record, defaulting to NA.
 # With simplifyVector = FALSE, scalar JSON values decode to length-1 atomics.
 .rec_chr <- function(rec, key) {
@@ -51,35 +67,102 @@ rpkg_analyzer_bin <- function() {
   })
 }
 
+# The columns a dataset frame always has, whether or not this shard's records
+# happen to mention them, with the type each takes when empty. Downstream code
+# addresses these by name, so a shard where nothing carried a row_sketch must
+# still have the column. Mirrors .empty_datasets_df in analyze.R, minus the
+# package/version stamp that is applied later.
+.DATASET_BASE_COLS <- list(
+  name = character(0L), file = character(0L), internal = logical(0L),
+  format = character(0L), format_version = integer(0L),
+  compression = character(0L), class = character(0L), kind = character(0L),
+  nrow = integer(0L), ncol = integer(0L), length = integer(0L),
+  n_cols = integer(0L), n_missing_total = integer(0L),
+  schema_fp = character(0L), shape_fp = character(0L),
+  content_fp = character(0L), s4_package = character(0L),
+  confidence = character(0L), notes = character(0L),
+  columns = character(0L), row_sketch = character(0L)
+)
+
+# Row-bind dataset frames whose columns need not match.
+#
+# .datasets_frame carries whatever fields the records in front of it happened to
+# have, so two versions of one package produce frames of different widths as
+# soon as they differ in what they hold: a version shipping a data.frame emits
+# has_rownames and one shipping only an S4 object does not. Plain rbind stops on
+# that, and the caller treats the error as the whole package failing.
+.rbind_datasets <- function(dfs) {
+  dfs <- Filter(function(d) !is.null(d) && nrow(d) > 0L, dfs)
+  if (!length(dfs)) return(NULL)
+  all_cols <- unique(unlist(lapply(dfs, names), use.names = FALSE))
+  do.call(rbind, lapply(dfs, function(d) {
+    for (col in setdiff(all_cols, names(d))) d[[col]] <- NA
+    d[, all_cols, drop = FALSE]
+  }))
+}
+
 # Build the per-dataset detail frame from parsed "dataset" records. Scalar
-# fields become columns; the nested `columns` and `row_sketch` are kept as JSON
-# strings (as .flatten_summary does for nested values). Column order matches
-# .empty_datasets_df in analyze.R (minus the package/version stamp).
+# fields become columns; nested values such as `columns` and `row_sketch` are
+# kept as JSON strings (as .flatten_summary does for the summary record). The
+# base columns lead in the order .empty_datasets_df declares, minus the
+# package/version stamp that analyze.R applies later.
 .datasets_frame <- function(recs) {
-  chr <- function(k) vapply(recs, function(r) .rec_chr(r, k), character(1L))
-  int <- function(k) vapply(recs, function(r) .rec_int(r, k), integer(1L))
-  lgl <- function(k) vapply(recs, function(r) .rec_lgl(r, k), logical(1L))
-  jsn <- function(k) vapply(recs, function(r) {
-    v <- r[[k]]
-    if (is.null(v)) NA_character_
-    else as.character(jsonlite::toJSON(v, auto_unbox = TRUE, null = "null"))
-  }, character(1L))
-  n_cols <- vapply(recs, function(r) {
-    c <- r[["columns"]]
-    if (is.null(c)) NA_integer_ else length(c)
-  }, integer(1L))
-  data.frame(
-    name = chr("name"), file = chr("file"), internal = lgl("internal"),
-    format = chr("format"), format_version = int("format_version"),
-    compression = chr("compression"), class = chr("class"), kind = chr("kind"),
-    nrow = int("nrow"), ncol = int("ncol"), length = int("length"),
-    n_cols = n_cols, n_missing_total = int("n_missing_total"),
-    schema_fp = chr("schema_fp"), shape_fp = chr("shape_fp"),
-    content_fp = chr("content_fp"), s4_package = chr("s4_package"),
-    confidence = chr("confidence"), notes = chr("notes"),
-    columns = jsn("columns"), row_sketch = jsn("row_sketch"),
-    stringsAsFactors = FALSE
-  )
+  # Carry whatever the analyzer emits rather than a fixed list of names. The
+  # list version silently dropped every field added since it was written, so a
+  # richer scan cost its own runtime and changed nothing in the database. What
+  # belongs in which table is decided on the way in, not here.
+  n <- length(recs)
+  out <- list()
+  if (n) {
+    keys <- setdiff(unique(unlist(lapply(recs, names), use.names = FALSE)), "rec")
+    for (k in keys) {
+      vals <- lapply(recs, function(r) r[[k]])
+      # A value that is a list, or that is not a single element, cannot be a
+      # column; keep it as JSON the way the summary record's nested values are.
+      nested <- vapply(vals, function(v) !is.null(v) && (is.list(v) || length(v) != 1L),
+                       logical(1L))
+      if (any(nested)) {
+        out[[k]] <- vapply(vals, function(v) {
+          if (is.null(v)) NA_character_
+          else as.character(jsonlite::toJSON(v, auto_unbox = TRUE, null = "null"))
+        }, character(1L))
+        next
+      }
+      present <- vals[!vapply(vals, is.null, logical(1L))]
+      out[[k]] <- if (!length(present)) {
+        rep(NA, n)
+      } else if (all(vapply(present, is.logical, logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA else as.logical(v)[[1L]], logical(1L))
+      } else if (all(vapply(present, function(v) is.numeric(v) && !is.na(v) &&
+                                                 v == trunc(v) && abs(v) < .Machine$integer.max,
+                            logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA_integer_ else as.integer(v)[[1L]], integer(1L))
+      } else if (all(vapply(present, is.numeric, logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA_real_ else as.numeric(v)[[1L]], numeric(1L))
+      } else {
+        vapply(vals, function(v) if (is.null(v)) NA_character_ else as.character(v)[[1L]], character(1L))
+      }
+    }
+    # n_cols is the width of the profiled schema, which is the length of a
+    # nested value rather than a field of its own.
+    out[["n_cols"]] <- vapply(recs, function(r) {
+      c <- r[["columns"]]
+      if (is.null(c)) NA_integer_ else length(c)
+    }, integer(1L))
+  }
+  # Fill in any base column this shard never mentioned, so the shape downstream
+  # code addresses by name is the same every run.
+  for (k in names(.DATASET_BASE_COLS)) {
+    if (is.null(out[[k]])) {
+      out[[k]] <- rep(.DATASET_BASE_COLS[[k]][NA_integer_], n)
+    }
+  }
+  # Base columns first, in their canonical order, then whatever is new.
+  ord <- c(names(.DATASET_BASE_COLS), setdiff(names(out), names(.DATASET_BASE_COLS)))
+  out <- out[ord]
+  df <- as.data.frame(out, stringsAsFactors = FALSE, optional = TRUE)
+  names(df) <- ord
+  df
 }
 
 #' Parse a full NDJSON analyzer stream into summary + detail frames.

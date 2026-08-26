@@ -160,11 +160,671 @@ metrics_fingerprint <- function(summary_df) {
 # ---- dataset tables (normalized, content-addressed) -------------------------
 # Datasets are split three ways so identical content is stored once, not per
 # version: an identity row per (package, name), a per-version link that carries
-# only a small integer content_id, and a content-addressed profile keyed by
-# (content_fp, schema_fp, fp_algo_version) shared across versions AND packages.
-# The heavy row_sketch lives in its own table (kept out of the merge allowlist).
+# only a small integer content_id, and a profile keyed by the digest of
+# everything that profile records, shared across versions AND packages. The
+# heavy row_sketch lives in its own table (kept out of the merge allowlist).
+
+# What a dataset record says about the data itself, and so belongs on the
+# profile row shared by every copy of that data.
+#
+# What decides this list is what the field describes, not what a fingerprint
+# covers, and that is a change. It used to be decided by coverage, because the
+# row was keyed on the two fingerprints and they are narrower than "describes
+# the data": content_fp is a hash over each column's type name and the bytes of
+# its cells, schema_fp is over `name:type` per column, and between them they
+# reach the cells, the column count, order, names, types and lengths and
+# nothing else. A time zone, a class, a series start, a projection, a factor's
+# declared levels and a table's row names are invisible to both. The row is
+# written with INSERT OR IGNORE from whichever record reaches it first, so any
+# field the key did not separate was published for every dataset sharing the
+# key with the answer belonging to one of them.
+#
+# The key is now a digest of the whole recorded profile, so two records that
+# differ in any of this get two rows and neither is handed the other's
+# measurement. That is what lets these fields sit here, where they describe
+# what they describe and where the catalog reads them.
+#
+# It also reaches what no relocation could. The per-column time zone, label,
+# comment, units, declared levels and projection ride inside the `columns` and
+# `elements` arrays, which are the profile payload and by far the largest
+# values written here: a per-version copy of them is exactly the duplication
+# this table exists to remove, so they could never move to the version link.
+# Keying on the digest separates them where moving them could not.
+#
+# Types are declared rather than inferred from whatever a shard happens to
+# carry. A shard whose every density is missing would otherwise fix that column
+# as text for good, and the column would then read back as text forever.
+.DATASET_CONTENT_COLS <- c(
+  # What the object calls itself, and what shape of thing it is.
+  class = "TEXT", kind = "TEXT", frame_class = "TEXT",
+  object_system = "TEXT", s4_package = "TEXT",
+
+  nrow = "INTEGER", ncol = "INTEGER",
+  length = "INTEGER", n_cols = "INTEGER", n_unique = "INTEGER",
+  n_missing_total = "INTEGER", columns = "TEXT",
+  shape_fp = "TEXT",
+  dim = "TEXT", n_dim = "INTEGER",
+  n_stored = "INTEGER", n_cells = "INTEGER", density = "REAL",
+  geom_type = "TEXT", is_geometry = "INTEGER", n_geometries = "INTEGER",
+  is_spatial = "INTEGER", bbox = "TEXT",
+
+  # What a column or a grid holds, on the same terms summary() reports it.
+  type = "TEXT", mean = "REAL", median = "REAL", q1 = "REAL", q3 = "REAL",
+  sd = "REAL", col_min = "REAL", col_max = "REAL",
+  skewness = "REAL", kurtosis = "REAL",
+  n_outliers = "INTEGER", n_outliers_low = "INTEGER", n_outliers_high = "INTEGER",
+  mode_value = "REAL", mode_share = "REAL",
+  n_true = "INTEGER", n_false = "INTEGER",
+  min_nchar = "INTEGER", max_nchar = "INTEGER", n_blank = "INTEGER",
+  n_zero = "INTEGER", p_zero = "REAL",
+  n_infinite = "INTEGER", max_infinite = "INTEGER", min_infinite = "INTEGER",
+  is_integer_valued = "INTEGER", sort_order = "TEXT",
+  n_missing_leading = "INTEGER", n_missing_trailing = "INTEGER",
+  max_missing_run = "INTEGER",
+  # Which of two things the summary beside it was taken over, cells or stored
+  # values. Decided by how the object holds its numbers, and a dense grid and a
+  # sparse one holding the same numbers hash differently, so two records on this
+  # row were read the same way and the word is the same for both.
+  summary_over = "TEXT",
+
+  # What a factor uses and what it declares. A spare level nobody used changes
+  # `levels` and `n_levels` and changes no cell, which is why this pair could
+  # not be separated by the fingerprints and had to be separated by the key.
+  levels = "TEXT", n_levels = "INTEGER", level_counts = "TEXT",
+  is_factor = "INTEGER", is_ordered = "INTEGER",
+
+  # Whether the two lists above are the whole list or a window onto it. The
+  # reader writes fifty entries and no more, and says which of the two it cut;
+  # it writes nothing where it cut nothing, so a value here is always TRUE and
+  # a NULL is a list given whole. Without them a three hundred level factor is
+  # published carrying fifty of its levels with n_levels beside them saying
+  # three hundred, and nothing saying which fifty or that the rest exist. The
+  # count is not the marker: a `levels` value can be short because the reader
+  # cut it or because the factor is small, and only these tell those apart.
+  levels_truncated = "INTEGER", level_counts_truncated = "INTEGER",
+
+  # How a frame is grouped and keyed, all of it attributes: two frames of the
+  # same numbers, one grouped and one not, hash identically.
+  is_grouped = "INTEGER", group_vars = "TEXT", n_groups = "INTEGER",
+  is_rowwise = "INTEGER", dt_key = "TEXT", dt_indices = "TEXT",
+
+  # Labels rather than values. Row names, dimension names and the margin labels
+  # of a grid are written beside the cells and none of them is hashed.
+  has_rownames = "INTEGER", has_dimnames = "INTEGER", dimnames = "TEXT",
+
+  # Whatever else was written beside the values.
+  label = "TEXT", comment = "TEXT", units = "TEXT", attrs_other = "TEXT",
+
+  # The time zone an instant is stored in. The cells of a POSIXct are seconds
+  # since the epoch, so the same moments written in two zones hash the same and
+  # read as two different local times. index_tz below is the zone of a series'
+  # index, a different field on a different kind of object.
+  tz = "TEXT",
+
+  # What a list holds. The inner row count is the one that matters: a nested
+  # table reports its group count as its rows.
+  element_class = "TEXT", element_classes = "TEXT",
+  element_len_min = "INTEGER", element_len_max = "INTEGER",
+  element_len_total = "INTEGER", max_depth = "INTEGER",
+  inner_nrow_total = "INTEGER", inner_ncol = "INTEGER",
+  # The names a list files its slots under, and the columns of an inner table.
+  element_names = "TEXT", inner_names = "TEXT",
+  inner_schema_varies = "INTEGER",
+
+  # Where a series starts and how often it is sampled. The `tsp` attribute is
+  # not hashed, so twelve monthly readings from 2000 and the same twelve read as
+  # quarterly readings from 1990 hold the same numbers.
+  ts_start = "REAL", ts_end = "REAL", ts_frequency = "REAL", frequency = "REAL",
+  ts_span = "REAL",
+
+  # The index of an indexed series, which is an attribute beside the values
+  # rather than a column of them, and every figure taken off it.
+  index_start = "TEXT", index_end = "TEXT", index_n = "INTEGER",
+  index_class = "TEXT", index_span = "REAL", index_tz = "TEXT",
+  index_delta = "REAL", index_regular = "INTEGER",
+  index_n_gaps = "INTEGER", index_max_gap = "REAL",
+  index_sorted = "INTEGER", index_has_duplicates = "INTEGER",
+
+  # Spatial detail read off the coordinates, and the projection written beside
+  # them. The coordinates are hashed and the projection is not, so a bounding
+  # box of the same numbers can mean two different places.
+  geom_dimension = "TEXT", n_empty = "INTEGER",
+  crs_input = "TEXT", crs_epsg = "INTEGER", crs_wkt = "TEXT",
+
+  # How a matrix is held, all of it read off the class rather than the cells.
+  matrix_shape = "TEXT", matrix_storage = "TEXT",
+  matrix_uplo = "TEXT", matrix_diag = "TEXT", matrix_value_type = "TEXT",
+
+  # Raster metadata, read off the object's slots.
+  n_layers = "INTEGER", layer_names = "TEXT", layer_min = "TEXT",
+  layer_max = "TEXT", resolution = "TEXT", nodata_value = "REAL",
+  in_memory = "INTEGER",
+
+  # Which kind of missing, and which end an infinity runs to. Both are
+  # column-level too and ride in the columns JSON; these are for the objects
+  # that are one vector rather than a table.
+  n_nan = "INTEGER", n_infinite_pos = "INTEGER", n_infinite_neg = "INTEGER",
+
+  # A broken-down time: how many fields it is stored in, and the years it
+  # covers, which is what is recoverable without rebuilding the instants.
+  n_fields = "INTEGER", year_min = "INTEGER", year_max = "INTEGER",
+
+  # Sparse and graph. All four are counted off the values themselves.
+  n_nonzero = "INTEGER", n_vertices = "INTEGER", n_edges = "INTEGER",
+  directed = "INTEGER",
+
+  # A list's elements profiled the way a frame's columns are, in the same
+  # shape, so one renderer serves both.
+  elements = "TEXT",
+
+  # Per element rather than reduced across the list. The aggregates cannot say
+  # how big any one slot was, which is the question a list of folds raises.
+  element_lens = "TEXT", element_inner_nrow = "TEXT",
+
+  # Where a grid's variation runs. A summary over every cell reads a matrix and
+  # its transpose identically; the means along each margin do not. Fourteen
+  # columns whatever the size of the matrix, because the margins are summarised
+  # rather than stored.
+  row_mean_min = "REAL", row_mean_q1 = "REAL", row_mean_median = "REAL",
+  row_mean_mean = "REAL", row_mean_q3 = "REAL", row_mean_max = "REAL",
+  row_mean_sd = "REAL",
+  col_mean_min = "REAL", col_mean_q1 = "REAL", col_mean_median = "REAL",
+  col_mean_mean = "REAL", col_mean_q3 = "REAL", col_mean_max = "REAL",
+  col_mean_sd = "REAL",
+
+  # How much of a column profile the record beside it carries, which used to be
+  # unsaid. A wide object's column list was truncated at 512 entries with no
+  # marker, so a 19,763 column frame stored the word "numeric" 512 times and
+  # nothing said the other 19,251 were gone. Now the analyzer declares a depth
+  # and drops no column: `full` is every column and every statistic, `reduced`
+  # is every column with four counts and no per-column fingerprint, `none`
+  # replaces the array entirely with the whole-object summary and the
+  # row_mean_*/col_mean_* margins, so a NULL columns value beside `none` is the
+  # profile rather than a gap in it, and `structural` is every column named and
+  # typed with nothing counted, because no value was read. ncol is the true
+  # width at every depth.
+  column_detail = "TEXT",
+
+  # Slots of a list that hold nothing at all. They count towards its length and
+  # they draw as nothing, so a list of ten with four of them empty is not the
+  # list its length says it is.
+  n_empty_slots = "INTEGER",
+
+  # How many bytes of column profile this row does NOT carry. Zero on a row
+  # that carries all of it, which is every honest row; a count says the profile
+  # was over MAX_DATASET_COLUMNS_BYTES and was refused rather than stored. It
+  # is written by the pipeline rather than read from the analyzer, so that a
+  # reader can tell an object with no columns from one whose columns would not
+  # fit through the load.
+  columns_refused_bytes = "INTEGER"
+)
+
+# How one file happened to store the data, which is not a property of the data
+# at all: the same table saved twice can differ in every one of these. R's
+# serialization format has versions, and a version 3 file cannot be read by R
+# before 3.5.0, so this is the difference between a dataset a reader can open
+# and one they cannot.
+#
+# Nothing describing the data belongs here. That was tried, for the fields the
+# fingerprints do not cover, and it could not work: it could not reach the two
+# profile arrays, which carry the same properties per column and cannot be
+# copied per version; it left `levels`, `n_levels` and `inner_schema_varies`
+# colliding anyway; and it took `class` and `kind` away from the table the
+# catalog reads them off. Keying the profile row on its own digest fixes all of
+# that at once, and this list goes back to being about the file.
+.DATASET_VERSION_COLS <- c(
+  format_version = "INTEGER", compressed_bytes = "INTEGER", notes = "TEXT",
+  # A file that is not what its name says: which separator would work, and how
+  # many columns it would give. A property of this file, not of the data.
+  delimiter_looks_like = "TEXT", delimiter_would_give_ncol = "INTEGER"
+)
+
+# Where a dataset was found. Not a property of its contents: the same data can
+# sit under data/ in one package and inst/extdata in another, and only the first
+# is loadable by name.
+.DATASET_IDENTITY_COLS <- c(
+  origin_dir = "TEXT",
+  # The title of the help page documenting this dataset. Not a property of the
+  # data: two packages carrying identical bytes may document them differently,
+  # or one may not document them at all.
+  title = "TEXT"
+)
+
+# How a profile digest is built. The pair separator joins a field's name, the
+# byte length of its value and the value; the field separator joins the pairs.
+# Both are control characters, which JSON escapes rather than carries, so
+# neither can appear inside a value the analyzer emits. The length is folded in
+# so that text shifting across a field boundary cannot produce the same input
+# from two different profiles.
+.DATASET_DIGEST_PAIR_SEP  <- "\x1e"
+.DATASET_DIGEST_FIELD_SEP <- "\x1f"
+
+# How much profile text one digest pass concatenates at a time. The values
+# being hashed include the column profile, which is bounded at
+# MAX_DATASET_COLUMNS_BYTES per row and nothing smaller, so hashing a whole
+# table in one vectorized pass would hold a second copy of it in memory.
+.DATASET_DIGEST_CHUNK_BYTES <- 16 * 1024^2
+
+# How much profile text the re-key migration reads at once, and how many rows
+# it will take to reach it. The migration digests rows that are already stored,
+# so it reads them back, and the same bound applies: one row's column profile
+# runs to MAX_DATASET_COLUMNS_BYTES and nothing smaller. A batch counted in
+# rows is therefore a batch whose size nobody stated, and on a catalog of
+# profiles near the cap it is the published table read whole with the digest's
+# working copies on top of it. Counted in bytes it is what the batch actually
+# holds. The row ceiling is the other end of the same bound: a table of tiny
+# profiles would otherwise bind a quarter of a million values into one
+# statement on its way to the byte budget.
+.DATASET_REKEY_BATCH_BYTES <- 32 * 1024^2
+.DATASET_REKEY_BATCH_ROWS  <- 2000L
+
+#' Digest the profile a dataset record carries, field by field.
+#'
+#' This is the uniqueness key of the content-addressed row, and it exists
+#' because the fingerprints beside it are not one. content_fp is a hash over
+#' each column's type name and cell bytes and schema_fp is over `name:type`,
+#' so between them they cover the cells, the column count, order, names, types
+#' and lengths, and nothing else. Everything the reader took off an attribute
+#' or off the class vector is invisible to both: a time zone, a class, a series
+#' start, a projection, a factor's declared levels, a table's row names.
+#'
+#' The row is written with INSERT OR IGNORE from the first record that reaches
+#' it, so a key that does not separate those fields hands every later dataset
+#' sharing the key whichever answer the first one had. Digesting the whole
+#' recorded profile means two profiles that differ in any recorded way get two
+#' rows, and no dataset is ever handed another's measurement.
+#'
+#' It is not a replacement for content_fp and does not change what it means.
+#' content_fp stays exactly as the reader computes it and stays on the row,
+#' because it is the signal behind "the same data ships in N packages" and a
+#' surrogate keyed finer would undercount that.
+#'
+#' Encoding, chosen so that a value can only ever hash to itself and so that
+#' the digest describes the row as it is stored:
+#'   - a present field folds in its name, the byte length of its value and the
+#'     value, so no value can impersonate a separator or another field;
+#'   - a field that is missing, and a field the shard's frame does not carry at
+#'     all, both contribute nothing. A shard is one analyzer invocation per
+#'     package, so a raster field is a column in a shard that read a raster and
+#'     absent in one that did not, and the same record has to digest alike in
+#'     both. It also means declaring a column the analyzer does not emit yet
+#'     leaves every digest already in the table alone;
+#'   - doubles are rendered at full precision one element at a time. format()
+#'     would choose a width from whatever else is in the shard, so the same
+#'     value would digest differently in two runs.
+#'
+#' @param df Data frame of dataset records, or of content rows read back.
+#' @return Character vector of 64-character lower-case hex digests, one per row.
+.dataset_profile_fp <- function(df) {
+  n <- nrow(df)
+  if (n == 0L) return(character(0L))
+  cols <- sort(intersect(c("content_fp", "schema_fp", names(.DATASET_CONTENT_COLS)),
+                         names(df)))
+  if (!length(cols)) return(rep(NA_character_, n))
+
+  parts <- lapply(cols, function(k) {
+    v <- df[[k]]
+    # Logicals become integers first, because that is what the writer stores
+    # and a field arrives from the parser as either, depending on whether one
+    # package's records left it empty.
+    if (is.logical(v)) v <- as.integer(v)
+    # is.na() and not is.nan(): SQLite has no NaN and RSQLite writes one as
+    # NULL, so a record holding NaN and a record holding nothing store the same
+    # row and have to digest alike. An infinity does store, and keeps its own.
+    absent <- is.na(v)
+    s <- if (is.double(v)) {
+      sprintf("%.17g", v)
+    } else if (is.character(v)) {
+      # As bytes, so the same characters marked latin1 and marked UTF-8 are one
+      # value rather than two: they store as the same text.
+      enc2utf8(v)
+    } else {
+      as.character(v)
+    }
+    s[absent] <- ""
+    # Each field carries its own leading separator rather than the join
+    # supplying one, so an absent field contributes literally nothing and not
+    # an empty slot: a column declared before the analyzer emits it must not
+    # move the digest of every row already in the table.
+    out <- paste0(.DATASET_DIGEST_FIELD_SEP, k, .DATASET_DIGEST_PAIR_SEP,
+                  nchar(s, type = "bytes"), .DATASET_DIGEST_PAIR_SEP, s)
+    out[absent] <- ""
+    out
+  })
+
+  weight <- rep(0, n)
+  for (p in parts) weight <- weight + nchar(p, type = "bytes")
+
+  out <- character(n)
+  lo <- 1L
+  while (lo <= n) {
+    hi  <- lo
+    acc <- weight[[lo]]
+    while (hi < n && acc + weight[[hi + 1L]] <= .DATASET_DIGEST_CHUNK_BYTES) {
+      hi  <- hi + 1L
+      acc <- acc + weight[[hi]]
+    }
+    idx  <- seq.int(lo, hi)
+    keys <- do.call(paste0, lapply(parts, `[`, idx))
+    out[idx] <- vapply(keys, function(k)
+      digest::digest(k, algo = "sha256", serialize = FALSE),
+      character(1L), USE.NAMES = FALSE)
+    lo <- hi + 1L
+  }
+  out
+}
+
+#' Take off the version link the columns that describe the data, not the file.
+#'
+#' They were moved there while the profile row was keyed on the fingerprints
+#' and so could not hold them, and a database written in that state exists.
+#' The profile row is keyed on its own digest now and holds them again, and the
+#' copy on the link would otherwise sit there carrying whatever the run that
+#' wrote it recorded, never written again and never removed: a column half
+#' filled with values from a schema nobody can look up.
+#'
+#' Not copied onto the profile row first. A profile row can outlive the record
+#' that minted it and nothing distinguishes that case from the one where the
+#' link's value is the row's own, so copying would carry a wrong answer
+#' forward. The profile fills in from the analyzer as each package is scanned
+#' again, which the analyzer-version invalidation already forces on an upgrade,
+#' so the gap is the convergence window rather than a hole left open.
+#'
+#' Identified as columns on the version table that are declared on the content
+#' row: nothing else can produce that overlap. A one-time no-op afterwards.
+.drop_relocated_version_columns <- function(con) {
+  if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  moved <- intersect(DBI::dbListFields(con, "bioc_dataset_versions"),
+                     names(.DATASET_CONTENT_COLS))
+  if (!length(moved)) return(invisible(NULL))
+  # SQLite rewrites every row of the table once per dropped column, so on a
+  # database downloaded from a release this is seconds each rather than
+  # nothing, once. Said out loud because a run that stops here otherwise looks
+  # like a run that hung.
+  cat(sprintf("moving %d column%s off bioc_dataset_versions: %s\n",
+              length(moved), if (length(moved) == 1L) "" else "s",
+              paste(moved, collapse = ", ")), file = stdout())
+  flush(stdout())
+  for (col in moved) {
+    tryCatch(
+      DBI::dbExecute(con, sprintf('ALTER TABLE bioc_dataset_versions DROP COLUMN "%s"', col)),
+      error = function(e) {
+        # SQLite refuses to drop a column an index or a constraint names. None
+        # of these is one, and a refusal is worth saying out loud rather than
+        # leaving a column nobody can explain.
+        cat(sprintf("could not drop %s from bioc_dataset_versions: %s\n",
+                    col, conditionMessage(e)), file = stdout())
+      })
+  }
+  invisible(NULL)
+}
+
+#' Add any dataset column the analyzer now emits that the table has not seen.
+#' Mirrors what bioc_code_summary already does for its own new columns; without
+#' it the widened CREATE only ever applies to a database built from nothing.
+.ensure_dataset_columns <- function(con) {
+  add <- function(table, spec) {
+    if (!table %in% DBI::dbListTables(con)) return(invisible(NULL))
+    existing <- DBI::dbListFields(con, table)
+    for (col in setdiff(names(spec), existing)) {
+      DBI::dbExecute(con, sprintf('ALTER TABLE %s ADD COLUMN "%s" %s',
+                                  table, col, spec[[col]]))
+    }
+    invisible(NULL)
+  }
+  .drop_relocated_version_columns(con)
+  add("bioc_dataset_contents", .DATASET_CONTENT_COLS)
+  add("bioc_dataset_versions", .DATASET_VERSION_COLS)
+  add("bioc_datasets", .DATASET_IDENTITY_COLS)
+  # After the widening, so the digest of an existing row is taken over the
+  # shape the row will keep rather than over a narrower one it is about to
+  # leave. Columns added just above are NULL on every existing row and an
+  # absent field contributes nothing, so the two give the same answer, but the
+  # order says which one is meant.
+  .rekey_dataset_contents(con)
+  invisible(NULL)
+}
+
+#' Group rows into batches bounded by the bytes they carry.
+#'
+#' Greedy and in order, because the rows have to reach the rebuilt table with
+#' their content_id and reading them by a contiguous range of it is a walk down
+#' the primary key rather than a scan per batch.
+#'
+#' A row heavier on its own than the whole budget still has to travel. It takes
+#' a batch to itself: the budget is a ceiling on what a batch adds to a working
+#' set, not a promise that any single row fits under it.
+#'
+#' @param weight   Byte weight of each row, in the order they will be read. A
+#'   weight that could not be taken counts as nothing rather than dropping the
+#'   row out of the plan.
+#' @param max_bytes Byte budget for one batch.
+#' @param max_rows  Row ceiling for one batch.
+#' @return Integer vector, one per row, naming the batch it belongs to. Batch
+#'   numbers start at 1 and rise by one, so the runs are contiguous.
+.dataset_rekey_batches <- function(weight,
+                                   max_bytes = .DATASET_REKEY_BATCH_BYTES,
+                                   max_rows  = .DATASET_REKEY_BATCH_ROWS) {
+  n <- length(weight)
+  if (n == 0L) return(integer(0L))
+  w <- as.numeric(weight)
+  w[is.na(w)] <- 0
+  out  <- integer(n)
+  b    <- 1L
+  acc  <- 0
+  rows <- 0L
+  for (i in seq_len(n)) {
+    if (rows > 0L && (acc + w[[i]] > max_bytes || rows >= max_rows)) {
+      b    <- b + 1L
+      acc  <- 0
+      rows <- 0L
+    }
+    out[[i]] <- b
+    acc  <- acc + w[[i]]
+    rows <- rows + 1L
+  }
+  out
+}
+
+#' Key the content-addressed table on the profile digest rather than on the
+#' fingerprints.
+#'
+#' The deployed database is keyed (content_fp, schema_fp, fp_algo_version), and
+#' the incremental path opens that file rather than building one, so the new
+#' key arrives here or it only ever applies to a database built from nothing.
+#'
+#' A UNIQUE is part of the CREATE and cannot be altered in place, so the table
+#' is rebuilt from its own CREATE with the key phrase replaced and profile_fp
+#' declared beside content_fp. Every column it has picked up since comes across
+#' by name, and every row comes across with its content_id, which the version
+#' links name. The indexes the DROP takes with it are recreated by the caller.
+#'
+#' Existing rows are digested rather than left NULL: the column is the key, and
+#' a key column full of NULLs is not a key. The digests cannot collide, because
+#' the old UNIQUE guarantees the rows differ in content_fp or schema_fp and
+#' both are folded into the digest.
+#'
+#' Rows are copied in batches bounded by the bytes they hold rather than by a
+#' count of them. One dataset's column profile runs to MAX_DATASET_COLUMNS_BYTES
+#' and nothing smaller, so a fixed number of rows is a working set nobody stated:
+#' on a catalog of profiles near the cap it is the published table read whole,
+#' with the digest's working copies on top. What each row weighs is asked of
+#' SQLite before any of it is in memory, and the batch that carries it is
+#' whatever fits under the budget.
+#'
+#' The whole rebuild runs inside a savepoint. CREATE, INSERT, DROP and RENAME
+#' are four statements and a run killed between them leaves the rebuild table
+#' behind, which the next run met as its own leftover and stopped on, and so did
+#' every run after it. Inside a savepoint an interrupted run leaves the file
+#' exactly as it found it.
+#'
+#' A one-time no-op once the key is the digest.
+.rekey_dataset_contents <- function(con) {
+  if (!"bioc_dataset_contents" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  sql <- DBI::dbGetQuery(con,
+    "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'bioc_dataset_contents'")$sql
+  old_key <- "UNIQUE (content_fp, schema_fp, fp_algo_version)"
+  if (length(sql) != 1L || is.na(sql) || !grepl(old_key, sql, fixed = TRUE)) {
+    return(invisible(NULL))
+  }
+  n <- as.integer(DBI::dbGetQuery(con,
+    "SELECT COUNT(*) n FROM bioc_dataset_contents")$n)
+  cat(sprintf("re-keying bioc_dataset_contents on the profile digest: %d row%s\n",
+              n, if (n == 1L) "" else "s"), file = stdout())
+  flush(stdout())
+
+  # SAVEPOINT and not BEGIN: this also runs from inside the writer's own
+  # transaction, where a second BEGIN is an error.
+  DBI::dbExecute(con, "SAVEPOINT rekey_dataset_contents")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO rekey_dataset_contents"), silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE rekey_dataset_contents"), silent = TRUE)
+  }, add = TRUE)
+
+  # A rebuild table from a run that died before this was atomic. The guard
+  # above has already established that the real table is here and still carries
+  # the old key, so this is an abandoned attempt and not the only copy of
+  # anything. Only ever dropped on that footing: if the original were the one
+  # missing, this function returns above and leaves the leftover alone.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS bioc_dataset_contents_new")
+
+  create <- sub(old_key, "UNIQUE (profile_fp, fp_algo_version)", sql, fixed = TRUE)
+  cols   <- DBI::dbListFields(con, "bioc_dataset_contents")
+  if (!"profile_fp" %in% cols) {
+    # Declared beside content_fp, which every table carrying the old key has.
+    # If it is spelled some other way the new CREATE would come out without a
+    # key column at all, so say which CREATE could not be read rather than
+    # failing later on a column nobody declared.
+    if (!grepl("content_fp TEXT NOT NULL", create, fixed = TRUE)) {
+      stop("cannot re-key bioc_dataset_contents: its CREATE does not declare ",
+           "content_fp the way the key migration expects: ", create)
+    }
+    create <- sub("content_fp TEXT NOT NULL",
+                  "profile_fp TEXT NOT NULL, content_fp TEXT NOT NULL",
+                  create, fixed = TRUE)
+  }
+  create <- sub("bioc_dataset_contents", "bioc_dataset_contents_new", create,
+                fixed = TRUE)
+  DBI::dbExecute(con, create)
+
+  read_names <- setdiff(cols, "profile_fp")
+  copy_cols  <- c("profile_fp", read_names)
+  ins <- sprintf("INSERT INTO bioc_dataset_contents_new (%s) VALUES (%s)",
+                 paste(sprintf('"%s"', copy_cols), collapse = ", "),
+                 paste(rep("?", length(copy_cols)), collapse = ", "))
+  read_cols <- paste(sprintf('"%s"', read_names), collapse = ", ")
+
+  # What every row weighs, asked of SQLite rather than of memory. LENGTH over a
+  # CAST to BLOB is the stored byte count and not a character count, so a
+  # profile carrying multi-byte text is not planned for as smaller than it is,
+  # and SQLite answers it off the record header without reading the value: on a
+  # 923 MB table this pass is a tenth of a second and allocates nothing.
+  #
+  # Added up in groups of 64 and finished in R, because SQLite stops at an
+  # expression a thousand deep and one chain of column lengths is exactly that
+  # deep. The profile is 148 columns and gains a few each time the reader
+  # describes more, so a single chain is a migration that works until the spec
+  # crosses a line nobody is watching, and then fails whole.
+  groups <- split(read_names, (seq_along(read_names) - 1L) %/% 64L)
+  sums   <- vapply(seq_along(groups), function(g) sprintf(
+    "%s AS w%d",
+    paste(sprintf('COALESCE(LENGTH(CAST("%s" AS BLOB)), 0)', groups[[g]]),
+          collapse = " + "), g), character(1L))
+  plan <- DBI::dbGetQuery(con, sprintf(
+    "SELECT content_id, %s FROM bioc_dataset_contents ORDER BY content_id",
+    paste(sums, collapse = ", ")))
+  weight <- rowSums(as.matrix(plan[, sprintf("w%d", seq_along(groups)), drop = FALSE]))
+  runs <- rle(.dataset_rekey_batches(weight))
+  ends <- cumsum(runs$lengths)
+  for (b in seq_along(ends)) {
+    lo <- plan$content_id[[ends[[b]] - runs$lengths[[b]] + 1L]]
+    hi <- plan$content_id[[ends[[b]]]]
+    # By content_id and not LIMIT/OFFSET: content_id is the rowid, so a range
+    # of it is a walk down the primary key, where OFFSET re-walked every row
+    # already copied and made the migration quadratic in the size of the table.
+    chunk <- DBI::dbGetQuery(con, sprintf(
+      "SELECT %s FROM bioc_dataset_contents
+        WHERE content_id BETWEEN ? AND ? ORDER BY content_id", read_cols),
+      params = list(lo, hi))
+    chunk$profile_fp <- .dataset_profile_fp(chunk)
+    DBI::dbExecute(con, ins, params = lapply(copy_cols, function(k) chunk[[k]]))
+    rm(chunk)
+  }
+
+  DBI::dbExecute(con, "DROP TABLE bioc_dataset_contents")
+  DBI::dbExecute(con,
+    "ALTER TABLE bioc_dataset_contents_new RENAME TO bioc_dataset_contents")
+  done <- TRUE
+  invisible(NULL)
+}
+
+#' Let a version link stand without a profile behind it.
+#'
+#' bioc_dataset_versions.content_id was NOT NULL, which is what made "the reader
+#' took no fingerprint" mean "the dataset leaves the catalog". The constraint
+#' cannot be dropped in place, so the table is rebuilt from its own CREATE with
+#' that one phrase removed: every column it has picked up since, and every row,
+#' come across untouched. The index it carries is recreated by the caller.
+#'
+#' The whole rebuild runs inside a savepoint, for the reason the profile re-key
+#' does. CREATE, INSERT, DROP and RENAME are four statements and a run killed
+#' between them leaves the rebuild table behind, which the next run meets as its
+#' own leftover and stops on, and so does every run after it: the database never
+#' migrates and nothing is ever published again. Inside a savepoint an
+#' interrupted run leaves the file exactly as it found it.
+#'
+#' A one-time no-op once the constraint is gone.
+.relax_dataset_version_content_id <- function(con) {
+  if (!"bioc_dataset_versions" %in% DBI::dbListTables(con)) return(invisible(NULL))
+  sql <- DBI::dbGetQuery(con,
+    "SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'bioc_dataset_versions'")$sql
+  notnull <- "content_id INTEGER NOT NULL"
+  if (length(sql) != 1L || is.na(sql) || !grepl(notnull, sql, fixed = TRUE)) {
+    return(invisible(NULL))
+  }
+  cols   <- paste(sprintf('"%s"', DBI::dbListFields(con, "bioc_dataset_versions")),
+                  collapse = ", ")
+  create <- sub(notnull, "content_id INTEGER", sql, fixed = TRUE)
+  create <- sub("bioc_dataset_versions", "bioc_dataset_versions_new", create,
+                fixed = TRUE)
+
+  # SAVEPOINT and not BEGIN: this runs from inside the writer's own
+  # transaction, where a second BEGIN is an error.
+  DBI::dbExecute(con, "SAVEPOINT relax_dataset_version_content_id")
+  done <- FALSE
+  on.exit({
+    if (!done) {
+      try(DBI::dbExecute(con, "ROLLBACK TO relax_dataset_version_content_id"),
+          silent = TRUE)
+    }
+    try(DBI::dbExecute(con, "RELEASE relax_dataset_version_content_id"),
+        silent = TRUE)
+  }, add = TRUE)
+
+  # A rebuild table from a run that died before this was atomic. The guard
+  # above has already established that the real table is here and still carries
+  # the constraint, so this is an abandoned attempt and not the only copy of
+  # anything. Only ever dropped on that footing: if the original were the one
+  # missing, this function returns above and leaves the leftover alone.
+  DBI::dbExecute(con, "DROP TABLE IF EXISTS bioc_dataset_versions_new")
+  DBI::dbExecute(con, create)
+  DBI::dbExecute(con, sprintf(
+    "INSERT INTO bioc_dataset_versions_new (%s) SELECT %s FROM bioc_dataset_versions",
+    cols, cols))
+  DBI::dbExecute(con, "DROP TABLE bioc_dataset_versions")
+  DBI::dbExecute(con,
+    "ALTER TABLE bioc_dataset_versions_new RENAME TO bioc_dataset_versions")
+  done <- TRUE
+  invisible(NULL)
+}
 
 .ensure_dataset_tables <- function(con) {
+  .relax_dataset_version_content_id(con)
   tables <- DBI::dbListTables(con)
   if (!"bioc_datasets" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_datasets (
@@ -172,26 +832,56 @@ metrics_fingerprint <- function(summary_df) {
       current_version TEXT, current_content_id INTEGER,
       PRIMARY KEY (package, name))")
   }
+  # content_id is nullable: a dataset whose values the reader could not take
+  # comes back with no fingerprints, so there is no content row for it to point
+  # at, and none can be invented without telling two objects that were never
+  # compared that they hold the same data. The link still says the package ships
+  # this dataset at this version, and format, confidence, notes, class and the
+  # rest beside it say what was and was not read.
   if (!"bioc_dataset_versions" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_versions (
       package TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL,
-      content_id INTEGER NOT NULL, format TEXT, compression TEXT, confidence TEXT,
+      content_id INTEGER, format TEXT, compression TEXT, confidence TEXT,
       is_current INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (package, name, version))")
   }
+  # Keyed on the digest of the whole recorded profile rather than on the
+  # fingerprints, because the fingerprints do not cover everything the row
+  # records and a key that does not separate two profiles publishes one of them
+  # under both. content_fp is still here and still means what it always meant.
   if (!"bioc_dataset_contents" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_contents (
-      content_id INTEGER PRIMARY KEY,
+      content_id INTEGER PRIMARY KEY, profile_fp TEXT NOT NULL,
       content_fp TEXT NOT NULL, schema_fp TEXT NOT NULL, fp_algo_version INTEGER NOT NULL,
-      class TEXT, kind TEXT, nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
-      UNIQUE (content_fp, schema_fp, fp_algo_version))")
+      nrow INTEGER, ncol INTEGER, n_missing_total INTEGER, columns TEXT,
+      UNIQUE (profile_fp, fp_algo_version))")
   }
   if (!"bioc_dataset_sketches" %in% tables) {
     DBI::dbExecute(con, "CREATE TABLE bioc_dataset_sketches (
       content_id INTEGER PRIMARY KEY, row_sketch TEXT)")
   }
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsv_content ON bioc_dataset_versions(content_id)")
-  DBI::dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_bioc_dsc_schema ON bioc_dataset_contents(schema_fp)")
+  # The analyzer describes more of a dataset over time, and those fields arrive
+  # as columns that do not exist yet. This is also what widens the narrow CREATEs
+  # above to the full declared shape, so a database being built from nothing and
+  # one downloaded from the last release end up with the same columns.
+  .ensure_dataset_columns(con)
+  # Each index is created only where the column it names is there. A table
+  # written before that column existed is the case this whole function is for,
+  # and CREATE INDEX on a name SQLite does not know fails the open rather than
+  # the index.
+  idx <- function(name, table, col) {
+    if (!table %in% DBI::dbListTables(con)) return(invisible(NULL))
+    if (!col %in% DBI::dbListFields(con, table)) return(invisible(NULL))
+    DBI::dbExecute(con, sprintf(
+      'CREATE INDEX IF NOT EXISTS %s ON %s("%s")', name, table, col))
+    invisible(NULL)
+  }
+  idx("idx_bioc_dsv_content", "bioc_dataset_versions", "content_id")
+  idx("idx_bioc_dsc_schema",  "bioc_dataset_contents", "schema_fp")
+  # content_fp used to lead the uniqueness key and so had an index for free.
+  # It no longer does, and grouping on it is how the catalog answers "the same
+  # data ships in N packages", which is a scan of the whole table without one.
+  idx("idx_bioc_dsc_content", "bioc_dataset_contents", "content_fp")
   invisible(NULL)
 }
 
@@ -240,15 +930,42 @@ metrics_fingerprint <- function(summary_df) {
   df$fp_algo_version <- as.integer(df$fp_algo_version)
   df$internal        <- as.integer(df$internal)
   df$is_current      <- as.integer(df$is_current)
-  # Records without a content fingerprint (.R scripts, unreadable, S4 class-only)
-  # have no profile to store; keep them out of the normalized tables.
-  df <- df[!is.na(df$content_fp) & nzchar(df$content_fp), , drop = FALSE]
-  if (nrow(df) == 0L) return(invisible(NULL))
   # Atomic vectors / matrices / S4 have values but no column schema, so schema_fp
-  # is NA. Use an empty string so they still dedup by content and satisfy the
-  # NOT NULL + UNIQUE(content_fp, schema_fp, fp_algo_version) constraint (a NULL
-  # would make every such row distinct and get dropped by INSERT OR IGNORE).
+  # is NA. Use an empty string so they still satisfy the column's NOT NULL and
+  # so two such records read the same way still digest alike: an absent field
+  # and an empty one are different inputs to the profile digest, and a schema_fp
+  # left NA would make every vector its own profile.
   df$schema_fp[is.na(df$schema_fp)] <- ""
+
+  # Nothing upstream bounds one column profile, and one pathological value is
+  # enough to make the published database unloadable: MySQL refuses any single
+  # value over its 32 MiB packet ceiling and fails the whole table's load, not
+  # the row's. A file read as something it is not has already produced profiles
+  # of 321 MB in the sibling pipeline that loads into the same place.
+  #
+  # What is refused is the profile, never the row. The class, the shape, the
+  # counts and the fingerprints are all still true and still worth storing, and
+  # the refused size stays beside them so a reader can tell a row whose columns
+  # would not fit from an object that has no columns at all.
+  df$columns_refused_bytes <- 0L
+  if ("columns" %in% names(df)) {
+    sizes <- nchar(as.character(df$columns), type = "bytes")
+    over  <- !is.na(sizes) & sizes > MAX_DATASET_COLUMNS_BYTES
+    if (any(over)) {
+      df$columns_refused_bytes[over] <- sizes[over]
+      df$columns[over] <- NA_character_
+      named <- sprintf("%s %s (%s)", df$package[over], df$name[over],
+                       vapply(sizes[over], format_bytes, character(1L)))
+      cat(sprintf("refused %d column profile%s over %s: %s%s\n",
+                  sum(over), if (sum(over) == 1L) "" else "s",
+                  format_bytes(MAX_DATASET_COLUMNS_BYTES),
+                  paste(head(named, 5L), collapse = ", "),
+                  if (length(named) > 5L)
+                    sprintf(" and %d more", length(named) - 5L) else ""),
+          file = stdout())
+      flush(stdout())
+    }
+  }
 
   # A single package version can surface one dataset name twice: an exported
   # data/ object and an internal sysdata object of the same name, or the same
@@ -259,25 +976,79 @@ metrics_fingerprint <- function(summary_df) {
   df <- df[order(df$package, df$name, df$version, df$internal), , drop = FALSE]
   df <- df[!duplicated(paste(df$package, df$name, df$version, sep = "\x1f")), , drop = FALSE]
 
-  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct fingerprint.
-  ck  <- paste(df$content_fp, df$schema_fp, df$fp_algo_version, sep = "\x1f")
-  cts <- df[!duplicated(ck), , drop = FALSE]
-  DBI::dbExecute(con,
-    "INSERT OR IGNORE INTO bioc_dataset_contents
-       (content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol, n_missing_total, columns)
-     VALUES (?,?,?,?,?,?,?,?,?)",
-    params = list(cts$content_fp, cts$schema_fp, cts$fp_algo_version, cts$class,
-                  cts$kind, cts$nrow, cts$ncol, cts$n_missing_total, cts$columns))
+  # Which records the reader fingerprinted. The ones it did not are objects it
+  # described and could not measure: an S4 object it holds no representation
+  # for, a raster packed into bytes, and an .R script under data/, which only R
+  # can evaluate. Every such record used to be dropped here, whole, so the
+  # dataset left the catalog rather than appearing in it with what is known:
+  # no identity row, no version link, nothing saying the package ships it.
+  #
+  # They still get no content row: that table is addressed by fingerprint, and
+  # a key invented for a record with none would tell two objects that were
+  # never compared that they hold the same data. They get the identity row and
+  # the version link, with no content_id, and the format, the confidence, the
+  # notes and the class beside it say what was read and what was not.
+  fingerprinted <- !is.na(df$content_fp) & nzchar(df$content_fp)
+  if (any(!fingerprinted)) {
+    # Said out loud for the same reason the refusal above is: a dataset in the
+    # catalog with nothing behind it is a coverage figure, and a shard where
+    # that number climbs is the reader losing objects it used to measure.
+    named <- sprintf("%s %s", df$package[!fingerprinted], df$name[!fingerprinted])
+    cat(sprintf("kept %d dataset%s with no profile, unmeasured by the reader: %s%s\n",
+                length(named), if (length(named) == 1L) "" else "s",
+                paste(head(named, 5L), collapse = ", "),
+                if (length(named) > 5L)
+                  sprintf(" and %d more", length(named) - 5L) else ""),
+        file = stdout())
+    flush(stdout())
+  }
 
-  ids <- DBI::dbGetQuery(con,
-    "SELECT content_id, content_fp, schema_fp, fp_algo_version FROM bioc_dataset_contents")
-  key_map <- stats::setNames(
-    ids$content_id,
-    paste(ids$content_fp, ids$schema_fp, ids$fp_algo_version, sep = "\x1f"))
-  df$content_id <- unname(key_map[ck])
+  # 1. Content-addressed profiles: one INSERT OR IGNORE per distinct profile.
+  #
+  # Keyed on the digest of everything the row records rather than on the
+  # fingerprints, which cover the cells and the column schema and nothing else.
+  # Under the fingerprints alone, two datasets whose profiles differ in a time
+  # zone, a declared level, a class or a projection resolved to one row, and
+  # whichever record sorted first supplied the answer for both.
+  df$profile_fp <- NA_character_
+  df$profile_fp[fingerprinted] <-
+    .dataset_profile_fp(df[fingerprinted, , drop = FALSE])
+  ck <- rep(NA_character_, nrow(df))
+  ck[fingerprinted] <- paste(df$profile_fp[fingerprinted],
+                             df$fp_algo_version[fingerprinted], sep = "\x1f")
+  cts <- df[fingerprinted & !duplicated(ck), , drop = FALSE]
+  df$content_id <- NA_integer_
+  if (nrow(cts) > 0L) {
+    content_cols <- intersect(names(.DATASET_CONTENT_COLS), names(cts))
+    ins_cols <- c("profile_fp", "content_fp", "schema_fp", "fp_algo_version",
+                  content_cols)
+    DBI::dbExecute(con,
+      sprintf("INSERT OR IGNORE INTO bioc_dataset_contents (%s) VALUES (%s)",
+              paste(sprintf('"%s"', ins_cols), collapse = ", "),
+              paste(rep("?", length(ins_cols)), collapse = ", ")),
+      params = lapply(ins_cols, function(k) {
+        v <- cts[[k]]
+        if (is.logical(v)) as.integer(v) else v
+      }))
 
-  # 2. Sketches: one INSERT OR IGNORE per content_id.
-  sk <- df[!duplicated(df$content_id) & !is.na(df$row_sketch), c("content_id", "row_sketch"), drop = FALSE]
+    # Resolve content_id for the profiles in this shard and attach it to every
+    # row that has one. The rest keep NA, which is the whole of what the
+    # profile table can say about them.
+    ids <- DBI::dbGetQuery(con,
+      "SELECT content_id, profile_fp, fp_algo_version FROM bioc_dataset_contents")
+    key_map <- stats::setNames(
+      ids$content_id,
+      paste(ids$profile_fp, ids$fp_algo_version, sep = "\x1f"))
+    df$content_id[fingerprinted] <- unname(key_map[ck[fingerprinted]])
+  }
+
+  # 2. Sketches: one INSERT OR IGNORE per content_id. The sketch is taken off
+  # the values, so two profiles of the same data hold the same sketch and now
+  # store it twice, once per profile row. Keyed on content_id all the same,
+  # because that is what the version link and the reclaim both name; the cost
+  # is a copy for each of the few profiles that split.
+  sk <- df[!is.na(df$content_id) & !duplicated(df$content_id) & !is.na(df$row_sketch),
+           c("content_id", "row_sketch"), drop = FALSE]
   if (nrow(sk) > 0L) {
     DBI::dbExecute(con,
       "INSERT OR IGNORE INTO bioc_dataset_sketches (content_id, row_sketch) VALUES (?, ?)",
@@ -285,7 +1056,10 @@ metrics_fingerprint <- function(summary_df) {
   }
 
   # 3. Version links (package was wiped above, so a plain append is idempotent).
-  ver <- df[, c("package", "name", "version", "content_id", "format", "compression", "confidence", "is_current"), drop = FALSE]
+  ver_cols <- c("package", "name", "version", "content_id", "format",
+                "compression", "confidence", "is_current",
+                intersect(names(.DATASET_VERSION_COLS), names(df)))
+  ver <- df[, ver_cols, drop = FALSE]
   DBI::dbAppendTable(con, "bioc_dataset_versions", ver)
 
   # 4. Identity, one per (package, name), stamped with the current version's content.
@@ -295,22 +1069,108 @@ metrics_fingerprint <- function(summary_df) {
     idn <- data.frame(package = cur$package, name = cur$name, file = cur$file,
                       internal = cur$internal, current_version = cur$version,
                       current_content_id = cur$content_id, stringsAsFactors = FALSE)
+    for (k in intersect(names(.DATASET_IDENTITY_COLS), names(cur))) {
+      idn[[k]] <- cur[[k]]
+    }
     DBI::dbAppendTable(con, "bioc_datasets", idn)
   }
   invisible(NULL)
 }
 
 #' Reclaim content/sketch rows no longer referenced by any version link.
+#'
+#' The subquery leaves out the links that name no profile. NOT IN over a set
+#' holding one NULL is NULL for every row it is asked about, so a single
+#' unmeasured dataset anywhere in the table would quietly retire the whole
+#' reclaim and leave nothing in the log to say so.
 .gc_dataset_contents <- function(con) {
   tables <- DBI::dbListTables(con)
   if (!"bioc_dataset_contents" %in% tables) return(invisible(NULL))
-  DBI::dbExecute(con,
-    "DELETE FROM bioc_dataset_sketches
-      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
-  DBI::dbExecute(con,
-    "DELETE FROM bioc_dataset_contents
-      WHERE content_id NOT IN (SELECT content_id FROM bioc_dataset_versions)")
+  referenced <-
+    "SELECT content_id FROM bioc_dataset_versions WHERE content_id IS NOT NULL"
+  DBI::dbExecute(con, sprintf(
+    "DELETE FROM bioc_dataset_sketches WHERE content_id NOT IN (%s)", referenced))
+  DBI::dbExecute(con, sprintf(
+    "DELETE FROM bioc_dataset_contents WHERE content_id NOT IN (%s)", referenced))
   invisible(NULL)
+}
+
+# ---- dataset column coverage ----------------------------------------------
+#
+# What the three dataset tables actually hold, column by column, asked of the
+# release itself.
+#
+# The column specs are held to what the analyzer emits by the contract test,
+# and that test can only compare against fields a fixture package provokes. A
+# shape no fixture builds is a field the contract never sees, and a column fed
+# by that field then ships as public data holding nothing for anybody while
+# reading to a viewer exactly like a fact that happens to be unknown. The two
+# truncation markers were dropped on the way into SQLite for as long as they
+# were for precisely that reason. The contract test measures the reader; this
+# measures the corpus, and nothing else here does.
+#
+# Asked in SQL rather than by pulling the frame into R, because the contents
+# table is the largest object the pipeline publishes and a shard has to be able
+# to afford this every run. It costs one scan per table, which is the order of
+# work the manifest's own fingerprint and statistics already spend on the same
+# tables a few lines later.
+
+#' Per-column coverage over the dataset tables.
+#'
+#' For every declared dataset column the table actually has: how many rows the
+#' table holds, and how many of them carry a value at all. A column measured on
+#' nobody is either a field the analyzer never emits or one whose writes are
+#' being discarded, and the count alone cannot tell those apart. That is the
+#' point: it says look here.
+#'
+#' @param con Connection to the dataset database.
+#' @return data.frame(table, column, n_rows, measured); zero rows when none of
+#'   the dataset tables exist yet.
+dataset_column_coverage <- function(con) {
+  empty <- data.frame(table = character(), column = character(),
+                      n_rows = integer(), measured = integer(),
+                      stringsAsFactors = FALSE)
+  specs <- list(
+    bioc_dataset_contents = .DATASET_CONTENT_COLS,
+    bioc_dataset_versions = .DATASET_VERSION_COLS,
+    bioc_datasets         = .DATASET_IDENTITY_COLS)
+  present <- DBI::dbListTables(con)
+  out <- list()
+  for (tbl in names(specs)) {
+    if (!tbl %in% present) next
+    cols <- intersect(names(specs[[tbl]]), DBI::dbListFields(con, tbl))
+    if (!length(cols)) next
+    # One scan per table: SQLite's COUNT(col) skips NULLs, so the coverage of
+    # every column at once is a single aggregate query.
+    sel <- paste(c('COUNT(*) AS "n_rows"',
+                   sprintf('COUNT("%s") AS "c%d"', cols, seq_along(cols))),
+                 collapse = ", ")
+    got <- DBI::dbGetQuery(con, sprintf('SELECT %s FROM "%s"', sel, tbl))
+    out[[tbl]] <- data.frame(
+      table = tbl, column = cols,
+      n_rows = as.integer(got$n_rows),
+      measured = as.integer(unlist(got[sprintf("c%d", seq_along(cols))],
+                                   use.names = FALSE)),
+      stringsAsFactors = FALSE)
+  }
+  if (!length(out)) return(empty)
+  res <- do.call(rbind, out)
+  rownames(res) <- NULL
+  res
+}
+
+#' Dataset columns worth a second look, given this run's coverage.
+#'
+#' A column with no value in any row of a table that holds rows. An empty table
+#' says nothing (a first shard has not written anything yet), so it raises
+#' nothing: the alert is about a column the corpus had every chance to fill.
+dataset_coverage_alerts <- function(cov) {
+  if (is.null(cov) || nrow(cov) == 0L) return(character(0L))
+  dead <- cov[cov$n_rows > 0L & cov$measured == 0L, , drop = FALSE]
+  if (nrow(dead) == 0L) return(character(0L))
+  sprintf("%s.%s: no value in any of %d %s",
+          dead$table, dead$column, dead$n_rows,
+          ifelse(dead$n_rows == 1L, "row", "rows"))
 }
 
 #' Open (or create) the dataset SQLite database, ensuring the four normalized
@@ -326,10 +1186,12 @@ open_or_init_data_db <- function(path) {
 
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The three non-summary tables
-#' (bioc_code_churn, bioc_api_history, bioc_metrics_failures) are created with
-#' fixed schemas and indexes on first open. bioc_code_summary is created lazily
-#' by upsert_shard the first time data is written (its schema is dynamic).
+#' If the file does not yet exist it is created. The four non-summary tables
+#' (bioc_code_churn, bioc_api_history, bioc_metrics_failures,
+#' bioc_analyzer_read_attempts) are created with fixed schemas and indexes on
+#' first open, so a database downloaded from an older release gains the ones it
+#' does not have yet. bioc_code_summary is created lazily by upsert_shard the
+#' first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
 #' @return An open DBI connection. The caller is responsible for calling
@@ -366,6 +1228,21 @@ open_or_init_db <- function(path) {
         package              TEXT PRIMARY KEY,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
         last_attempt         TEXT
+      )")
+  }
+
+  # Packages handed to the analyzer that it did not read. The fields the
+  # backfill queues wait on (n_fns_r, the dataset rows) come from the binary
+  # alone, so a package the pure-R fallback analysed carries none of them and
+  # both queues hand it back on every run for good. analyzer_version is the
+  # build that could not read it, so a later build can ask again.
+  if (!"bioc_analyzer_read_attempts" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE bioc_analyzer_read_attempts (
+        package          TEXT PRIMARY KEY,
+        attempts         INTEGER NOT NULL DEFAULT 0,
+        analyzer_version TEXT,
+        last_attempt     TEXT
       )")
   }
 
@@ -569,16 +1446,22 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param ver_table   Table to count rows from for n_versions.
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
-#' @param bootstrap   list(n_analyzed, n_universe, n_remaining, bootstrap_complete).
-#'   n_universe/n_remaining may be NULL.
+#' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
+#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable).
+#'   n_universe/n_remaining and the two dataset counts may be NULL, in which
+#'   case they are left out.
 #' @return A named list matching the MANIFEST SCHEMA.
 #' @param last_changed ISO-8601 timestamp of the last run that actually moved the
 #'   data, or NULL when this run did. Kept separate from the generation time
 #'   because a run that finds nothing to do still needs to report that it ran.
+#' @param coverage    Optional frame from dataset_column_coverage(). When given,
+#'   the manifest carries how many declared columns hold nothing for anybody,
+#'   so the finding outlives the run that made it. NULL leaves the block out,
+#'   which is what the code series does: it has no dataset columns to measure.
 build_manifest <- function(con, series, repo, db_filename, db_bytes,
                            tables, fp_table, fp_cols, pkg_table, ver_table,
                            stat_table, stat_cols, bootstrap,
-                           last_changed = NULL) {
+                           last_changed = NULL, coverage = NULL) {
   present <- DBI::dbListTables(con)
   count_tbl <- function(t) {
     if (!t %in% present) return(0L)
@@ -643,7 +1526,7 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
 
   now_iso <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
-  list(
+  out <- list(
     schema_version = 1L,
     series         = series,
     repo           = repo,
@@ -666,9 +1549,44 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       n_analyzed         = bootstrap$n_analyzed,
       n_universe         = bootstrap$n_universe,
       n_remaining        = bootstrap$n_remaining,
-      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete)
+      bootstrap_complete = isTRUE(bootstrap$bootstrap_complete),
+      # A different question from bootstrap_complete, and one it hides:
+      # completion is measured against the code analysis, so it reads true
+      # while packages sit with no dataset scan at all and no queue that will
+      # ever pick them up.
+      n_datasets_unscanned = bootstrap$n_datasets_unscanned,
+      # How many packages the pipeline has stopped asking for datasets: asked
+      # to the cap under this analyzer build and never read. Kept beside
+      # bootstrap_complete because completion is measured against the code
+      # analysis, so it reads true while these packages sit unread. The number
+      # does not come down on its own, which is what makes it worth publishing:
+      # it says what the corpus is missing for good, until a build that can
+      # read them arrives.
+      n_datasets_unreadable = bootstrap$n_datasets_unreadable,
+      # How many datasets are in the catalog with nothing behind them: the
+      # reader described them and could not fingerprint them, so they have an
+      # identity row and a version link and no profile. Unlike the two counts
+      # above it is per dataset rather than per package, and the table count
+      # beside it in this same file is its denominator. It is here rather than
+      # only in a line the shard prints because that line scrolls away with the
+      # run, and a shard where this number jumps is the one worth seeing.
+      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured
     )
   )
+
+  # The names are capped and the count is not. A reader chasing this wants the
+  # number first, and enough names to start looking; the full list is a query
+  # against the database the manifest describes.
+  if (!is.null(coverage)) {
+    all_null <- coverage[coverage$n_rows > 0L & coverage$measured == 0L, , drop = FALSE]
+    named <- sort(paste(all_null$table, all_null$column, sep = "."))
+    out$coverage <- list(
+      n_columns  = nrow(coverage),
+      n_all_null = nrow(all_null),
+      all_null   = head(named, 20L)
+    )
+  }
+  out
 }
 
 #' Union `pkgs` into a sorted, deduped newline file at `path` (accumulates the

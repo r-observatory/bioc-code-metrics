@@ -116,9 +116,9 @@ test_that("data-series fingerprint matches when a package name is a prefix of an
   # tuple-ORDER-BY fingerprint cannot rely on insertion order.
   DBI::dbExecute(con,
     "INSERT INTO bioc_dataset_contents
-       (content_id, content_fp, schema_fp, fp_algo_version, class, kind, nrow, ncol)
-     VALUES (1, 'cf1', 'sf1', 1, 'data.frame', 'table', 10, 2),
-            (2, 'cf2', 'sf2', 1, 'data.frame', 'table', 20, 3)")
+       (content_id, profile_fp, content_fp, schema_fp, fp_algo_version, nrow, ncol)
+     VALUES (1, 'pf1', 'cf1', 'sf1', 1, 10, 2),
+            (2, 'pf2', 'cf2', 'sf2', 1, 20, 3)")
   DBI::dbExecute(con,
     "INSERT INTO bioc_datasets (package, name, file, internal, current_version, current_content_id)
      VALUES ('bioc11pkg', 'd', 'data/d.rda', 0, '1.0', 2),
@@ -209,4 +209,83 @@ test_that("an empty but present fp_table yields a stable 64-hex fingerprint with
   expect_true(grepl("^[0-9a-f]{64}$", m$fingerprint))
   expect_identical(m$fingerprint, digest::digest("", algo = "sha256", serialize = FALSE))
   expect_identical(m$fingerprint, db_fingerprint(con))
+})
+
+test_that("the bootstrap block counts the packages no dataset scan ever reached", {
+  # bootstrap_complete answers a different question: it is about the code
+  # analysis, and it reads true while packages sit permanently without a
+  # dataset scan. Two of the three below are in that state and nothing said so.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  DBI::dbWriteTable(con, "bioc_code_summary", data.frame(
+    package = c("a", "a", "b", "c"),
+    version = c("1.0", "1.1", "2.0", "3.0"),
+    latest_release_date = c(NA, "2026-01-01", "2026-01-02", "2026-01-03"),
+    datasets_scanned = c(NA, 1L, NA, NA),
+    stringsAsFactors = FALSE))
+
+  expect_identical(.n_datasets_unscanned(con), 2L)
+
+  m <- build_manifest(
+    con, series = "code", repo = "r-observatory/bioc-code-metrics",
+    db_filename = "bioc-code-metrics.db", db_bytes = 4096L,
+    tables = "bioc_code_summary",
+    fp_table = "bioc_code_summary", fp_cols = c("package", "version"),
+    pkg_table = "bioc_code_summary", ver_table = "bioc_code_summary",
+    stat_table = "bioc_code_summary", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unscanned = 2L))
+
+  expect_true(m$bootstrap$bootstrap_complete)
+  expect_identical(m$bootstrap$n_datasets_unscanned, 2L)
+})
+
+test_that("a database with no dataset marker at all counts every package as unscanned", {
+  # The column arrives on the first write that carries it, so before that run
+  # nothing in the database has been scanned and the count has to say so
+  # rather than reading zero.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  DBI::dbWriteTable(con, "bioc_code_summary", data.frame(
+    package = c("a", "b"), version = c("1.0", "2.0"),
+    latest_release_date = c("2026-01-01", "2026-01-02"),
+    stringsAsFactors = FALSE))
+
+  expect_identical(.n_datasets_unscanned(con), 2L)
+})
+
+test_that("the bootstrap block counts the datasets the reader could not measure", {
+  # These are in the catalog and have no profile behind them, which is a
+  # coverage figure and not a row count. It only lived in a line the shard
+  # printed, so a shard where the number jumps scrolled away with the run.
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  .ensure_dataset_tables(con)
+  DBI::dbExecute(con,
+    "INSERT INTO bioc_dataset_versions (package, name, version, content_id, is_current)
+     VALUES ('a', 'd', '1.0', 1, 1),
+            ('b', 'e', '1.0', NULL, 1),
+            ('c', 'f', '1.0', NULL, 1)")
+
+  expect_identical(.n_datasets_unmeasured(con), 2L)
+
+  m <- build_manifest(
+    con, series = "data", repo = "r-observatory/bioc-code-metrics",
+    db_filename = "bioc-data-metrics.db", db_bytes = 4096L,
+    tables = "bioc_dataset_versions",
+    fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
+    pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
+    stat_table = "bioc_dataset_contents", stat_cols = character(0L),
+    bootstrap = list(n_analyzed = 3L, n_universe = 3L, n_remaining = 0L,
+                     bootstrap_complete = TRUE, n_datasets_unmeasured = 2L))
+
+  expect_identical(m$bootstrap$n_datasets_unmeasured, 2L)
+  # The denominator is beside it: the count of links the table holds.
+  expect_identical(m$tables$bioc_dataset_versions, 3L)
+})
+
+test_that("a database with no dataset link table counts nothing unmeasured", {
+  db <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), db); on.exit(DBI::dbDisconnect(con))
+  expect_identical(.n_datasets_unmeasured(con), 0L)
 })

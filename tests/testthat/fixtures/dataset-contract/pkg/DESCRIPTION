@@ -1,0 +1,5 @@
+Package: bcmfixtures
+Version: 0.1.0
+Title: Dataset shapes the contract test measures
+Description: Not a real package. Every object exists to make the analyzer
+    report one family of fields.
