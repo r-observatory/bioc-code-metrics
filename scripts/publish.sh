@@ -158,6 +158,28 @@ verify_assets() {
   done
 }
 
+# Edit TAG with the gh release edit flags that follow, up to five times, 10 s,
+# then 20 s and so on apart.
+#
+# Both edits the publish makes come after every asset has landed and been
+# checked, so a single 5xx on one would otherwise throw that upload away. Each
+# is one PATCH that sets the same fields however many times it lands, so
+# repeating one that returned 500 and applied anyway changes nothing: gh finds
+# the release by its tag again and sets the fields again.
+edit_release() {
+  local tag="$1" n
+  shift
+  for n in 1 2 3 4 5; do
+    if gh release edit "$tag" "$@"; then
+      return 0
+    fi
+    echo "attempt ${n}: could not edit ${tag}"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to edit ${tag}."
+  return 1
+}
+
 # Publish TAG with TITLE and the notes in NOTES, carrying the files that follow.
 #
 # A tag with no release gets an empty draft, the files one at a time, a check
@@ -169,7 +191,15 @@ verify_assets() {
 #
 # The create is never retried here. A POST that returns 500 can still have
 # created the release, and retrying could leave two drafts under one tag; a
-# later publish under the same tag finds the one and replaces it.
+# later publish under the same tag finds the one and replaces it. Nor is the
+# delete of a draft, which goes by tag: gh looks the tag up as a published
+# release and as a draft at the same time and acts on whichever answer comes
+# back first (release_rows). So when the listing has not caught up with a
+# release published under the same tag, the delete can take that release
+# instead, and each repeat is another chance to. A draft the one attempt leaves
+# is deleted by the next publish under the tag. The listing, the uploads, the
+# read-back and the edits land the same however often they run, and each is
+# retried.
 #
 # Databases go up before manifests whatever order they are passed in. The
 # replacement is not atomic, and a manifest newer than the database beside it
@@ -206,9 +236,9 @@ publish_release() {
   done
   verify_assets "$tag" "${ordered[@]}" || return 1
   if [ -z "$state" ]; then
-    gh release edit "$tag" --draft=false --latest || return 1
+    edit_release "$tag" --draft=false --latest || return 1
   else
-    gh release edit "$tag" --title "$title" --notes-file "$notes" || return 1
+    edit_release "$tag" --title "$title" --notes-file "$notes" || return 1
   fi
 }
 

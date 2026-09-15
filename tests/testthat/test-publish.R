@@ -378,19 +378,84 @@ test_that("an asset that landed at the wrong size is refused before publishing",
   expect_identical(.pub_latest(w), "metrics-2026-09-12")
 })
 
-test_that("a publish edit that fails leaves a draft the next call replaces", {
+test_that("a publish edit that fails once is made again, and the release is published", {
+  # The edit comes after every asset has uploaded and been checked, so one 5xx
+  # on it used to throw away a verified upload and leave a complete draft.
   w <- .pub_world(list(.pub_prior()))
   .pub_fail(w, "publish", 1L)
   r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_length(grep("--draft=false", .pub_calls(w), fixed = TRUE), 2L)
+  expect_length(grep("^gh release (create|delete) ", .pub_calls(w)), 1L)
+  expect_identical(.pub_latest(w), "metrics-2026-09-13")
+})
+
+test_that("a publish edit that landed but reported failure is safe to make again", {
+  # A PATCH that returns 500 can still have applied. The next attempt finds a
+  # published release under the tag and sets the same two fields on it.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "publish-after", 1L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_false(.pub_releases(w, "metrics-2026-09-12")[[1L]]$isLatest)
+  expect_length(grep("--draft=false", .pub_calls(w), fixed = TRUE), 2L)
+})
+
+test_that("a publish edit that never lands leaves a draft the next call replaces", {
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "publish", 99L)
+  r <- .pub_publish(w)
   expect_false(identical(r$status, 0L))
+  expect_length(grep("--draft=false", .pub_calls(w), fixed = TRUE), 5L)
   expect_true(.pub_releases(w, "metrics-2026-09-13")[[1L]]$isDraft)
   expect_identical(.pub_latest(w), "metrics-2026-09-12")
 
+  file.remove(file.path(w$fails, "publish"))
   file.create(w$log)
   r <- .pub_publish(w)
   expect_identical(r$status, 0L, info = r$output)
   .pub_expect_published(w)
   expect_length(grep("^gh release delete metrics-2026-09-13 --yes$", .pub_calls(w)), 1L)
+})
+
+test_that("a same-day notes edit that fails once is made again", {
+  w <- .pub_world(list(.pub_prior()))
+  expect_identical(.pub_publish(w)$status, 0L)
+  file.create(w$log)
+  .pub_fail(w, "edit", 1L)
+  r <- .pub_sh(w, paste(
+    "publish_release metrics-2026-09-13 'Bioconductor Metrics - 2026-09-13 (updated 09:00 UTC)'",
+    "out/release-notes-code.md", .PUB_ASSETS, "|| exit 1"))
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_releases(w, "metrics-2026-09-13")[[1L]]$name,
+                   "Bioconductor Metrics - 2026-09-13 (updated 09:00 UTC)")
+  expect_length(grep("^gh release edit ", .pub_calls(w)), 2L)
+})
+
+test_that("an edit waits ten seconds longer after each failed attempt", {
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "publish", 2L)
+  slept <- file.path(w$dir, "slept")
+  r <- .pub_sh(w, c(sprintf("sleep() { echo \"$1\" >> %s; }", shQuote(slept)),
+                    "publish_release metrics-2026-09-13 t out/release-notes-code.md out/code-manifest.json || exit 1"),
+               wait = NA)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(readLines(slept), c("10", "20"))
+})
+
+test_that("a draft that will not delete is not deleted again in the same call", {
+  # The delete goes by tag, and when the listing has not caught up with a
+  # release published under the same tag it can take that release instead, so
+  # it is not repeated. The draft is left to the next publish.
+  w <- .pub_world(list(.pub_prior(), .pub_stranded()))
+  .pub_fail(w, "delete", 1L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_length(grep("^gh release delete ", .pub_calls(w)), 1L)
+  expect_false(any(grepl("^gh release (create|upload|edit) ", .pub_calls(w))))
+  expect_true(.pub_releases(w, "metrics-2026-09-13")[[1L]]$isDraft)
 })
 
 test_that("a create that errors is not retried, and its draft is replaced next time", {
@@ -576,9 +641,9 @@ test_that("every gh call in scripts/publish.sh stops the function when it fails"
   expect_true(length(gh) > 0L)
   lines <- .pub_logical_lines(.pub_script())
   lines <- lines[!grepl("^\\s*#", lines)]
-  helpers <- grep("\\b(release_state|release_rows|upload_asset|verify_assets|file_bytes)[ )]", lines,
-                  value = TRUE, perl = TRUE)
-  expect_gte(length(helpers), 6L)
+  helpers <- grep("\\b(release_state|release_rows|upload_asset|verify_assets|edit_release|file_bytes)[ )]",
+                  lines, value = TRUE, perl = TRUE)
+  expect_gte(length(helpers), 8L)
   expect_true(any(grepl("gh api ", gh, fixed = TRUE)))
   calls <- c(gh, helpers)
   guarded <- grepl("\\|\\| return 1", calls) |

@@ -26,6 +26,9 @@
 #   short-<asset>   the upload succeeds but records one byte fewer than sent
 #   create          the POST returns HTTP 500 after the draft was created
 #   publish         `edit --draft=false` returns HTTP 500 and changes nothing
+#   publish-after   `edit --draft=false` applies, then returns HTTP 500
+#   edit            any other `edit` returns HTTP 500 and changes nothing
+#   delete          `release delete` returns HTTP 500 and deletes nothing
 #   list            `release list` returns HTTP 500
 #   view            `release view` returns HTTP 502
 #   api             `api` listing the releases returns HTTP 500
@@ -187,7 +190,10 @@ case "$sub" in
       shift
     done
     id=$(resolve "$tag") || exit 1
-    if [ "$draft" = false ] && take_failure publish; then die "HTTP 500 (PATCH release)"; fi
+    if [ "$draft" = false ]; then
+      if take_failure publish; then die "HTTP 500 (PATCH release)"; fi
+    elif take_failure edit; then die "HTTP 500 (PATCH release)"
+    fi
     state | jq --argjson id "$id" --arg d "$draft" --argjson l "$latest" --arg n "$title" '
       map(if .id == $id then
             (if $d == "" then . else .isDraft = ($d == "true") end)
@@ -195,6 +201,7 @@ case "$sub" in
             | (if $l then .isLatest = true else . end)
           elif $l then .isLatest = false
           else . end)' | save
+    if [ "$draft" = false ] && take_failure publish-after; then die "HTTP 500 (PATCH release)"; fi
     ;;
 
   delete)
@@ -208,6 +215,7 @@ case "$sub" in
       shift
     done
     id=$(resolve "$tag") || exit 1
+    if take_failure delete; then die "HTTP 500 (DELETE releases/$id)"; fi
     was_draft=$(state | jq --argjson id "$id" '.[] | select(.id == $id) | .isDraft')
     state | jq --argjson id "$id" 'map(select(.id != $id))' | save
     if [ "$cleanup" = true ] && [ "$was_draft" = true ]; then
