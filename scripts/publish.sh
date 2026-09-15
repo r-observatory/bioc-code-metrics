@@ -26,7 +26,18 @@
 # the step green over a release missing its database.
 
 # Bytes in a file, on the runner's GNU stat or the BSD stat a Mac has.
-file_bytes() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+#
+# A missing file is named before either stat is asked. GNU stat reads the BSD
+# form as a usage error, so on the runner a missing file used to print nothing
+# but "stat: invalid option -- '%'". The error goes to stderr, because callers
+# read the size from stdout.
+file_bytes() {
+  if [ ! -f "$1" ]; then
+    echo "::error::$1 does not exist." >&2
+    return 1
+  fi
+  stat -c%s "$1" 2>/dev/null || stat -f%z "$1"
+}
 
 # Wait before attempt $1 + 1, at $2 seconds for each attempt already made.
 # PUBLISH_RETRY_WAIT_S replaces $2, and only exists so the tests do not sleep.
@@ -224,6 +235,13 @@ publish_release() {
     echo "::error::nothing to publish to ${tag}."
     return 1
   fi
+  # Every file is here before the release is touched. The size check in
+  # update.yml measures only the databases, so a missing manifest got as far as
+  # a draft holding both of them and five failed uploads, about five minutes of
+  # backoff, before anything said which file it was.
+  for f in "$@"; do
+    file_bytes "$f" > /dev/null || return 1
+  done
   local ordered=()
   for f in "$@"; do case "$f" in *.db) ordered+=("$f") ;; esac; done
   for f in "$@"; do case "$f" in *.db) ;; *) ordered+=("$f") ;; esac; done
@@ -275,6 +293,12 @@ refresh_heartbeat() {
     echo "No prior release to carry a heartbeat; nothing to refresh."
     return 0
   fi
+  # Every manifest is here before the release is read. They go up one at a
+  # time, so a manifest ahead of a missing one would otherwise refresh
+  # last_checked for its own series alone before the step failed.
+  for f in "$@"; do
+    file_bytes "$f" > /dev/null || return 1
+  done
   state=$(release_state "$tag") || return 1
   case "$state" in
     published) ;;

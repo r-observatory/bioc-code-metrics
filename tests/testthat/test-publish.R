@@ -353,6 +353,68 @@ test_that("the refusal over two releases under one tag names them by id, not by 
   expect_length(.pub_state(w), 3L)
 })
 
+# A `stat` that answers the way GNU coreutils does on the runner, whatever this
+# machine has: -c takes a format, and -f means --file-system and takes none, so
+# the BSD form `-f%z` is a usage error.
+.pub_gnu_stat <- function(w) {
+  writeLines(c(
+    "#!/usr/bin/env bash",
+    'case "$1" in',
+    "  -c%s)",
+    '    [ -e "$2" ] || { echo "stat: cannot statx $2: No such file or directory" >&2; exit 1; }',
+    '    wc -c < "$2" | tr -d " " ;;',
+    "  *) echo \"stat: invalid option -- '%'\" >&2; exit 1 ;;",
+    "esac"), file.path(w$bin, "stat"))
+  Sys.chmod(file.path(w$bin, "stat"), "755")
+}
+
+test_that("file_bytes names a missing file on stderr, not with a GNU stat usage error", {
+  # file_bytes asks GNU stat for a size and falls back to the BSD form, so the
+  # same helper works where the tests run on macOS. On the runner that fallback
+  # is a usage error, so the size check in update.yml failed on a database
+  # missing from out/ with nothing but "stat: invalid option -- '%'".
+  w <- .pub_world(list(.pub_prior()))
+  .pub_gnu_stat(w)
+  unlink(file.path(w$dir, "out", "bioc-data-metrics.db"))
+  r <- .pub_sh(w, c(
+    sprintf('[ "$(command -v stat)" = %s ] || exit 98', shQuote(file.path(w$bin, "stat"))),
+    'echo "measured <$(file_bytes out/code-manifest.json)>"',
+    'bytes=$(file_bytes out/bioc-data-metrics.db) || { echo "answered <${bytes}>"; exit 1; }'))
+  expect_identical(r$status, 1L, info = r$output)
+  expect_true(grepl("measured <120>", r$output, fixed = TRUE), info = r$output)
+  expect_true(grepl("::error::out/bioc-data-metrics.db does not exist", r$output, fixed = TRUE),
+              info = r$output)
+  # Callers read the size from stdout, so the error stays out of it.
+  expect_true(grepl("answered <>", r$output, fixed = TRUE), info = r$output)
+  expect_false(grepl("invalid option", r$output, fixed = TRUE))
+})
+
+test_that("a file missing from out/ is named before the release is touched", {
+  # The databases are measured for the size budget before a publish, but a
+  # missing manifest was not measured at all: it got as far as a draft holding
+  # both databases and five failed uploads before anything said which file it
+  # was. A same-day republish would first have replaced the databases on the
+  # published release.
+  today <- .pub_prior()
+  today$id <- 2L
+  today$tagName <- "metrics-2026-09-13"
+  prior <- .pub_prior()
+  prior$isLatest <- FALSE
+  for (releases in list(list(.pub_prior()), list(prior, today))) {
+    for (missing in c("bioc-data-metrics.db", "data-manifest.json")) {
+      w <- .pub_world(releases)
+      .pub_gnu_stat(w)
+      unlink(file.path(w$dir, "out", missing))
+      r <- .pub_publish(w)
+      expect_false(identical(r$status, 0L))
+      expect_true(grepl(sprintf("::error::out/%s does not exist", missing), r$output, fixed = TRUE),
+                  info = r$output)
+      expect_false(grepl("invalid option", r$output, fixed = TRUE))
+      expect_length(.pub_calls(w), 0L)
+    }
+  }
+})
+
 test_that("databases go up before manifests, whatever order they are passed in", {
   # A manifest must never be newer than the database beside it: preflight reads
   # a database behind its manifest as lost rows.
@@ -619,6 +681,20 @@ test_that("the heartbeat fails when a manifest landed at the wrong size", {
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_false(identical(r$status, 0L))
   expect_true(grepl("code-manifest.json 120", r$output, fixed = TRUE))
+})
+
+test_that("the heartbeat names a missing manifest before it touches the release", {
+  # The manifests go up one at a time, so the one ahead of a missing one would
+  # have refreshed last_checked for its own series alone before the step failed.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_gnu_stat(w)
+  unlink(file.path(w$dir, "out", "data-manifest.json"))
+  r <- .pub_heartbeat(w, "metrics-2026-09-12")
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("::error::out/data-manifest.json does not exist", r$output, fixed = TRUE),
+              info = r$output)
+  expect_false(grepl("invalid option", r$output, fixed = TRUE))
+  expect_length(.pub_calls(w), 0L)
 })
 
 test_that("the heartbeat has nothing to do without a prior release", {
