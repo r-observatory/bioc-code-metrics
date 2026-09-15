@@ -21,6 +21,7 @@
 #   create          the POST returns HTTP 500 after the draft was created
 #   publish         `edit --draft=false` returns HTTP 500 and changes nothing
 #   list            `release list` returns HTTP 500
+#   view            `release view` returns HTTP 502
 # Anything this fake does not model exits 2, so a publish that starts calling
 # gh some other way fails its test instead of passing by accident.
 set -u
@@ -80,6 +81,7 @@ case "$sub" in
       esac
       shift
     done
+    if take_failure view; then die "HTTP 502 (GET releases/tags/$tag)"; fi
     id=$(resolve "$tag") || exit 1
     state | jq -r --argjson id "$id" ".[] | select(.id == \$id) | $query"
     ;;

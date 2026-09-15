@@ -27,6 +27,10 @@
 # Bytes in a file, on the runner's GNU stat or the BSD stat a Mac has.
 file_bytes() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
 
+# Wait before attempt $1 + 1, at $2 seconds for each attempt already made.
+# PUBLISH_RETRY_WAIT_S replaces $2, and only exists so the tests do not sleep.
+publish_backoff() { sleep $(($1 * ${PUBLISH_RETRY_WAIT_S:-$2})); }
+
 # The newest PUBLISHED release of a series ("metrics", or the legacy "code" and
 # "data"), or nothing when the series has none. A draft is what an interrupted
 # publish leaves, so it is not a prior release whatever its tag says. A failed
@@ -42,16 +46,31 @@ latest_tag() {
 # per release when more than one does. GitHub does not stop a draft from
 # sharing a tag with another release, and gh then picks whichever lookup
 # answers first, so that case has no safe reading.
+#
+# The listing is read up to five times, 10 s, then 20 s and so on apart. Most
+# days publish nothing and only get as far as the heartbeat, and a single
+# GraphQL 500 here used to turn that run red and leave last_checked where it
+# was, which the merger reads as a late pipeline. The answer is this function's
+# stdout, so the attempt messages go to stderr.
 release_state() {
-  gh release list --limit 1000 --json tagName,isDraft \
-    -q ".[] | select(.tagName == \"$1\") | if .isDraft then \"draft\" else \"published\" end" || return 1
+  local tag="$1" n rows
+  for n in 1 2 3 4 5; do
+    if rows=$(gh release list --limit 1000 --json tagName,isDraft \
+                -q ".[] | select(.tagName == \"${tag}\") | if .isDraft then \"draft\" else \"published\" end"); then
+      printf '%s\n' "$rows"
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases to find ${tag}" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases; cannot tell whether ${tag} exists." >&2
+  return 1
 }
 
 # Upload one file to a release, replacing an asset of the same name. gh makes
 # the delete that --clobber sends first only once, then tries the upload four
 # times 200 ms apart. A GitHub incident lasting minutes outlives both, so this
 # waits 30 s, then 60 s, and so on between five attempts of the whole call.
-# PUBLISH_RETRY_WAIT_S only exists so the tests do not sleep.
 upload_asset() {
   local tag="$1" file="$2" n
   for n in 1 2 3 4 5; do
@@ -59,7 +78,7 @@ upload_asset() {
       return 0
     fi
     echo "attempt ${n}: $(basename "$file") did not upload to ${tag}"
-    if [ "$n" -lt 5 ]; then sleep $((n * ${PUBLISH_RETRY_WAIT_S:-30})); fi
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 30; fi
   done
   echo "::error::five attempts failed to upload $(basename "$file") to ${tag}."
   return 1
@@ -68,11 +87,26 @@ upload_asset() {
 # Check that a release carries every file, by name and size, as a finished
 # upload. An upload that returned success is not the same thing as an asset
 # that landed whole, and it is the asset that the next run downloads.
+#
+# The read is tried five times like the listing. It comes after every upload
+# has landed, so one 502 on it would otherwise throw away a whole day's
+# databases and leave the release an unpublished draft. A read that works and
+# shows an asset missing or short is not retried: that is the answer.
 verify_assets() {
-  local tag="$1" got f want
+  local tag="$1" got="" f want n
   shift
-  got=$(gh release view "$tag" --json assets \
-          -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"') || return 1
+  for n in 1 2 3 4 5; do
+    if got=$(gh release view "$tag" --json assets \
+               -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"'); then
+      break
+    fi
+    echo "attempt ${n}: could not read the assets of ${tag}"
+    if [ "$n" -eq 5 ]; then
+      echo "::error::five attempts failed to read back the assets of ${tag}."
+      return 1
+    fi
+    publish_backoff "$n" 10
+  done
   for f in "$@"; do
     want="$(basename "$f") $(file_bytes "$f")" || return 1
     if ! printf '%s\n' "$got" | grep -qxF "$want"; then

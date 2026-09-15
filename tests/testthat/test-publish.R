@@ -351,6 +351,59 @@ test_that("a create that errors is not retried, and its draft is replaced next t
   .pub_expect_published(w)
 })
 
+test_that("a release listing and a read-back that each fail once are read again", {
+  # The create is the only call that is unsafe to repeat. A single 5xx on the
+  # read-back used to fail the publish after both databases had landed, which
+  # threw away the upload and left the release an unpublished draft.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "list", 1L)
+  .pub_fail(w, "view", 1L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  calls <- .pub_calls(w)
+  expect_length(grep("^gh release create ", calls), 1L)
+  expect_length(grep("^gh release list ", calls), 2L)
+  expect_length(grep("^gh release view ", calls), 2L)
+})
+
+test_that("a listing that fails once during a same-day republish still reads as published", {
+  # release_state answers on stdout, so a retry message printed there would turn
+  # "published" into two lines and the republish into a refusal.
+  w <- .pub_world(list(.pub_prior()))
+  expect_identical(.pub_publish(w)$status, 0L)
+  file.create(w$log)
+  .pub_fail(w, "list", 1L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_false(any(grepl("^gh release (create|delete) ", .pub_calls(w))))
+})
+
+test_that("a read-back that never succeeds fails the call and leaves today unpublished", {
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "view", 99L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_length(grep("^gh release view ", .pub_calls(w)), 5L)
+  expect_false(any(grepl("--draft=false", .pub_calls(w), fixed = TRUE)))
+  expect_true(.pub_releases(w, "metrics-2026-09-13")[[1L]]$isDraft)
+  expect_identical(.pub_latest(w), "metrics-2026-09-12")
+})
+
+test_that("a read waits ten seconds longer after each failed attempt", {
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "list", 2L)
+  .pub_fail(w, "view", 2L)
+  slept <- file.path(w$dir, "slept")
+  r <- .pub_sh(w, c(sprintf("sleep() { echo \"$1\" >> %s; }", shQuote(slept)),
+                    "release_state metrics-2026-09-12 > /dev/null || exit 1",
+                    "verify_assets metrics-2026-09-12 || exit 1"),
+               wait = NA)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(readLines(slept), c("10", "20", "10", "20"))
+})
+
 # ---------------------------------------------------------------------------
 # The heartbeat
 # ---------------------------------------------------------------------------
@@ -388,6 +441,27 @@ test_that("the heartbeat fails when its upload never lands", {
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_false(identical(r$status, 0L))
   expect_identical(sum(.pub_uploads(w) == "data-manifest.json"), 5L)
+})
+
+test_that("the heartbeat reads the release again when a read fails once", {
+  # Most days publish nothing and end here. A heartbeat that goes red leaves
+  # last_checked where it was, and the merger's readiness gate reads freshness
+  # from last_checked, so one 5xx would make this pipeline look late.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "list", 1L)
+  .pub_fail(w, "view", 1L)
+  r <- .pub_heartbeat(w, "metrics-2026-09-12")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_uploads(w), c("code-manifest.json", "data-manifest.json"))
+})
+
+test_that("the heartbeat fails when the release list never reads", {
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "list", 99L)
+  r <- .pub_heartbeat(w, "metrics-2026-09-12")
+  expect_false(identical(r$status, 0L))
+  expect_length(grep("^gh release list ", .pub_calls(w)), 5L)
+  expect_length(.pub_uploads(w), 0L)
 })
 
 test_that("the heartbeat fails when a manifest landed at the wrong size", {
@@ -436,7 +510,8 @@ test_that("every gh call in scripts/publish.sh stops the function when it fails"
                   value = TRUE, perl = TRUE)
   expect_gte(length(helpers), 5L)
   calls <- c(gh, helpers)
-  guarded <- grepl("\\|\\| return 1", calls) | grepl("^\\s*if !? ?gh ", calls)
+  guarded <- grepl("\\|\\| return 1", calls) |
+    grepl("^\\s*if !? ?([a-z_]+=\\$\\()?gh ", calls)
   expect_true(all(guarded), info = paste(calls[!guarded], collapse = "\n"))
 })
 
