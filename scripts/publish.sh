@@ -132,30 +132,41 @@ upload_asset() {
 #
 # The read is tried five times like the listing. It comes after every upload
 # has landed, so one 502 on it would otherwise throw away a whole day's
-# databases and leave the release an unpublished draft. A read that works and
-# shows an asset missing or short is not retried: that is the answer.
+# databases and leave the release an unpublished draft.
+#
+# A read that disagrees is read again, like one that failed. Nothing promises
+# that a release lists an asset the moment its upload returns, and refusing on
+# the first read that lags leaves a complete draft unpublished, so the next run
+# repeats the day's analysis. Only the last of five reads decides, so an asset
+# that really landed short takes about a hundred seconds longer to refuse.
 verify_assets() {
-  local tag="$1" got="" f want n
+  local tag="$1" got f want wrong n
   shift
   for n in 1 2 3 4 5; do
+    wrong=""
     if got=$(gh release view "$tag" --json assets \
                -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"'); then
-      break
+      for f in "$@"; do
+        want="$(basename "$f") $(file_bytes "$f")" || return 1
+        if ! printf '%s\n' "$got" | grep -qxF "$want"; then
+          wrong="$want"
+          break
+        fi
+      done
+      if [ -z "$wrong" ]; then return 0; fi
+      echo "attempt ${n}: ${tag} does not list ${wrong} yet"
+    else
+      got=""
+      echo "attempt ${n}: could not read the assets of ${tag}"
     fi
-    echo "attempt ${n}: could not read the assets of ${tag}"
-    if [ "$n" -eq 5 ]; then
-      echo "::error::five attempts failed to read back the assets of ${tag}."
-      return 1
-    fi
-    publish_backoff "$n" 10
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
   done
-  for f in "$@"; do
-    want="$(basename "$f") $(file_bytes "$f")" || return 1
-    if ! printf '%s\n' "$got" | grep -qxF "$want"; then
-      echo "::error::${tag} does not carry ${want} after the upload; it lists: $(printf '%s' "$got" | tr '\n' ',')"
-      return 1
-    fi
-  done
+  if [ -z "$wrong" ]; then
+    echo "::error::five attempts failed to read back the assets of ${tag}."
+  else
+    echo "::error::${tag} does not carry ${wrong} after the upload; it lists: $(printf '%s' "$got" | tr '\n' ',')"
+  fi
+  return 1
 }
 
 # Edit TAG with the gh release edit flags that follow, up to five times, 10 s,

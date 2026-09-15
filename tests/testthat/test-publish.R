@@ -376,6 +376,20 @@ test_that("an asset that landed at the wrong size is refused before publishing",
   expect_false(any(grepl("--draft=false", .pub_calls(w), fixed = TRUE)))
   expect_true(.pub_releases(w, "metrics-2026-09-13")[[1L]]$isDraft)
   expect_identical(.pub_latest(w), "metrics-2026-09-12")
+  # Read five times first, in case the release had not caught up.
+  expect_length(grep("^gh release view ", .pub_calls(w)), 5L)
+})
+
+test_that("a read-back that has not caught up with the uploads is read again, not refused", {
+  # Nothing promises that a release lists an asset the moment its upload
+  # returns. Refusing on the first read that disagrees fails a publish whose
+  # assets are all there, and the next run repeats the day's analysis.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "stale-data-manifest.json", 2L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_length(grep("^gh release view ", .pub_calls(w)), 3L)
 })
 
 test_that("a publish edit that fails once is made again, and the release is published", {

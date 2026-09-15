@@ -31,6 +31,8 @@
 #   delete          `release delete` returns HTTP 500 and deletes nothing
 #   list            `release list` returns HTTP 500
 #   view            `release view` returns HTTP 502
+#   stale-<asset>   `release view` leaves that asset out, as a read that has
+#                   not caught up with its upload would
 #   api             `api` listing the releases returns HTTP 500
 #   api-delete      `api -X DELETE` of a release by id returns HTTP 500
 # Anything this fake does not model exits 2, so a publish that starts calling
@@ -126,7 +128,15 @@ case "$sub" in
     done
     if take_failure view; then die "HTTP 502 (GET releases/tags/$tag)"; fi
     id=$(resolve "$tag") || exit 1
-    state | jq -r --argjson id "$id" ".[] | select(.id == \$id) | $query"
+    one=$(state | jq --argjson id "$id" '.[] | select(.id == $id)')
+    for f in "$GH_FAILS"/stale-*; do
+      [ -e "$f" ] || continue
+      n="${f##*/stale-}"
+      if take_failure "stale-$n"; then
+        one=$(printf '%s\n' "$one" | jq --arg n "$n" '.assets |= map(select(.name != $n))')
+      fi
+    done
+    printf '%s\n' "$one" | jq -r "$query"
     ;;
 
   create)
