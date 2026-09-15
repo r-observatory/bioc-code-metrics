@@ -36,10 +36,23 @@ publish_backoff() { sleep $(($1 * ${PUBLISH_RETRY_WAIT_S:-$2})); }
 # publish leaves, so it is not a prior release whatever its tag says. A failed
 # listing fails the call rather than answering empty, because empty is what a
 # cold start looks like.
+#
+# This is the first call of every run, so it is read up to five times like
+# release_state's listing, for the same reason: one GraphQL 500 here stopped a
+# day that had nothing to publish before its heartbeat. The tag is this
+# function's stdout, so the attempt messages go to stderr.
 latest_tag() {
-  local tags
-  tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName') || return 1
-  printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r | head -n 1
+  local tags n
+  for n in 1 2 3 4 5; do
+    if tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName'); then
+      printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r | head -n 1
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases to find the newest $1 release" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases; cannot tell whether a $1 release exists." >&2
+  return 1
 }
 
 # "published", "draft", nothing when no release carries the tag, or one line

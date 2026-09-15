@@ -141,10 +141,32 @@ test_that("latest_tag fails when the release list cannot be read", {
   # An empty answer is what a cold start looks like, so a failed listing must
   # stop the step rather than come back empty.
   w <- .pub_world(list(.pub_prior()))
-  .pub_fail(w, "list", 1L)
+  .pub_fail(w, "list", 99L)
   r <- .pub_sh(w, c('METRICS_TAG=$(latest_tag metrics)', 'echo "resolved <${METRICS_TAG}>"'))
   expect_false(identical(r$status, 0L))
   expect_false(grepl("resolved <", r$output, fixed = TRUE))
+  expect_length(grep("^gh release list ", .pub_calls(w)), 5L)
+})
+
+test_that("latest_tag reads the release list again when a read fails", {
+  # It is the first call of every run, in the download step, so a single
+  # GraphQL 500 there stopped a no-op day before the heartbeat, exactly as one
+  # on the heartbeat's own listing did. The tag is the function's stdout, which
+  # the attempt messages must stay out of.
+  w <- .pub_world(list(.pub_prior(), .pub_stranded()))
+  .pub_fail(w, "list", 1L)
+  r <- .pub_sh(w, c('METRICS_TAG=$(latest_tag metrics)', 'echo "resolved <${METRICS_TAG}>"'))
+  expect_identical(r$status, 0L, info = r$output)
+  expect_true(grepl("resolved <metrics-2026-09-12>", r$output, fixed = TRUE), info = r$output)
+  expect_length(grep("^gh release list ", .pub_calls(w)), 2L)
+
+  .pub_fail(w, "list", 2L)
+  slept <- file.path(w$dir, "slept")
+  r <- .pub_sh(w, c(sprintf("sleep() { echo \"$1\" >> %s; }", shQuote(slept)),
+                    "latest_tag metrics > /dev/null || exit 1"),
+               wait = NA)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(readLines(slept), c("10", "20"))
 })
 
 test_that("latest_tag is empty when the series has no published release", {
