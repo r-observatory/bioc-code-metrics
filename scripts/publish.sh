@@ -1,0 +1,178 @@
+# scripts/publish.sh: find the release a run builds on, and publish the one it
+# produces. Sourced by the download step and the shard step of update.yml.
+# shellcheck shell=bash
+#
+# The sibling cran-code-metrics pipeline carried exactly this code until it
+# stopped on 2026-09-13. `gh release create TAG <assets> --latest` is several
+# API calls: it creates a draft, uploads the assets into it and then publishes
+# it. Both database uploads got HTTP 500, gh's own delete of the draft got a
+# 500 as well, and a draft was left under the new tag holding only the two
+# manifests. `gh release list` returns drafts to a token that can push, sorted
+# in among the real releases, so every run after that resolved the draft as
+# the prior release, downloaded two manifests and no database, and refused.
+# Here it would have been worse: a draft holding no assets at all advertises
+# nothing, which reads as a cold start, and the run would have published one
+# shard's worth of packages as latest.
+#
+# So a draft is never something to build on, never something to upload into,
+# and a publish that fails partway leaves a draft that nothing resolves. A
+# later publish under the same tag, which means the same day, deletes it.
+#
+# Every gh call inside these functions ends in `|| return 1`, or sits in an
+# `if`, on purpose. The workflow calls them as `f || exit 1`, and bash ignores
+# `set -e` for the whole body of a function called on the left of `||`, so an
+# unguarded failed upload followed by a successful edit returned 0 and left
+# the step green over a release missing its database.
+
+# Bytes in a file, on the runner's GNU stat or the BSD stat a Mac has.
+file_bytes() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+
+# The newest PUBLISHED release of a series ("metrics", or the legacy "code" and
+# "data"), or nothing when the series has none. A draft is what an interrupted
+# publish leaves, so it is not a prior release whatever its tag says. A failed
+# listing fails the call rather than answering empty, because empty is what a
+# cold start looks like.
+latest_tag() {
+  local tags
+  tags=$(gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName') || return 1
+  printf '%s\n' "$tags" | { grep "^$1-" || true; } | sort -r | head -n 1
+}
+
+# "published", "draft", nothing when no release carries the tag, or one line
+# per release when more than one does. GitHub does not stop a draft from
+# sharing a tag with another release, and gh then picks whichever lookup
+# answers first, so that case has no safe reading.
+release_state() {
+  gh release list --limit 1000 --json tagName,isDraft \
+    -q ".[] | select(.tagName == \"$1\") | if .isDraft then \"draft\" else \"published\" end" || return 1
+}
+
+# Upload one file to a release, replacing an asset of the same name. gh makes
+# the delete that --clobber sends first only once, then tries the upload four
+# times 200 ms apart. A GitHub incident lasting minutes outlives both, so this
+# waits 30 s, then 60 s, and so on between five attempts of the whole call.
+# PUBLISH_RETRY_WAIT_S only exists so the tests do not sleep.
+upload_asset() {
+  local tag="$1" file="$2" n
+  for n in 1 2 3 4 5; do
+    if gh release upload "$tag" "$file" --clobber; then
+      return 0
+    fi
+    echo "attempt ${n}: $(basename "$file") did not upload to ${tag}"
+    if [ "$n" -lt 5 ]; then sleep $((n * ${PUBLISH_RETRY_WAIT_S:-30})); fi
+  done
+  echo "::error::five attempts failed to upload $(basename "$file") to ${tag}."
+  return 1
+}
+
+# Check that a release carries every file, by name and size, as a finished
+# upload. An upload that returned success is not the same thing as an asset
+# that landed whole, and it is the asset that the next run downloads.
+verify_assets() {
+  local tag="$1" got f want
+  shift
+  got=$(gh release view "$tag" --json assets \
+          -q '.assets[] | select(.state == "uploaded") | "\(.name) \(.size)"') || return 1
+  for f in "$@"; do
+    want="$(basename "$f") $(file_bytes "$f")" || return 1
+    if ! printf '%s\n' "$got" | grep -qxF "$want"; then
+      echo "::error::${tag} does not carry ${want} after the upload; it lists: $(printf '%s' "$got" | tr '\n' ',')"
+      return 1
+    fi
+  done
+}
+
+# Publish TAG with TITLE and the notes in NOTES, carrying the files that follow.
+#
+# A tag with no release gets an empty draft, the files one at a time, a check
+# of what landed, and only then the edit that publishes it as latest. A draft
+# already under the tag is left from an earlier attempt that failed somewhere
+# in that sequence; it can hold any mix of assets, so it is deleted and the
+# sequence starts again rather than being uploaded into. A published release is
+# an earlier shard of this same run, and its assets are replaced in place.
+#
+# The create is never retried here. A POST that returns 500 can still have
+# created the release, and retrying could leave two drafts under one tag; a
+# later publish under the same tag finds the one and replaces it.
+#
+# Databases go up before manifests whatever order they are passed in. The
+# replacement is not atomic, and a manifest newer than the database beside it
+# is what preflight.R refuses as lost rows, while a database newer than its
+# manifest costs nothing.
+publish_release() {
+  local tag="$1" title="$2" notes="$3" state f
+  shift 3
+  if [ "$#" -eq 0 ]; then
+    echo "::error::nothing to publish to ${tag}."
+    return 1
+  fi
+  local ordered=()
+  for f in "$@"; do case "$f" in *.db) ordered+=("$f") ;; esac; done
+  for f in "$@"; do case "$f" in *.db) ;; *) ordered+=("$f") ;; esac; done
+
+  state=$(release_state "$tag") || return 1
+  case "$state" in
+    ""|published) ;;
+    draft)
+      echo "::warning::${tag} is a draft an earlier publish left unfinished; deleting it and publishing again."
+      gh release delete "$tag" --yes || return 1
+      state="" ;;
+    *)
+      echo "::error::more than one release is named ${tag} ($(printf '%s' "$state" | tr '\n' ',')). Delete the draft ones with \`gh release delete ${tag} --yes\` (no --cleanup-tag) until one is left, then re-run."
+      return 1 ;;
+  esac
+
+  if [ -z "$state" ]; then
+    gh release create "$tag" --draft --title "$title" --notes-file "$notes" || return 1
+  fi
+  for f in "${ordered[@]}"; do
+    upload_asset "$tag" "$f" || return 1
+  done
+  verify_assets "$tag" "${ordered[@]}" || return 1
+  if [ -z "$state" ]; then
+    gh release edit "$tag" --draft=false --latest || return 1
+  else
+    gh release edit "$tag" --title "$title" --notes-file "$notes" || return 1
+  fi
+}
+
+# Put the freshness manifests back on the release the run built on, when the
+# run published nothing.
+#
+# The universe is keyed on the Bioconductor RELEASE, which moves twice a year,
+# so between releases every daily run correctly finds nothing to do and
+# publishes nothing. Consumers that read freshness off the latest release would
+# then watch this pipeline appear to die for months. Refreshing the two small
+# manifests on that release lets last_checked advance daily while last_changed
+# stays at the moment the data really moved. No database is re-uploaded.
+#
+# TAG is whatever the download step resolved, and empty on a cold start. Only a
+# published release is written to: a draft is never the release anyone reads
+# freshness from, and putting new manifests into one makes it look like a
+# release that finished.
+refresh_heartbeat() {
+  local tag="$1" state f
+  shift
+  if [ -z "$tag" ]; then
+    echo "No prior release to carry a heartbeat; nothing to refresh."
+    return 0
+  fi
+  state=$(release_state "$tag") || return 1
+  case "$state" in
+    published) ;;
+    draft)
+      echo "::error::${tag} is a draft, not a published release; refusing to put the freshness manifests into it."
+      return 1 ;;
+    "")
+      echo "::error::no release is named ${tag} any more; refusing to refresh the freshness manifests on it."
+      return 1 ;;
+    *)
+      echo "::error::more than one release is named ${tag}; refusing to guess which one carries the heartbeat."
+      return 1 ;;
+  esac
+  echo "Nothing published this run; refreshing the freshness manifests on ${tag}."
+  for f in "$@"; do
+    upload_asset "$tag" "$f" || return 1
+  done
+  verify_assets "$tag" "$@" || return 1
+}

@@ -14,7 +14,8 @@
 # first run look identical from there on.
 #
 # The workflow's download step is the first line: a release that advertises an
-# asset it cannot hand over fails the run. This file is the second. It is run
+# asset it cannot hand over fails the run, and a draft is never resolved as a
+# release at all (scripts/publish.sh). This file is the second. It is run
 # once per run, from that same step, and it cannot move into the shard loop:
 # the comparison holds only before the first shard, because every later shard
 # has legitimately added rows to the same file while prev-*-manifest.json still
@@ -22,10 +23,11 @@
 #
 # Two things happen here, in this order. A release that published a database
 # and no manifest gets a baseline measured from that database, because the
-# publish is four assets in one non-atomic --clobber and can be interrupted
-# between them. Then each database is compared against the manifest that
-# shipped with it, and only a database that did not come back at all, or one
-# holding LESS than its manifest recorded, stops the run.
+# publish replaces four assets one at a time and can be interrupted between
+# them. Then each database is compared against the manifest published with
+# it, and only a database that did not come back at all, one holding LESS than
+# its manifest recorded, or a resolved release that carried neither, stops the
+# run.
 
 # The two series the download step brings back, named once. `expected` names
 # the ones whose DATABASE the resolved release advertised, and the downloaded
@@ -202,12 +204,12 @@ prior_db_notes <- function(series, counts, prior, tables) {
 #' A baseline measured from a downloaded database, for a release that
 #' published no manifest.
 #'
-#' The publish is not atomic (four assets, one --clobber, each existing asset
-#' deleted before its replacement lands), so a run that died in that window can
-#' leave a release carrying its database and no code-manifest.json. There was
-#' nothing to check such a database against, so it was checked against the row
-#' count alone and a release that lost one asset was refused every day after,
-#' since the same release stays latest.
+#' The publish is not atomic (four assets replaced one at a time with --clobber,
+#' each existing asset deleted before its replacement lands), so a run that
+#' died in that window can leave a release carrying its database and no
+#' code-manifest.json. There was nothing to check such a database against, so
+#' it was checked against the row count alone and a release that lost one asset
+#' was refused every day after, since the same release stays latest.
 #'
 #' The database is right there and it is the thing worth protecting, so measure
 #' it. The result is a real floor for prior_db_violations(): a database that
@@ -266,6 +268,14 @@ ensure_prior_baseline <- function(out_dir) {
   notes
 }
 
+# The tag the download step resolved for one series, or "" when none did.
+.pf_resolved_tag <- function(resolved, series) {
+  if (length(resolved) == 0L || !(series %in% names(resolved))) return("")
+  tag <- as.character(resolved[[series]])
+  if (length(tag) != 1L || is.na(tag)) return("")
+  trimws(tag)
+}
+
 #' Check every database the resolved release advertised.
 #'
 #' A series is checked when the resolved release advertised its database OR its
@@ -276,13 +286,25 @@ ensure_prior_baseline <- function(out_dir) {
 #' that as a cold start would let the run rebuild from nothing and publish it
 #' as latest. That release stays latest, so it would repeat every day.
 #'
+#' Neither is enough when the release carries nothing at all. A release with no
+#' database and no manifest advertises nothing and downloads nothing, which is
+#' exactly what no release looks like, and a draft left by a failed
+#' `gh release create` holds no assets when its uploads and gh's own cleanup
+#' both fail. The tag the download step resolved is the one thing that tells the
+#' two apart, so a series whose tag resolved and whose release carried neither
+#' asset is refused rather than read as a cold start.
+#'
 #' @param out_dir  Directory the download step wrote into.
 #' @param expected Character vector of series ("code", "data") whose database
 #'   the release this run resolved actually advertises.
+#' @param resolved Named character vector, series to the tag the download step
+#'   resolved for it (for example `c(code = "metrics-2026-09-13", data = "")`).
+#'   A missing or empty entry means no release resolved for that series.
 #' @return list(violations = character, notes = character, checked = character).
 #'   `checked` names the series that had any evidence of a prior release;
 #'   empty is the genuine cold start.
-preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
+preflight_prior_dbs <- function(out_dir, expected = character(0L),
+                                resolved = character(0L)) {
   violations <- character(0L)
   notes      <- character(0L)
   checked    <- character(0L)
@@ -295,7 +317,19 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
     # field inside it only decides whether the row counts can be compared. A
     # manifest too old to compare against is still proof of a prior release.
     baselined  <- file.exists(m_path)
-    if (!advertised && !baselined) next
+    tag        <- .pf_resolved_tag(resolved, spec$series)
+    if (!advertised && !baselined) {
+      if (nzchar(tag)) {
+        checked <- c(checked, spec$series)
+        violations <- c(violations, sprintf(paste0(
+          "the release this run resolved for the %s series, %s, carries neither ",
+          "%s nor %s. That is not a cold start: a release with neither asset ",
+          "lost both after it was published, or was never a finished publish. ",
+          "This run would rebuild from nothing and publish it as latest."),
+          spec$series, tag, spec$db, spec$manifest_asset))
+      }
+      next
+    }
     checked <- c(checked, spec$series)
 
     db_path <- file.path(out_dir, spec$db)
@@ -351,19 +385,44 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L)) {
 #' @return A single string, ready to append to a refusal.
 preflight_repair_advice <- function() {
   paste0(
-    "\nLook at the PREVIOUS release first. The publish uploads four assets in ",
-    "one `gh release upload --clobber`, which deletes each existing asset ",
-    "before uploading its replacement and cannot do so atomically, so an ",
-    "interrupted publish can leave one shard's database beside another ",
-    "shard's manifest, or a database that never finished uploading.\n",
+    "\nLook at the PREVIOUS release first. A same-day publish replaces four ",
+    "assets one at a time with `gh release upload --clobber`, which deletes ",
+    "each existing asset before uploading its replacement and cannot do so ",
+    "atomically, so an interrupted publish can leave one shard's database ",
+    "beside another shard's manifest, or a database that never finished ",
+    "uploading.\n",
     "If that is what happened, open the release the download step resolved as ",
     "code src / data src and make its assets agree again: re-upload the ",
     "database and the manifest that belong together, or delete that release ",
     "so the day before it becomes latest again. Then re-run.\n",
+    "If that release carries no assets at all for the series, there is nothing ",
+    "in it to repair. Delete it with `gh release delete TAG --yes --cleanup-tag`, ",
+    "so its git tag goes with it, then re-run. If `gh release list` shows a ",
+    "draft under the same tag as well, delete the draft by id instead, with ",
+    "`gh api -X DELETE repos/{owner}/{repo}/releases/<id>` (the ids are in ",
+    "`gh api 'repos/{owner}/{repo}/releases?per_page=100'`): a delete by tag ",
+    "can take the published one.\n",
     "If that release is consistent, this run really did lose the rows, and ",
     "the cause is upstream of the publish. Do not paper over it here.\n",
     "force_full is not the repair either way. It wipes the metric tables and ",
     "republishes one shard as latest.")
+}
+
+# The command line: the output directory, then --code-src=TAG and
+# --data-src=TAG for the releases the download step resolved (either may be
+# empty), then the series whose database that release advertised. The tags are
+# flags rather than positions so that an empty one survives the shell as
+# "--code-src=" instead of disappearing and shifting everything after it.
+.pf_parse_args <- function(args) {
+  args     <- as.character(args)
+  out_dir  <- if (length(args) >= 1L) args[[1L]] else "out"
+  rest     <- args[-1L]
+  is_src   <- grepl("^--(code|data)-src=", rest)
+  resolved <- c(code = "", data = "")
+  for (a in rest[is_src]) {
+    resolved[[sub("^--(code|data)-src=.*$", "\\1", a)]] <- sub("^--(code|data)-src=", "", a)
+  }
+  list(out_dir = out_dir, expected = rest[!is_src], resolved = resolved)
 }
 
 if (identical(sys.nframe(), 0L)) {
@@ -377,12 +436,11 @@ if (identical(sys.nframe(), 0L)) {
   }
   source(file.path(.script_dir, "config.R"))
 
-  args     <- commandArgs(trailingOnly = TRUE)
-  out_dir  <- if (length(args) >= 1L) args[1L] else "out"
-  expected <- if (length(args) >= 2L) args[-1L] else character(0L)
+  args     <- .pf_parse_args(commandArgs(trailingOnly = TRUE))
+  out_dir  <- args$out_dir
 
   derived <- ensure_prior_baseline(out_dir)
-  checked <- preflight_prior_dbs(out_dir, expected)
+  checked <- preflight_prior_dbs(out_dir, args$expected, args$resolved)
   for (n in c(derived, checked$notes)) {
     cat(sprintf("::warning::%s\n", n), file = stderr())
   }

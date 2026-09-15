@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# A stand-in for the `gh release` subcommands scripts/publish.sh calls, for
+# tests/testthat/test-publish.R. Nothing here touches the network.
+#
+# It models the parts of gh 2.100.0 that decide whether a publish can strand a
+# draft, read from gh's own source when metrics-2026-09-13 was stranded in the
+# sibling cran-code-metrics pipeline:
+#   - `release list` returns drafts unless --exclude-drafts is passed.
+#   - `view`, `upload`, `edit` and `delete` find a release by tag, and fall
+#     back to a draft carrying that pending tag when no published one exists.
+#   - `upload --clobber` deletes the existing asset before the new one lands.
+#   - `delete --cleanup-tag` deletes the release and then fails, because a
+#     draft has no git tag to clean up.
+#
+# State lives in $GH_STATE, a JSON array of
+#   {id, tagName, isDraft, isLatest, name, assets: [{name, size, state}]}.
+# Every call is appended to $GH_LOG. Failures are injected through counters in
+# $GH_FAILS: a file holding N makes the next N matching calls fail.
+#   upload-<asset>  the upload returns HTTP 500 and leaves a half-written asset
+#   short-<asset>   the upload succeeds but records one byte fewer than sent
+#   create          the POST returns HTTP 500 after the draft was created
+#   publish         `edit --draft=false` returns HTTP 500 and changes nothing
+#   list            `release list` returns HTTP 500
+# Anything this fake does not model exits 2, so a publish that starts calling
+# gh some other way fails its test instead of passing by accident.
+set -u
+
+printf 'gh %s\n' "$*" >> "$GH_LOG"
+
+die() { echo "$1" >&2; exit "${2:-1}"; }
+state() { cat "$GH_STATE"; }
+save() { local t; t=$(mktemp) && cat > "$t" && mv "$t" "$GH_STATE"; }
+nbytes() { wc -c < "$1" | tr -d ' '; }
+
+take_failure() {
+  local f="$GH_FAILS/$1" n
+  [ -f "$f" ] || return 1
+  n=$(cat "$f")
+  [ "$n" -gt 0 ] || return 1
+  echo $((n - 1)) > "$f"
+}
+
+# The id of the release a tag names: the published one if there is one, else a
+# draft carrying that tag, as gh's FetchRelease does.
+resolve() {
+  state | jq -e --arg t "$1" '
+    ([.[] | select(.tagName == $t and (.isDraft | not))] +
+     [.[] | select(.tagName == $t and .isDraft)]) | .[0].id' 2>/dev/null ||
+    die "release not found"
+}
+
+[ "${1:-}" = release ] || die "fake gh: unsupported command ${1:-}" 2
+sub="${2:-}"
+shift 2
+
+case "$sub" in
+  list)
+    exclude=false; query='.'
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --exclude-drafts) exclude=true ;;
+        -q) query="$2"; shift ;;
+        --limit|--json) shift ;;
+        *) die "fake gh: unsupported list argument $1" 2 ;;
+      esac
+      shift
+    done
+    if take_failure list; then die "HTTP 500 (GraphQL releases)"; fi
+    state | jq -r --argjson x "$exclude" \
+      "[sort_by(-.id)[] | select((\$x and .isDraft) | not)] | $query"
+    ;;
+
+  view)
+    tag="$1"; shift; query='.'
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -q) query="$2"; shift ;;
+        --json) shift ;;
+        *) die "fake gh: unsupported view argument $1" 2 ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    state | jq -r --argjson id "$id" ".[] | select(.id == \$id) | $query"
+    ;;
+
+  create)
+    tag="$1"; shift; draft=false; title=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --draft) draft=true ;;
+        --title) title="$2"; shift ;;
+        --notes-file) [ -f "$2" ] || die "open $2: no such file"; shift ;;
+        *) die "fake gh: only an empty --draft create is modelled, not $1" 2 ;;
+      esac
+      shift
+    done
+    [ "$draft" = true ] || die "fake gh: only an empty --draft create is modelled" 2
+    id=$(( $(state | jq 'map(.id) | max // 0') + 1 ))
+    state | jq --argjson id "$id" --arg t "$tag" --arg n "$title" \
+      '. + [{id: $id, tagName: $t, isDraft: true, isLatest: false, name: $n, assets: []}]' | save
+    if take_failure create; then die "HTTP 500 (POST releases)"; fi
+    ;;
+
+  upload)
+    tag="$1"; shift; clobber=false; files=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --clobber) clobber=true ;;
+        -*) die "fake gh: unsupported upload argument $1" 2 ;;
+        *) files+=("$1") ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    for f in "${files[@]}"; do
+      n=$(basename "$f")
+      if state | jq -e --argjson id "$id" --arg n "$n" \
+           'any(.[] | select(.id == $id) | .assets[]; .name == $n)' > /dev/null; then
+        [ "$clobber" = true ] || die "asset under the same name already exists: [$n]"
+        state | jq --argjson id "$id" --arg n "$n" \
+          'map(if .id == $id then .assets |= map(select(.name != $n)) else . end)' | save
+      fi
+      size=$(nbytes "$f"); st=uploaded; rc=0
+      if take_failure "upload-$n"; then st=starter; rc=1
+      elif take_failure "short-$n"; then size=$((size - 1))
+      fi
+      state | jq --argjson id "$id" --arg n "$n" --argjson s "$size" --arg st "$st" \
+        'map(if .id == $id then .assets += [{name: $n, size: $s, state: $st}] else . end)' | save
+      [ "$rc" -eq 0 ] || die "HTTP 500 (uploads.github.com assets?name=$n)"
+    done
+    ;;
+
+  edit)
+    tag="$1"; shift; draft=""; latest=false; title=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --draft=false) draft=false ;;
+        --draft=true) draft=true ;;
+        --latest) latest=true ;;
+        --title) title="$2"; shift ;;
+        --notes-file) [ -f "$2" ] || die "open $2: no such file"; shift ;;
+        *) die "fake gh: unsupported edit argument $1" 2 ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    if [ "$draft" = false ] && take_failure publish; then die "HTTP 500 (PATCH release)"; fi
+    state | jq --argjson id "$id" --arg d "$draft" --argjson l "$latest" --arg n "$title" '
+      map(if .id == $id then
+            (if $d == "" then . else .isDraft = ($d == "true") end)
+            | (if $n == "" then . else .name = $n end)
+            | (if $l then .isLatest = true else . end)
+          elif $l then .isLatest = false
+          else . end)' | save
+    ;;
+
+  delete)
+    tag="$1"; shift; cleanup=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --yes) ;;
+        --cleanup-tag) cleanup=true ;;
+        *) die "fake gh: unsupported delete argument $1" 2 ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    was_draft=$(state | jq --argjson id "$id" '.[] | select(.id == $id) | .isDraft')
+    state | jq --argjson id "$id" 'map(select(.id != $id))' | save
+    if [ "$cleanup" = true ] && [ "$was_draft" = true ]; then
+      die "HTTP 422: Reference does not exist (refs/tags/$tag)"
+    fi
+    ;;
+
+  *) die "fake gh: unsupported release $sub" 2 ;;
+esac

@@ -66,7 +66,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          latest_tag() { gh release list --limit 1000 --json tagName -q '.[].tagName' | { grep "^$1-" || true; } | sort -r | head -1; }
+          # latest_tag resolves published releases only; a draft is what an
+          # interrupted publish leaves, never a release to build on.
+          source scripts/publish.sh
 
           # A single consolidated release per day (metrics-YYYY-MM-DD) carries both
           # the code and data DBs as assets. Fall back to the legacy split code-/data-
@@ -120,7 +122,7 @@ jobs:
           # The series whose databases the resolved release actually carries.
           # preflight.R reads this to tell a cold start apart from a download
           # that came back with nothing in it.
-          EXPECT=""
+          EXPECT=()
           if [ -n "$CODE_SRC" ]; then
             if ! list_assets "$CODE_SRC" "out/.assets-${CODE_SRC}"; then
               echo "::error::could not read the asset list of ${CODE_SRC}; refusing to guess whether it carries a database."
@@ -128,7 +130,7 @@ jobs:
             fi
             if have_asset "$CODE_SRC" bioc-code-metrics.db; then
               get_asset "$CODE_SRC" bioc-code-metrics.db
-              EXPECT="$EXPECT code"
+              EXPECT+=(code)
             fi
             # code-manifest.json only. The pre-split manifest.json cannot serve
             # as a baseline: it carries no series, so preflight.R cannot tell
@@ -146,7 +148,7 @@ jobs:
             fi
             if have_asset "$DATA_SRC" bioc-data-metrics.db; then
               get_asset "$DATA_SRC" bioc-data-metrics.db
-              EXPECT="$EXPECT data"
+              EXPECT+=(data)
             fi
             if have_asset "$DATA_SRC" data-manifest.json; then
               get_asset "$DATA_SRC" data-manifest.json
@@ -159,7 +161,11 @@ jobs:
           # published with it before any shard writes to it. Rows, not bytes:
           # the file size moves for reasons that have nothing to do with what
           # was collected.
-          Rscript scripts/preflight.R out/ $EXPECT
+          #
+          # The resolved tags go along because the assets alone cannot tell a
+          # cold start from a release that carries nothing: both advertise no
+          # database and no manifest, and only the second one had a tag.
+          Rscript scripts/preflight.R out/ --code-src="$CODE_SRC" --data-src="$DATA_SRC" "${EXPECT[@]}"
 
           # Snapshot the pre-run package set so the release notes can tag
           # each changed package as new-to-the-catalog vs updated. Always
@@ -185,6 +191,11 @@ jobs:
           METRICS_TAG="metrics-${TODAY}"
           MAX_BYTES=2040109465
 
+          # scripts/publish.sh holds publish_release and refresh_heartbeat,
+          # which never leave a draft to build on and fail the step when an
+          # upload does not land.
+          source scripts/publish.sh
+
           # Publish ONE dated release carrying both the code and data metrics DBs
           # (plus both manifests) as assets, with a single notes body. render_notes.R
           # writes the same catalog to release-notes-code.md/-data.md, so either is
@@ -192,42 +203,21 @@ jobs:
           publish_metrics() {
             local f bytes
             for f in bioc-code-metrics.db bioc-data-metrics.db; do
-              bytes=$(stat -c%s "out/$f")
+              bytes=$(file_bytes "out/$f") || return 1
               if [ "$bytes" -gt "$MAX_BYTES" ]; then
                 echo "::error::out/$f is ${bytes} bytes (> ${MAX_BYTES}); refusing to publish ${METRICS_TAG}."
                 return 1
               fi
             done
-            local assets=(out/bioc-code-metrics.db out/bioc-data-metrics.db out/code-manifest.json out/data-manifest.json)
             # Stamp the title with the publish time so a same-day clobber is
             # visibly a fresh update (the dated tag stays daily for retention
             # pruning; --clobber does not move the release's published timestamp).
-            local title="Bioconductor Metrics - ${TODAY} (updated $(date -u +'%H:%M') UTC)"
-            if gh release view "$METRICS_TAG" >/dev/null 2>&1; then
-              # Today's release already exists (an earlier shard this run): clobber ONLY today.
-              gh release upload "$METRICS_TAG" "${assets[@]}" --clobber
-              gh release edit "$METRICS_TAG" --title "$title" --notes-file out/release-notes-code.md
-            else
-              gh release create "$METRICS_TAG" "${assets[@]}" \
-                --title "$title" --notes-file out/release-notes-code.md --latest
-            fi
-          }
-
-          # The universe is keyed on the Bioconductor RELEASE, which moves twice a
-          # year, so between releases every daily run correctly finds nothing to
-          # do and publishes nothing. Consumers that read freshness off the latest
-          # release would then watch this pipeline appear to die for months. Put
-          # the two small manifests back on the release that is already latest, so
-          # last_checked advances daily while last_changed stays at the moment the
-          # data really moved. No database is re-uploaded.
-          refresh_heartbeat() {
-            if [ -z "${PREV_CODE_TAG:-}" ]; then
-              echo "No prior release to carry a heartbeat; nothing to refresh."
-              return 0
-            fi
-            echo "Nothing published this run; refreshing the freshness manifests on ${PREV_CODE_TAG}."
-            gh release upload "$PREV_CODE_TAG" \
-              out/code-manifest.json out/data-manifest.json --clobber
+            local stamp title
+            stamp=$(date -u +'%H:%M') || return 1
+            title="Bioconductor Metrics - ${TODAY} (updated ${stamp} UTC)"
+            publish_release "$METRICS_TAG" "$title" out/release-notes-code.md \
+              out/bioc-code-metrics.db out/bioc-data-metrics.db \
+              out/code-manifest.json out/data-manifest.json || return 1
           }
 
           shard=0
@@ -269,7 +259,9 @@ jobs:
             exit 1
           fi
 
-          [ "$published" -eq 1 ] || refresh_heartbeat
+          if [ "$published" -eq 0 ]; then
+            refresh_heartbeat "${PREV_CODE_TAG:-}" out/code-manifest.json out/data-manifest.json || exit 1
+          fi
 
       - name: Prune old dated releases
         if: ${{ github.event_name == 'schedule' }}
@@ -280,8 +272,9 @@ jobs:
           set -euo pipefail
           # Prune only the consolidated metrics- series. Legacy code-/data- releases
           # are left untouched here and removed by a one-time cleanup once the new
-          # scheme is confirmed.
-          gh release list --limit 1000 --json tagName -q '.[].tagName' \
+          # scheme is confirmed. Drafts are left out so they do not take one of
+          # the KEEP slots from a real release.
+          gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' \
             | { grep "^metrics-" || true; } \
             | Rscript scripts/prune.R \
             | while read -r tag; do
