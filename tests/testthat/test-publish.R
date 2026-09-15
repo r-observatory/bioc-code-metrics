@@ -629,6 +629,82 @@ test_that("the heartbeat has nothing to do without a prior release", {
 })
 
 # ---------------------------------------------------------------------------
+# Drafts no publish comes back for
+# ---------------------------------------------------------------------------
+
+.pub_release <- function(id, tag, draft = FALSE, assets = list()) {
+  list(id = id, tagName = tag, isDraft = draft, isLatest = FALSE, name = "", assets = assets)
+}
+
+.pub_tags <- function(w, drafts) {
+  rs <- Filter(function(r) isTRUE(r$isDraft) == drafts, .pub_state(w))
+  sort(vapply(rs, function(r) r$tagName, ""))
+}
+
+test_that("a draft a failed publish left on an earlier day is deleted once a later day is out", {
+  # A publish replaces a draft only under the tag it publishes, and the prune
+  # leaves drafts out of its listing. This pipeline runs once a day, so a
+  # publish that fails leaves its draft, databases and all, under a tag nothing
+  # publishes again.
+  w <- .pub_world(list(.pub_prior()))
+  .pub_fail(w, "upload-bioc-data-metrics.db", 99L)
+  expect_false(identical(.pub_publish(w, tag = "metrics-2026-09-13")$status, 0L))
+  file.remove(file.path(w$fails, "upload-bioc-data-metrics.db"))
+  .pub_fail(w, "publish", 99L)
+  expect_false(identical(.pub_publish(w, tag = "metrics-2026-09-14")$status, 0L))
+  file.remove(file.path(w$fails, "publish"))
+  expect_identical(.pub_publish(w, tag = "metrics-2026-09-15")$status, 0L)
+  expect_identical(.pub_tags(w, drafts = TRUE), c("metrics-2026-09-13", "metrics-2026-09-14"))
+
+  file.create(w$log)
+  r <- .pub_sh(w, "delete_stale_drafts metrics metrics-2026-09-15 || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_length(.pub_tags(w, drafts = TRUE), 0L)
+  expect_identical(.pub_tags(w, drafts = FALSE), c("metrics-2026-09-12", "metrics-2026-09-15"))
+  deletes <- grep("-X DELETE", .pub_calls(w), value = TRUE, fixed = TRUE)
+  expect_identical(sub(".*/", "", deletes), c("3", "2"))
+  expect_false(any(grepl("^gh release delete", .pub_calls(w))))
+})
+
+test_that("clearing drafts leaves today's draft, other series and every published release alone", {
+  # By id, so a draft beside a published release under the same tag goes and
+  # the published one stays, which a delete by tag cannot promise.
+  w <- .pub_world(list(
+    .pub_release(10L, "code-2026-07-01", draft = TRUE),
+    .pub_prior(),
+    .pub_release(4L, "metrics-2026-09-12", draft = TRUE),
+    .pub_release(5L, "metrics-2026-09-13"),
+    .pub_release(6L, "metrics-2026-09-14", draft = TRUE)))
+  r <- .pub_sh(w, "delete_stale_drafts metrics metrics-2026-09-14 || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(vapply(.pub_state(w), function(x) as.integer(x$id), 1L), c(10L, 1L, 5L, 6L))
+})
+
+test_that("a draft that will not delete waits for the next run, and a listing that fails stops the step", {
+  stale <- list(.pub_prior(), .pub_stranded(),
+                .pub_release(3L, "metrics-2026-09-14", draft = TRUE),
+                .pub_release(4L, "metrics-2026-09-15"))
+  step <- c("delete_stale_drafts metrics metrics-2026-09-15 || exit 1",
+            'echo "went on past the drafts"')
+
+  w <- .pub_world(stale)
+  .pub_fail(w, "api-delete", 1L)
+  r <- .pub_sh(w, step)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_true(grepl("::warning::could not delete the draft metrics-2026-09-14", r$output, fixed = TRUE),
+              info = r$output)
+  expect_identical(.pub_tags(w, drafts = TRUE), "metrics-2026-09-14")
+
+  # A listing that cannot be read is not "no drafts".
+  w <- .pub_world(stale)
+  .pub_fail(w, "api", 1L)
+  r <- .pub_sh(w, step)
+  expect_false(identical(r$status, 0L))
+  expect_false(grepl("went on past the drafts", r$output, fixed = TRUE))
+  expect_length(.pub_tags(w, drafts = TRUE), 2L)
+})
+
+# ---------------------------------------------------------------------------
 # The scripts as written
 # ---------------------------------------------------------------------------
 
@@ -687,6 +763,25 @@ test_that("update.yml resolves only published releases and publishes through scr
   # A draft has no git tag, so --cleanup-tag deletes the release and then fails.
   # Pruning published releases in update.yml is where that flag belongs.
   expect_false(any(grepl("--cleanup-tag", .pub_gh_calls(.pub_script()), fixed = TRUE)))
+})
+
+test_that("the prune clears the drafts a failed publish left on an earlier day", {
+  # Publishing replaces a draft only under today's tag, and the prune's listing
+  # leaves drafts out, so without this a draft from a failed publish stays for
+  # good.
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  start <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  expect_length(start, 1L)
+  prune <- yml[start:length(yml)]
+  expect_true(any(grepl("source scripts/publish.sh", prune, fixed = TRUE)))
+  expect_true(any(grepl('delete_stale_drafts metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1',
+                        prune, fixed = TRUE)))
+
+  sh <- paste(.pub_logical_lines(.pub_script()), collapse = "\n")
+  body <- regmatches(sh, regexpr("(?s)delete_stale_drafts\\(\\) \\{.*?\n\\}", sh, perl = TRUE))
+  expect_length(body, 1L)
+  expect_true(grepl("gh api -X DELETE", body, fixed = TRUE))
+  expect_false(grepl("gh release delete", body, fixed = TRUE))
 })
 
 test_that("update.yml tells preflight which releases it resolved", {

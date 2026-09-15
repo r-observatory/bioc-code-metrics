@@ -16,7 +16,8 @@
 #
 # So a draft is never something to build on, never something to upload into,
 # and a publish that fails partway leaves a draft that nothing resolves. A
-# later publish under the same tag, which means the same day, deletes it.
+# later publish under the same tag, which means the same day, deletes it; once
+# the day has passed, the prune step does (delete_stale_drafts).
 #
 # Every gh call inside these functions ends in `|| return 1`, or sits in an
 # `if`, on purpose. The workflow calls them as `f || exit 1`, and bash ignores
@@ -208,9 +209,9 @@ edit_release() {
 # back first (release_rows). So when the listing has not caught up with a
 # release published under the same tag, the delete can take that release
 # instead, and each repeat is another chance to. A draft the one attempt leaves
-# is deleted by the next publish under the tag. The listing, the uploads, the
-# read-back and the edits land the same however often they run, and each is
-# retried.
+# is deleted by the next publish under the tag, or by delete_stale_drafts once
+# the day has passed. The listing, the uploads, the read-back and the edits
+# land the same however often they run, and each is retried.
 #
 # Databases go up before manifests whatever order they are passed in. The
 # replacement is not atomic, and a manifest newer than the database beside it
@@ -292,4 +293,32 @@ refresh_heartbeat() {
     upload_asset "$tag" "$f" || return 1
   done
   verify_assets "$tag" "$@" || return 1
+}
+
+# Delete the drafts in a series that no publish will come back for.
+#
+# publish_release replaces a draft only under the tag it is publishing, and the
+# prune lists without drafts. This pipeline runs once a day, so a publish that
+# fails in a day's last run leaves its draft under a tag nothing uses again,
+# holding up to both databases, for good. The prune step runs this only after
+# the shard step succeeded, whether that step published or refreshed the
+# heartbeat, and under the workflow's concurrency group, so no publish is part
+# way through a draft. Today's tag is skipped all the same: the next publish
+# today replaces that draft itself.
+#
+# By id, for the reason release_rows gives: a draft can share its tag with a
+# published release. A delete that fails is left for the next scheduled run. A
+# listing that fails stops the step, as the prune's own listing does, rather
+# than reading as no drafts.
+delete_stale_drafts() {
+  local rows id t kind
+  rows=$(release_rows) || return 1
+  while read -r id t kind; do
+    case "$t" in "$1"-*) ;; *) continue ;; esac
+    if [ "$kind" != draft ] || [ "$t" = "$2" ]; then continue; fi
+    echo "deleting the draft ${t} (release ${id}), left by a publish that did not finish"
+    if ! gh api -X DELETE "repos/{owner}/{repo}/releases/${id}"; then
+      echo "::warning::could not delete the draft ${t} (release ${id}); the next scheduled run tries again."
+    fi
+  done <<< "$rows"
 }

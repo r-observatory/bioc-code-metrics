@@ -282,3 +282,11 @@ jobs:
                 echo "pruning $tag"
                 gh release delete "$tag" --yes --cleanup-tag || true
               done
+
+          # That listing leaves drafts out, and a publish replaces a draft only
+          # under its own day's tag, so the draft of a publish that failed on an
+          # earlier day is deleted here or never. scripts/publish.sh says why
+          # this goes by id.
+          # shellcheck source=scripts/publish.sh
+          source scripts/publish.sh
+          delete_stale_drafts metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1
