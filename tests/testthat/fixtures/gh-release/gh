@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# A stand-in for the `gh release` subcommands scripts/publish.sh calls, for
-# tests/testthat/test-publish.R. Nothing here touches the network.
+# A stand-in for the `gh release` subcommands and the `gh api` calls
+# scripts/publish.sh makes, for tests/testthat/test-publish.R. Nothing here
+# touches the network.
 #
 # It models the parts of gh 2.100.0 that decide whether a publish can strand a
 # draft, read from gh's own source when metrics-2026-09-13 was stranded in the
 # sibling cran-code-metrics pipeline:
 #   - `release list` returns drafts unless --exclude-drafts is passed.
-#   - `view`, `upload`, `edit` and `delete` find a release by tag, and fall
-#     back to a draft carrying that pending tag when no published one exists.
+#   - `view`, `upload`, `edit` and `delete` find a release by tag. gh looks the
+#     tag up as a published release and as a draft at the same time and takes
+#     whichever answer comes back first, so when both exist its choice is a
+#     race. This fake always takes the published one, the choice that loses a
+#     day's databases, so a path that deletes by tag in that state shows it.
+#   - `api` lists every release with its id, newest first as REST orders them,
+#     and deletes one by id. The {owner}/{repo} placeholders stay literal.
 #   - `upload --clobber` deletes the existing asset before the new one lands.
 #   - `delete --cleanup-tag` deletes the release and then fails, because a
 #     draft has no git tag to clean up.
@@ -22,6 +28,8 @@
 #   publish         `edit --draft=false` returns HTTP 500 and changes nothing
 #   list            `release list` returns HTTP 500
 #   view            `release view` returns HTTP 502
+#   api             `api` listing the releases returns HTTP 500
+#   api-delete      `api -X DELETE` of a release by id returns HTTP 500
 # Anything this fake does not model exits 2, so a publish that starts calling
 # gh some other way fails its test instead of passing by accident.
 set -u
@@ -42,13 +50,45 @@ take_failure() {
 }
 
 # The id of the release a tag names: the published one if there is one, else a
-# draft carrying that tag, as gh's FetchRelease does.
+# draft carrying that tag. gh's FetchRelease races the two lookups instead; see
+# the top of this file for why the fake settles that race this way.
 resolve() {
   state | jq -e --arg t "$1" '
     ([.[] | select(.tagName == $t and (.isDraft | not))] +
      [.[] | select(.tagName == $t and .isDraft)]) | .[0].id' 2>/dev/null ||
     die "release not found"
 }
+
+if [ "${1:-}" = api ]; then
+  shift
+  method=GET; path=""; query=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X) method="$2"; shift ;;
+      -q) query="$2"; shift ;;
+      --paginate) ;;
+      -*) die "fake gh: unsupported api argument $1" 2 ;;
+      *) [ -z "$path" ] || die "fake gh: more than one api path" 2; path="$1" ;;
+    esac
+    shift
+  done
+  case "$method $path" in
+    "GET repos/{owner}/{repo}/releases?per_page=100")
+      if take_failure api; then die "HTTP 500 (GET releases)"; fi
+      state | jq -r "[sort_by(-.id)[] | {id, tag_name: .tagName, draft: .isDraft, name, assets}] | ${query:-.}"
+      ;;
+    "DELETE repos/{owner}/{repo}/releases/"*)
+      id="${path##*/}"
+      case "$id" in ""|*[!0-9]*) die "fake gh: not a release id: $id" 2 ;; esac
+      if take_failure api-delete; then die "HTTP 500 (DELETE releases/$id)"; fi
+      state | jq -e --argjson id "$id" 'any(.[]; .id == $id)' > /dev/null ||
+        die "HTTP 404: Not Found (DELETE releases/$id)"
+      state | jq --argjson id "$id" 'map(select(.id != $id))' | save
+      ;;
+    *) die "fake gh: unsupported api call $method $path" 2 ;;
+  esac
+  exit 0
+fi
 
 [ "${1:-}" = release ] || die "fake gh: unsupported command ${1:-}" 2
 sub="${2:-}"

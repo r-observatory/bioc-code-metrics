@@ -80,6 +80,35 @@ release_state() {
   return 1
 }
 
+# Every release as "<id> <tag> draft|published", newest first. REST rather
+# than `gh release list`, which has no id to give. An id is the only safe way
+# to name one of two releases under the same tag: `gh release delete TAG`
+# looks the tag up as a published release and as a draft at the same time and
+# acts on whichever answer comes back first.
+release_rows() {
+  gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
+    -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"' || return 1
+}
+
+# "  id <id>: draft|published" for each release under TAG, for the operator.
+release_ids() {
+  local rows id t kind
+  rows=$(release_rows) || return 1
+  while read -r id t kind; do
+    if [ "$t" = "$1" ]; then echo "  id ${id}: ${kind}"; fi
+  done <<< "$rows"
+}
+
+# Refuse a tag that more than one release carries, and tell the operator how to
+# clear it without a delete by tag, naming each release under it by id. $2 is
+# what is being refused. Always returns 1.
+refuse_doubled_tag() {
+  echo "::error::more than one release is named $1; $2 Delete the draft ones by id, with \`gh api -X DELETE repos/{owner}/{repo}/releases/<id>\`, then re-run. A delete by tag cannot choose between them and can take the published one."
+  release_ids "$1" ||
+    echo "  could not list their ids; \`gh api 'repos/{owner}/{repo}/releases?per_page=100' --paginate\` shows them."
+  return 1
+}
+
 # Upload one file to a release, replacing an asset of the same name. gh makes
 # the delete that --clobber sends first only once, then tries the upload four
 # times 200 ms apart. A GitHub incident lasting minutes outlives both, so this
@@ -165,7 +194,7 @@ publish_release() {
       gh release delete "$tag" --yes || return 1
       state="" ;;
     *)
-      echo "::error::more than one release is named ${tag} ($(printf '%s' "$state" | tr '\n' ',')). Delete the draft ones with \`gh release delete ${tag} --yes\` (no --cleanup-tag) until one is left, then re-run."
+      refuse_doubled_tag "$tag" "refusing to publish into it."
       return 1 ;;
   esac
 
@@ -214,7 +243,7 @@ refresh_heartbeat() {
       echo "::error::no release is named ${tag} any more; refusing to refresh the freshness manifests on it."
       return 1 ;;
     *)
-      echo "::error::more than one release is named ${tag}; refusing to guess which one carries the heartbeat."
+      refuse_doubled_tag "$tag" "refusing to guess which one carries the heartbeat."
       return 1 ;;
   esac
   echo "Nothing published this run; refreshing the freshness manifests on ${tag}."

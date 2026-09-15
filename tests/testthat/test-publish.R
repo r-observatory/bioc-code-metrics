@@ -318,6 +318,41 @@ test_that("more than one release under today's tag is refused and left alone", {
   expect_length(.pub_releases(w, "metrics-2026-09-13"), 2L)
 })
 
+# Yesterday's release, today's published release and a draft under today's tag.
+.pub_doubled <- function() {
+  prior <- .pub_prior()
+  prior$isLatest <- FALSE
+  today <- .pub_prior()
+  today$id <- 2L
+  today$tagName <- "metrics-2026-09-13"
+  draft <- .pub_stranded()
+  draft$id <- 3L
+  list(prior, today, draft)
+}
+
+test_that("the refusal over two releases under one tag names them by id, not by tag", {
+  # `gh release delete TAG` looks the tag up as a published release and as a
+  # draft at the same time and deletes whichever answer arrives first, so the
+  # advice to run it could take today's published release and keep the draft.
+  w <- .pub_world(.pub_doubled())
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("id 2: published", r$output, fixed = TRUE), info = r$output)
+  expect_true(grepl("id 3: draft", r$output, fixed = TRUE), info = r$output)
+  expect_false(grepl("id 1:", r$output, fixed = TRUE))
+  expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>", r$output, fixed = TRUE))
+  expect_false(grepl("gh release delete", r$output, fixed = TRUE))
+  expect_false(any(grepl("^gh release (create|delete|upload|edit) |-X DELETE", .pub_calls(w))))
+  expect_length(.pub_state(w), 3L)
+
+  # The ids could not be read: still refused, and it says where to find them.
+  .pub_fail(w, "api", 1L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("could not list their ids", r$output, fixed = TRUE), info = r$output)
+  expect_length(.pub_state(w), 3L)
+})
+
 test_that("databases go up before manifests, whatever order they are passed in", {
   # A manifest must never be newer than the database beside it: preflight reads
   # a database behind its manifest as lost rows.
@@ -457,6 +492,19 @@ test_that("the heartbeat refuses to write into a draft", {
   expect_length(.pub_uploads(w), 0L)
 })
 
+test_that("the heartbeat refuses a doubled tag and names the releases by id", {
+  # Every daily run refuses until someone clears the draft, so the refusal has
+  # to say how to do that without a delete by tag.
+  w <- .pub_world(.pub_doubled())
+  r <- .pub_heartbeat(w, "metrics-2026-09-13")
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("id 2: published", r$output, fixed = TRUE), info = r$output)
+  expect_true(grepl("id 3: draft", r$output, fixed = TRUE), info = r$output)
+  expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>", r$output, fixed = TRUE))
+  expect_length(.pub_uploads(w), 0L)
+  expect_length(.pub_state(w), 3L)
+})
+
 test_that("the heartbeat fails when its upload never lands", {
   w <- .pub_world(list(.pub_prior()))
   .pub_fail(w, "upload-data-manifest.json", 99L)
@@ -517,7 +565,7 @@ test_that("the heartbeat has nothing to do without a prior release", {
 .pub_gh_calls <- function(path) {
   lines <- .pub_logical_lines(path)
   lines <- lines[!grepl("^\\s*#", lines)]
-  grep("(^|[\\s$(;])gh release ", lines, value = TRUE, perl = TRUE)
+  grep("(^|[\\s$(;])gh (release|api) ", lines, value = TRUE, perl = TRUE)
 }
 
 test_that("every gh call in scripts/publish.sh stops the function when it fails", {
@@ -528,9 +576,10 @@ test_that("every gh call in scripts/publish.sh stops the function when it fails"
   expect_true(length(gh) > 0L)
   lines <- .pub_logical_lines(.pub_script())
   lines <- lines[!grepl("^\\s*#", lines)]
-  helpers <- grep("\\b(release_state|upload_asset|verify_assets|file_bytes) ", lines,
+  helpers <- grep("\\b(release_state|release_rows|upload_asset|verify_assets|file_bytes)[ )]", lines,
                   value = TRUE, perl = TRUE)
-  expect_gte(length(helpers), 5L)
+  expect_gte(length(helpers), 6L)
+  expect_true(any(grepl("gh api ", gh, fixed = TRUE)))
   calls <- c(gh, helpers)
   guarded <- grepl("\\|\\| return 1", calls) |
     grepl("^\\s*if !? ?([a-z_]+=\\$\\()?gh ", calls)
