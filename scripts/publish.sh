@@ -667,7 +667,8 @@ swap_asset() {
 #
 # The upload goes through a symlink because the database is 1.9 GB and gh names
 # an asset after the basename of the path it is given: the link gives the file
-# the temporary name without a second copy of it.
+# the temporary name without a second copy of it. replace_asset makes that link
+# and takes it down again; this is the replacement it goes through.
 #
 # The temporary name goes in front of the real one rather than after it,
 # because the name decides two things that outlive it. GitHub reads the
@@ -690,17 +691,16 @@ swap_asset() {
 # reads can be taken away again. So every upload onto a published release goes
 # up as swap-next-NAME and is measured before it is given a name, and the only
 # thing an empty NAME changes is that nothing is moved aside first.
-replace_asset() {
-  local tag="$1" rel="$2" file="$3" name size sha live new stage
+replace_staged_asset() {  # $1=tag $2=release id $3=file $4=link to upload through
+  local tag="$1" rel="$2" file="$3" link="$4" name size sha live new
   name=$(basename "$file")
   size=$(file_bytes "$file") || return 1
   sha=$(file_sha256 "$file") || return 1
   live=$(repair_asset "$rel" "$name") || return 1
 
-  stage="$(dirname "$file")/.swap-stage"
-  mkdir -p "$stage" || return 1
-  ln -sfn "../${name}" "${stage}/swap-next-${name}" || return 1
-  upload_asset "$tag" "${stage}/swap-next-${name}" || return 1
+  mkdir -p "$(dirname "$link")" || return 1
+  ln -sfn "../${name}" "$link" || return 1
+  upload_asset "$tag" "$link" || return 1
   # Bytes the check refused are taken off the release rather than left under
   # the temporary name, where the repair would read them as an upload nobody
   # got round to swapping in and give them the name (discard_asset).
@@ -709,7 +709,30 @@ replace_asset() {
     return 1
   fi
   swap_asset "$rel" "$name" "${live%% *}" "${new%% *}" || return 1
-  rm -f "${stage}/swap-next-${name}"
+}
+
+# Replace one asset of a published release, and take the link the upload went
+# through down again, however the replacement ended.
+#
+# The link is this machine's, not the release's. It is named after the asset
+# and points at a path out/ holds only while the run that wrote it is going, so
+# one left behind outlives its file, and the next replacement of that asset
+# uploads through a link an earlier run made rather than one it made itself.
+# Only the run that finished took its link down, so every refused replacement
+# left one, all of them dangling by the end of the run.
+#
+# The name is built here rather than by the replacement, so that what is
+# uploaded and what is taken down cannot come apart. Whether the link comes
+# down says nothing about the asset, which is on the release or it is not
+# either way, so a delete that fails is said out loud and the replacement's own
+# answer is what the caller gets.
+replace_asset() {
+  local link rc=0
+  link="$(dirname "$3")/.swap-stage/swap-next-$(basename "$3")"
+  replace_staged_asset "$1" "$2" "$3" "$link" || rc=$?
+  rm -f "$link" ||
+    echo "::warning::could not remove ${link}, the link $(basename "$3") was uploaded through; delete it, because the next replacement of that asset uploads through a link of the same name."
+  return "$rc"
 }
 
 # Edit TAG with the gh release edit flags that follow, up to five times, 10 s,

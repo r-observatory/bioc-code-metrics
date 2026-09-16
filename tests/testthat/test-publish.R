@@ -726,6 +726,12 @@ test_that("a read waits ten seconds longer after each failed attempt", {
   sprintf("%s %d sha256:%s", name, size, digest::digest(paste(name, size), algo = "sha256"))
 }
 
+# What out/.swap-stage holds afterwards: the links a replacement uploads
+# through, each of them dangling once out/ is written again.
+.pub_stage_left <- function(w) {
+  list.files(file.path(w$dir, "out", ".swap-stage"), all.files = TRUE, no.. = TRUE)
+}
+
 test_that("a second shard uploads beside the live asset and renames it into place", {
   w <- .pub_shard_world()
   before <- .pub_assets(w, "metrics-2026-09-13")
@@ -945,6 +951,52 @@ test_that("a clearing that could not read the release says the bytes may not be 
   expect_length(grep("^::error::", lines), 1L)
   expect_true(grepl("failed to list the assets of release 2", grep("^::error::", lines, value = TRUE),
                     fixed = TRUE))
+})
+
+test_that("the link a replacement uploads through is taken down again", {
+  # The upload goes through a link that gives the database the temporary name
+  # without a second copy of 1.9 GB of it. Each link is named after the asset it
+  # stages and points into out/, which holds that file only while the run that
+  # wrote it is going, so one left behind outlives its file and is what a later
+  # replacement of the same asset uploads through.
+  w <- .pub_shard_world()
+  expect_identical(.pub_publish(w)$status, 0L)
+  .pub_expect_published(w)
+  expect_identical(.pub_stage_left(w), character(0L))
+
+  # And a refusal leaves nothing behind either, wherever it stops: before the
+  # upload lands, after the check reads bytes it refuses, or between the two
+  # renames, with the name on neither copy.
+  for (fault in c("upload-swap-next-bioc-code-metrics.db",
+                  "short-swap-next-bioc-code-metrics.db",
+                  "starter-swap-next-bioc-code-metrics.db",
+                  "patch-bioc-code-metrics.db")) {
+    w <- .pub_shard_world()
+    .pub_fail(w, fault, 99L)
+    expect_false(identical(.pub_publish(w)$status, 0L), info = fault)
+    expect_identical(.pub_stage_left(w), character(0L), info = fault)
+  }
+})
+
+test_that("a link that will not come down is named, and answers for nothing else", {
+  # The link is this machine's and the asset is on the release whatever becomes
+  # of it, so an `rm` that fails must not turn a replacement that landed into a
+  # run that failed, which is the day's release thrown away and the analysis
+  # run again.
+  w <- .pub_shard_world()
+  writeLines(c("#!/usr/bin/env bash",
+               'case "$*" in',
+               '  *.swap-stage*) echo "rm: read-only file system" >&2; exit 1 ;;',
+               'esac',
+               'exec /bin/rm "$@"'), file.path(w$bin, "rm"))
+  Sys.chmod(file.path(w$bin, "rm"), "755")
+
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  said <- grep("^::warning::could not remove out/\\.swap-stage/swap-next-",
+               strsplit(r$output, "\n", fixed = TRUE)[[1L]], value = TRUE)
+  expect_length(said, 4L)
 })
 
 test_that("the first rename failing leaves the release exactly as it was", {
@@ -1652,7 +1704,7 @@ test_that("a sweep that cannot read a release stops the step", {
 .PUB_HELPERS <- paste0(
   "release_state|release_rows|release_id|release_assets|upload_asset|verify_assets|",
   "verify_asset|edit_release|file_bytes|file_sha256|rename_asset|delete_asset|",
-  "repair_asset|repair_release|swap_asset|replace_asset")
+  "repair_asset|repair_release|swap_asset|replace_asset|replace_staged_asset")
 
 test_that("every gh call in scripts/publish.sh stops the function when it fails", {
   # A function called as `f || exit 1` runs with errexit off, so a failed gh
@@ -1667,8 +1719,9 @@ test_that("every gh call in scripts/publish.sh stops the function when it fails"
   expect_true(any(grepl("gh api ", gh, fixed = TRUE)))
   calls <- c(gh, helpers)
   # Either the line returns when the call fails, or the call is the condition
-  # of an if, where its status is read rather than dropped.
-  guarded <- grepl("\\|\\| return 1", calls) |
+  # of an if, or its status is kept to be answered with once the line after it
+  # has run. All three read it rather than dropping it.
+  guarded <- grepl("\\|\\| return 1", calls) | grepl("\\|\\| rc=\\$\\?", calls) |
     grepl(sprintf("^\\s*if !? ?([a-z_]+=\\$\\()?(gh|%s) ", .PUB_HELPERS), calls)
   expect_true(all(guarded), info = paste(calls[!guarded], collapse = "\n"))
 })
@@ -1685,16 +1738,27 @@ test_that("nothing in scripts/publish.sh clobbers an asset a reader asks for by 
   # The one upload takes whatever path it is handed, and both callers of the
   # swap hand it a name nothing reads.
   sh <- paste(lines, collapse = "\n")
-  swap <- regmatches(sh, regexpr("(?s)replace_asset\\(\\) \\{.*?\n\\}", sh, perl = TRUE))
-  expect_length(swap, 1L)
-  expect_true(grepl("swap-next-", swap, fixed = TRUE))
-  expect_true(grepl("repair_asset", swap, fixed = TRUE))
-  # One upload, under the temporary name, however little the release carries
-  # under the real one. An upload onto the name a reader asks for is one the
-  # run cannot take back when it measures those bytes and refuses them.
-  ups <- grep("upload_asset ", strsplit(swap, "\n", fixed = TRUE)[[1L]], value = TRUE)
+  body <- function(fn) {
+    got <- regmatches(sh, regexpr(sprintf("(?s)%s\\(\\) \\{.*?\n\\}", fn), sh, perl = TRUE))
+    expect_length(got, 1L)
+    strsplit(got, "\n", fixed = TRUE)[[1L]]
+  }
+  # replace_asset names the link the upload goes through and takes it down
+  # again; replace_staged_asset is the replacement that goes through it, so the
+  # two are read together.
+  swap <- c(body("replace_asset"), body("replace_staged_asset"))
+  expect_true(any(grepl("swap-next-", swap, fixed = TRUE)))
+  expect_true(any(grepl("repair_asset", swap, fixed = TRUE)))
+  # One upload, through the link, however little the release carries under the
+  # real name. An upload onto the name a reader asks for is one the run cannot
+  # take back when it measures those bytes and refuses them, so the name the
+  # link carries is a temporary one.
+  ups <- grep("upload_asset ", swap, value = TRUE)
   expect_length(ups, 1L)
-  expect_true(grepl("swap-next-", ups, fixed = TRUE), info = ups)
+  expect_true(grepl("\"$link\"", ups, fixed = TRUE), info = ups)
+  named <- grep("link=", body("replace_asset"), value = TRUE)
+  expect_length(named, 1L)
+  expect_true(grepl("swap-next-", named, fixed = TRUE), info = named)
 })
 
 test_that("update.yml resolves only published releases and publishes through scripts/publish.sh", {
