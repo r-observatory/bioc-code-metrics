@@ -151,6 +151,19 @@
   sprintf("%s %s %s", a$id, a$size, a$state)
 }
 
+# Take an asset off a release between two runs, by name. It stands for the
+# ways a live name goes missing that no run performs: an upload cut off under
+# it and cleared, or a delete by hand.
+.pub_drop_asset <- function(w, tag, name) {
+  releases <- lapply(.pub_state(w), function(rel) {
+    if (identical(rel$tagName, tag)) {
+      rel$assets <- Filter(function(a) !identical(a$name, name), rel$assets)
+    }
+    rel
+  })
+  jsonlite::write_json(releases, w$state, auto_unbox = TRUE)
+}
+
 # Read a release the way the merger does: by name, through gh. Answers the
 # fake's stand-in for the bytes, "<name> <size> <digest>", or fails the way gh
 # does when nothing carries the name.
@@ -861,6 +874,49 @@ test_that("a temporary asset still half-written after the upload never takes the
   expect_identical(read$output, .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
 })
 
+test_that("a staging copy the run refused is taken off the release", {
+  # Nothing downloads swap-next-<name>, so bytes left under it serve no reader,
+  # and the repair gives that name to <name> when the release has lost <name>
+  # itself. The one copy this run measured against the file and refused would
+  # then be the copy a later run puts in front of readers, without measuring it
+  # again, so the run that refused it clears it.
+  for (how in c("short", "corrupt", "starter")) {
+    w <- .pub_shard_world()
+    .pub_fail(w, sprintf("%s-swap-next-bioc-code-metrics.db", how), 99L)
+    r <- .pub_publish(w)
+    expect_false(identical(r$status, 0L), info = how)
+    expect_false("swap-next-bioc-code-metrics.db" %in%
+                   names(.pub_assets(w, "metrics-2026-09-13")), info = how)
+    # Said out loud, in the same breath as the refusal, because bytes that were
+    # uploaded are being taken away.
+    expect_true(grepl("clearing swap-next-bioc-code-metrics.db", r$output, fixed = TRUE),
+                info = paste(how, r$output))
+    # The asset a reader asks for kept its name and its bytes throughout.
+    expect_length(.pub_renames(w), 0L)
+    expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                     .pub_seeded_bytes("bioc-code-metrics.db", 4000L), info = how)
+  }
+})
+
+test_that("a staging copy the run cannot clear is named by id for the operator", {
+  # Best effort: the run is already failing, and the delete is one more call
+  # that can get a 500. What it cannot do quietly is leave bytes nobody has
+  # judged under a name the repair reads, so the refusal names the asset by id
+  # and says what a later run does with it.
+  w <- .pub_shard_world()
+  .pub_fail(w, "short-swap-next-bioc-code-metrics.db", 99L)
+  .pub_fail(w, "asset-delete", 99L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  left <- .pub_assets(w, "metrics-2026-09-13")[["swap-next-bioc-code-metrics.db"]]
+  expect_true(grepl(sprintf("asset %s", left$id), r$output, fixed = TRUE), info = r$output)
+  expect_true(grepl("delete it by id", r$output, fixed = TRUE), info = r$output)
+  # A delete it could not make is not a reason to touch the live asset.
+  expect_length(.pub_renames(w), 0L)
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
+})
+
 test_that("the first rename failing leaves the release exactly as it was", {
   w <- .pub_shard_world()
   .pub_fail(w, "patch-swap-prev-bioc-code-metrics.db", 99L)
@@ -1053,6 +1109,34 @@ test_that("a live name holding an upload that was cut off is cleared and uploade
   expect_false("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
   expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
                    .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("a staging copy that was refused is never the copy a later repair promotes", {
+  # The repair gives <name> to a finished swap-next-<name> when the release
+  # carries no <name>, which is what saves a day whose run stopped after the
+  # upload and before the swap. It cannot tell that copy apart from one a run
+  # measured and refused, so the run that refused it is the only thing that can
+  # keep it out of that answer.
+  w <- .pub_shard_world()
+  .pub_fail(w, "short-swap-next-bioc-code-metrics.db", 99L)
+  expect_false(identical(.pub_publish(w)$status, 0L))
+
+  # The release then loses the name itself, which is the state that makes the
+  # repair reach for a staging copy.
+  .pub_drop_asset(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  file.create(w$log)
+  r <- .pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_length(.pub_renames(w), 0L)
+  expect_length(.pub_asset_deletes(w), 0L)
+  expect_false("bioc-code-metrics.db" %in% names(.pub_assets(w, "metrics-2026-09-13")))
+  # Nobody is handed the refused bytes under the name: a reader asking for it
+  # is told there is no such asset, which is what preflight refuses to build on
+  # and what the next run replaces.
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_false(identical(read$status, 0L))
+  expect_true(grepl("no assets match the file pattern", read$output, fixed = TRUE),
+              info = read$output)
 })
 
 test_that("a run stopped between the renames is repaired before the release is read", {

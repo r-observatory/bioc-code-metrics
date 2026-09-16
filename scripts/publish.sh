@@ -347,6 +347,39 @@ verify_asset() {
   return 1
 }
 
+# Take NAME off release REL, because this run measured those bytes against the
+# file they came from and refused them.
+#
+# Nothing downloads swap-next-NAME, so bytes left under it serve no reader, and
+# leaving them costs something: the repair gives that name to NAME when the
+# release has lost NAME itself, and it cannot tell a staged upload a run
+# refused from one a run was interrupted before it could swap in. So the copy
+# this run proved wrong would be the copy a later one puts in front of readers,
+# without measuring it again, and the run that refused it is the only thing
+# that can keep it out of that answer.
+#
+# Best effort, and never the caller's exit status: the caller is already
+# failing, and this is one more call that can get a 500. What it does not do is
+# go quietly, so a delete that does not land names the asset by id and says
+# what a later run does with it.
+discard_asset() {
+  local rel="$1" name="$2" rows row id
+  if ! rows=$(release_assets "$rel"); then
+    echo "::error::could not read the assets of release ${rel} to clear ${name}, which holds bytes this run refused; delete it by id, because a run that finds the release has lost the asset it was staged for gives that name to these bytes without measuring them again."
+    return 0
+  fi
+  row=$(asset_row "$rows" "$name")
+  if [ -z "$row" ]; then
+    return 0
+  fi
+  id="${row%% *}"
+  echo "clearing ${name} on release ${rel}, asset ${id}, which holds bytes this run refused"
+  if ! delete_asset "$id"; then
+    echo "::error::could not clear ${name} (asset ${id}) on release ${rel}; delete it by id, because a run that finds the release has lost the asset it was staged for gives that name to these bytes without measuring them again."
+  fi
+  return 0
+}
+
 # Put back whatever an interrupted replacement left of NAME on release REL,
 # before anything else touches it.
 #
@@ -375,7 +408,10 @@ verify_asset() {
 #   the old manifest is the pair the day started with.
 #
 #   No NAME, only a finished swap-next-NAME. What deleting before uploading
-#   leaves. The bytes are whole, so they take the name.
+#   leaves. The bytes are whole, so they take the name. Nothing here has
+#   measured them against the file they came from, so a run that did measure a
+#   staged upload and refused it takes that copy off the release itself
+#   (discard_asset) rather than leaving it for this rule to promote.
 #
 #   No NAME, only a half-written swap-next-NAME. Nothing servable is left.
 #   Delete it; the caller is about to upload the name again, and when no
@@ -583,7 +619,13 @@ replace_asset() {
   mkdir -p "$stage" || return 1
   ln -sfn "../${name}" "${stage}/swap-next-${name}" || return 1
   upload_asset "$tag" "${stage}/swap-next-${name}" || return 1
-  new=$(verify_asset "$rel" "swap-next-${name}" "$size" "$sha") || return 1
+  # Bytes the check refused are taken off the release rather than left under
+  # the temporary name, where the repair would read them as an upload nobody
+  # got round to swapping in and give them the name (discard_asset).
+  if ! new=$(verify_asset "$rel" "swap-next-${name}" "$size" "$sha"); then
+    discard_asset "$rel" "swap-next-${name}"
+    return 1
+  fi
   swap_asset "$rel" "$name" "${live%% *}" "${new%% *}" || return 1
   rm -f "${stage}/swap-next-${name}"
 }
