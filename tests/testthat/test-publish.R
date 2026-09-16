@@ -1003,6 +1003,46 @@ test_that("the swap waits longer after each failed rename, in seconds not tens o
   expect_identical(readLines(slept), c("2", "4", "2", "4"))
 })
 
+test_that("a listing that has not caught up with the second rename is read again", {
+  # A listing taken inside 40 ms of a rename that answered 200 has been seen
+  # still showing the state before it. Read once, a swap that had worked looked
+  # like one that had not, and what followed was a rollback asking for a name
+  # the new upload already held: 422, and a run that ended red saying the
+  # release carried no database while it was carrying today's.
+  w <- .pub_shard_world()
+  before <- .pub_assets(w, "metrics-2026-09-13")
+  .pub_fail(w, "lag-bioc-code-metrics.db", 2L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  # One rename onto the name, and nothing moved back.
+  expect_length(grep(" bioc-code-metrics.db$", .pub_renames(w)), 1L)
+  expect_identical(.pub_assets(w, "metrics-2026-09-13")[["swap-prev-bioc-code-metrics.db"]]$id,
+                   before[["bioc-code-metrics.db"]]$id)
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("a listing that never catches up fails saying what it read, and moves nothing", {
+  # Five reads apart cannot be told from a rename that never landed, so the run
+  # still fails. What it must not do is put the old copy back: the rename
+  # answered, so that asks for a name the new upload already holds, and the
+  # message must say what was read rather than that the release lost the name.
+  w <- .pub_shard_world()
+  .pub_fail(w, "lag-bioc-code-metrics.db", 5L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_length(grep(" bioc-code-metrics.db$", .pub_renames(w)), 1L)
+  expect_true(grepl("five reads of release 2 still list bioc-code-metrics.db as [nothing]",
+                    r$output, fixed = TRUE), info = r$output)
+  expect_false(grepl("could not be renamed back", r$output, fixed = TRUE))
+  # The release was right all along, which is the point: nothing was undone.
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+  # It stopped there rather than replacing the rest.
+  expect_false(any(grepl("bioc-data-metrics", .pub_uploads(w), fixed = TRUE)))
+})
+
 test_that("a name that cannot be put back is restored from the previous copy next time", {
   # The one state that hurts: the release carries no bioc-code-metrics.db, so a
   # by-name read fails and the next run's preflight would refuse the release it

@@ -564,7 +564,7 @@ repair_release() {
 # about 50 s with nothing under the name, against a swap that measured half a
 # second when the renames land. Four waits of 2/4/6/8 hold both to about 20 s.
 swap_asset() {
-  local rel="$1" name="$2" old="$3" new="$4" rows n renamed
+  local rel="$1" name="$2" old="$3" new="$4" rows row n renamed gave
   if [ -z "$new" ]; then
     echo "::error::release ${rel} does not carry swap-next-${name}; refusing to swap it in."
     return 1
@@ -589,8 +589,10 @@ swap_asset() {
 
   # From here until this lands a reader asking for NAME gets nothing, so the
   # attempts are seconds apart rather than tens of seconds.
+  gave=""
   for n in 1 2 3 4 5; do
     if rename_asset "$new" "$name"; then
+      gave=yes
       break
     fi
     echo "attempt ${n}: could not give ${name} to the new upload on release ${rel}"
@@ -600,9 +602,38 @@ swap_asset() {
   # The release decides, not the PATCH. One that returns 500 can still have
   # applied, and the retry after it renames the same id to the name it already
   # holds, which is a 200 that changes nothing.
-  rows=$(release_assets "$rel") || return 1
-  if [ "$(asset_row "$rows" "$name" | cut -d' ' -f1)" = "$new" ]; then
-    return 0
+  #
+  # Read up to five times, not once. A rename that answers 200 is not the same
+  # thing as every read of the release agreeing with it: a listing taken inside
+  # 40 ms of one has been seen still showing the state before it. Read once, a
+  # swap that had worked looked like one that had not, and the rollback below
+  # then asked for a name the new upload already held, got 422, and ended the
+  # run red saying the release carried no NAME while it was carrying exactly
+  # what it should.
+  #
+  # These reads are spaced like the renames, 2 s and up rather than 10 s and
+  # up, because until one of them agrees the run does not know whether a reader
+  # is finding NAME, and the answer it is waiting for takes about half a second
+  # when the renames land.
+  for n in 1 2 3 4 5; do
+    rows=$(release_assets "$rel") || return 1
+    row=$(asset_row "$rows" "$name")
+    if [ "${row%% *}" = "$new" ]; then
+      return 0
+    fi
+    echo "attempt ${n}: release ${rel} lists ${name} as [${row:-nothing}], not the new upload (asset ${new})"
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 2; fi
+  done
+
+  # Five reads apart cannot be told from a rename that never landed, so the run
+  # fails either way. What it does about it is decided by the rename's own
+  # answer, because that is the one thing the listing is not telling it. A
+  # rename that answered leaves nothing to roll back to: putting the old copy
+  # back would ask for a name the new upload already holds, and the release is
+  # far more likely to be carrying the swap than to have lost the name.
+  if [ -n "$gave" ]; then
+    echo "::error::${name} on release ${rel} was given to the new upload, but five reads of release ${rel} still list ${name} as [${row:-nothing}], not asset ${new}. Nothing was moved back, because the rename answered and putting the old copy back would ask for a name the new upload already holds. The repair at the start of the next run settles whatever the release is carrying."
+    return 1
   fi
   if [ -z "$old" ]; then
     echo "::error::${name} on release ${rel} could not be given to the new upload, and the release carried no ${name} before this run, so it carries none now. The bytes are whole under swap-next-${name}, and the repair at the start of the next run gives them the name."

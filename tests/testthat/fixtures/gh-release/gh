@@ -83,6 +83,10 @@
 #   patch-<name>    the PATCH that renames an asset TO <name> returns HTTP 500
 #                   and changes nothing
 #   patch-after-<name>  that PATCH applies, then returns HTTP 500
+#   lag-<name>      that PATCH applies and answers 200, and then the next N
+#                   reads of the release's assets still show the state it
+#                   found, as a listing taken inside the window of a write
+#                   that has already answered does
 #   asset-delete    `api -X DELETE` of an asset by id returns HTTP 500
 # Anything this fake does not model exits 2, so a publish that starts calling
 # gh some other way fails its test instead of passing by accident.
@@ -130,9 +134,11 @@ resolve() {
 }
 
 # The assets of one release, as the REST endpoint gives them: every asset,
-# ordered by its current name.
+# ordered by its current name. $2 is the state to read them out of, so a
+# listing that has not caught up with the last write can be answered from the
+# state before it.
 assets_of() {
-  state | jq --argjson id "$1" '[.[] | select(.id == $id)][0].assets | sort_by(.name)'
+  jq --argjson id "$1" '[.[] | select(.id == $id)][0].assets | sort_by(.name)' "${2:-$GH_STATE}"
 }
 
 if [ "${1:-}" = api ]; then
@@ -179,7 +185,13 @@ if [ "${1:-}" = api ]; then
       if take_failure api-assets; then api_die 500 "GET releases/$rel/assets"; fi
       state | jq -e --argjson id "$rel" 'any(.[]; .id == $id)' > /dev/null ||
         api_die 404 "GET releases/$rel/assets"
-      assets_of "$rel" | jq -r "${query:-.}"
+      # A listing taken inside the window of a rename that has answered can
+      # still show the state before it, which "lag-<name>" sets up.
+      if [ -f "$GH_STATE.lagging" ] && take_failure lag-assets; then
+        assets_of "$rel" "$GH_STATE.lagging" | jq -r "${query:-.}"
+      else
+        assets_of "$rel" | jq -r "${query:-.}"
+      fi
       ;;
     "PATCH repos/{owner}/{repo}/releases/assets/"*)
       aid="${bare##*/}"
@@ -193,6 +205,14 @@ if [ "${1:-}" = api ]; then
            ([.[] | select(any(.assets[]; .id == $a))][0].assets // [])
            | any(.[]; .id != $a and ((.name | ascii_downcase) == ($n | ascii_downcase)))' > /dev/null; then
         api_die 422 "PATCH assets/$aid"
+      fi
+      # A write that has answered is not the same thing as every read agreeing
+      # with it. "lag-<name>" hands the next N assets listings the state this
+      # PATCH found, so a caller reading the release straight after a rename
+      # that returned 200 sees what it was before.
+      if [ -s "$GH_FAILS/lag-$field" ] && [ "$(cat "$GH_FAILS/lag-$field")" -gt 0 ]; then
+        cp "$GH_STATE" "$GH_STATE.lagging"
+        mv "$GH_FAILS/lag-$field" "$GH_FAILS/lag-assets"
       fi
       # Name and nothing else: the id, the size and the digest stay put.
       state | jq --argjson a "$aid" --arg n "$field" \
