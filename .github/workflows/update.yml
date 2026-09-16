@@ -119,6 +119,23 @@ jobs:
             exit 1
           }
 
+          # A publish or a heartbeat replaces an asset by uploading it under
+          # swap-next-<name> and renaming it into place. Interrupted between
+          # those two renames, it leaves the release carrying the bytes under
+          # swap-prev-<name> and nothing under the name itself, and from here
+          # that is indistinguishable from a release that never carried a
+          # database: the listing below would not find it, and preflight would
+          # refuse the release this run resolved. The repair puts the name
+          # back, by asset id, and does nothing at all when there is nothing to
+          # put back. scripts/publish.sh says what each leftover state means.
+          if [ "$CODE_SRC" = "$DATA_SRC" ]; then
+            repair_release "$CODE_SRC" bioc-code-metrics.db bioc-data-metrics.db \
+              code-manifest.json data-manifest.json || exit 1
+          else
+            repair_release "$CODE_SRC" bioc-code-metrics.db code-manifest.json || exit 1
+            repair_release "$DATA_SRC" bioc-data-metrics.db data-manifest.json || exit 1
+          fi
+
           # The series whose databases the resolved release actually carries.
           # preflight.R reads this to tell a cold start apart from a download
           # that came back with nothing in it.
@@ -209,9 +226,10 @@ jobs:
                 return 1
               fi
             done
-            # Stamp the title with the publish time so a same-day clobber is
+            # Stamp the title with the publish time so a same-day republish is
             # visibly a fresh update (the dated tag stays daily for retention
-            # pruning; --clobber does not move the release's published timestamp).
+            # pruning; replacing an asset does not move the release's published
+            # timestamp).
             local stamp title
             stamp=$(date -u +'%H:%M') || return 1
             title="Bioconductor Metrics - ${TODAY} (updated ${stamp} UTC)"
@@ -290,3 +308,12 @@ jobs:
           # shellcheck source=scripts/publish.sh
           source scripts/publish.sh
           delete_stale_drafts metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1
+
+          # Replacing an asset leaves the copy it displaced under
+          # swap-prev-<name>, for a reader that is still pulling it, and the
+          # next replacement under that tag clears it. Tomorrow publishes under
+          # a new tag and never comes back to today's, so this step is the only
+          # thing that visits a release again after its day, and without it
+          # every kept release would hold a second copy of both databases for
+          # good.
+          sweep_swap_leftovers metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1

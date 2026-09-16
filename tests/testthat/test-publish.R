@@ -137,20 +137,67 @@
   basename(sub(" --clobber$", "", sub("^gh release upload \\S+ ", "", up)))
 }
 
+# The assets of a release, by name.
+.pub_assets <- function(w, tag) {
+  rel <- .pub_releases(w, tag)
+  if (length(rel) != 1L) return(list())
+  setNames(rel[[1L]]$assets, vapply(rel[[1L]]$assets, function(a) a$name, ""))
+}
+
+# "<id> <size> <state>" for one asset, or NA when the release has no such name.
+.pub_asset_line <- function(w, tag, name) {
+  a <- .pub_assets(w, tag)[[name]]
+  if (is.null(a)) return(NA_character_)
+  sprintf("%s %s %s", a$id, a$size, a$state)
+}
+
+# Read a release the way the merger does: by name, through gh. Answers the
+# fake's stand-in for the bytes, "<name> <size> <digest>", or fails the way gh
+# does when nothing carries the name.
+.pub_read <- function(w, tag, name) {
+  .pub_sh(w, sprintf("gh release download %s -p %s -O - || exit 1", shQuote(tag), shQuote(name)))
+}
+
+# What a reader should get for a file on disk.
+.pub_bytes_of <- function(w, name) {
+  path <- file.path(w$dir, "out", name)
+  sprintf("%s %d sha256:%s", name, file.size(path),
+          digest::digest(file = path, algo = "sha256"))
+}
+
+# The renames the run made, as "<asset id> <new name>", in the order they went.
+.pub_renames <- function(w) {
+  p <- grep("^gh api -X PATCH ", .pub_calls(w), value = TRUE)
+  sub("^gh api -X PATCH repos/\\{owner\\}/\\{repo\\}/releases/assets/([0-9]+) -f name=(\\S+).*$",
+      "\\1 \\2", p)
+}
+
+# The ids of the assets the run deleted.
+.pub_asset_deletes <- function(w) {
+  d <- grep("^gh api -X DELETE repos/\\{owner\\}/\\{repo\\}/releases/assets/", .pub_calls(w),
+            value = TRUE)
+  sub("^.*/assets/([0-9]+).*$", "\\1", d)
+}
+
 # Today's release as a published, Latest release carrying exactly the four
-# assets at the sizes on disk.
+# assets at the sizes on disk. A replacement leaves the copy it displaced under
+# swap-prev-<name> for the next one to delete, so those are allowed beside the four;
+# a swap-next-<name> is not, because the swap ends with that name gone.
 .pub_expect_published <- function(w, tag = "metrics-2026-09-13") {
   rel <- .pub_releases(w, tag)
   expect_length(rel, 1L)
   rel <- rel[[1L]]
   expect_false(rel$isDraft)
   expect_true(rel$isLatest)
-  got <- vapply(rel$assets, function(a) sprintf("%s %d %s", a$name, a$size, a$state), "")
+  spare <- grepl("^swap-(prev|next)-", vapply(rel$assets, function(a) a$name, ""))
+  got <- vapply(rel$assets[!spare], function(a) sprintf("%s %d %s", a$name, a$size, a$state), "")
   want <- vapply(c("bioc-code-metrics.db", "bioc-data-metrics.db", "code-manifest.json",
                    "data-manifest.json"),
                  function(f) sprintf("%s %d uploaded", f,
                                      file.size(file.path(w$dir, "out", f))), "")
   expect_setequal(got, unname(want))
+  left <- vapply(rel$assets[spare], function(a) a$name, "")
+  expect_true(all(grepl("^swap-prev-", left)), info = paste(left, collapse = ", "))
 }
 
 # ---------------------------------------------------------------------------
@@ -285,14 +332,14 @@ test_that("the retry waits thirty seconds longer after each failed attempt", {
   expect_identical(readLines(slept), c("30", "60"))
 })
 
-test_that("a failed clobber of today's published release fails the call", {
+test_that("a failed replacement on today's published release fails the call", {
   # The second shard of a run republishes into the release the first shard
   # published. While the gh calls there were unguarded, a failed upload followed
   # by a successful title edit returned 0 and the step went green.
   w <- .pub_world(list(.pub_prior()))
   expect_identical(.pub_publish(w)$status, 0L)
   file.create(w$log)
-  .pub_fail(w, "upload-bioc-code-metrics.db", 99L)
+  .pub_fail(w, "upload-swap-next-bioc-code-metrics.db", 99L)
 
   r <- .pub_publish(w)
   expect_false(identical(r$status, 0L))
@@ -630,6 +677,377 @@ test_that("a read waits ten seconds longer after each failed attempt", {
 })
 
 # ---------------------------------------------------------------------------
+# Replacing an asset on a release people are already reading
+# ---------------------------------------------------------------------------
+#
+# Every case here is about the same window. `gh release upload --clobber`
+# deletes the live asset and then uploads its replacement, so from the delete
+# until the upload finishes the release advertises no database at all, and if
+# the upload never lands it never carries one again: the next run resolves that
+# release, finds no database, and preflight refuses. Measured against a scratch
+# repository, a 300 MiB upload takes 23 to 37 s, and the databases here are
+# larger. The replacement below uploads under a temporary name first and then
+# renames, which leaves the live asset in place for all of that and swaps the
+# names in about half a second.
+
+# Today's release as a first shard published it, at sizes that are not the ones
+# on disk, so a replacement is visible in the sizes.
+.pub_first_shard <- function(assets = list(
+  .pub_asset("bioc-code-metrics.db", 4000L), .pub_asset("bioc-data-metrics.db", 2000L),
+  .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L))) {
+  list(id = 2L, tagName = "metrics-2026-09-13", isDraft = FALSE, isLatest = TRUE,
+       name = "Bioconductor Metrics - 2026-09-13", assets = assets)
+}
+
+# Yesterday's release, and today's carrying what the first shard published.
+.pub_shard_world <- function(assets = NULL, env = parent.frame()) {
+  prior <- .pub_prior()
+  prior$isLatest <- FALSE
+  today <- if (is.null(assets)) .pub_first_shard() else .pub_first_shard(assets)
+  .pub_world(list(prior, today), env = env)
+}
+
+# What a reader gets for a seeded asset, the way .pub_with_asset_ids stamps it.
+.pub_seeded_bytes <- function(name, size) {
+  sprintf("%s %d sha256:%s", name, size, digest::digest(paste(name, size), algo = "sha256"))
+}
+
+test_that("a second shard uploads beside the live asset and renames it into place", {
+  w <- .pub_shard_world()
+  before <- .pub_assets(w, "metrics-2026-09-13")
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+
+  # Nothing was uploaded under a name a reader asks for.
+  expect_identical(.pub_uploads(w), c("swap-next-bioc-code-metrics.db", "swap-next-bioc-data-metrics.db",
+                                      "swap-next-code-manifest.json", "swap-next-data-manifest.json"))
+  expect_false(any(grepl("upload metrics-2026-09-13 out/bioc-", .pub_calls(w), fixed = TRUE)))
+  # The bytes went up once, under a link, not as a second copy of the file.
+  expect_true(all(grepl(".swap-stage/", grep("^gh release upload ", .pub_calls(w), value = TRUE),
+                        fixed = TRUE)))
+
+  after <- .pub_assets(w, "metrics-2026-09-13")
+  # The asset that was live is still on the release, under swap-prev-, with its id,
+  # size and digest untouched; the name now belongs to the new upload.
+  expect_identical(after[["swap-prev-bioc-code-metrics.db"]]$id, before[["bioc-code-metrics.db"]]$id)
+  expect_identical(after[["swap-prev-bioc-code-metrics.db"]]$size, before[["bioc-code-metrics.db"]]$size)
+  expect_false(identical(after[["bioc-code-metrics.db"]]$id, before[["bioc-code-metrics.db"]]$id))
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("a republish reads the release once for each thing it decides", {
+  # Every read is a request against the hourly REST budget the workflow's token
+  # gets for this repository, and a changeover day, or a force_full dispatch,
+  # publishes after every shard that changed anything. Three reads per asset
+  # decide something: what the repair left under the name, whether the upload
+  # landed whole, and what the release carries once the names have moved. The
+  # release the tag names is resolved once for the whole publish.
+  w <- .pub_shard_world()
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  calls <- .pub_calls(w)
+  expect_length(grep("releases/tags/", calls, fixed = TRUE), 1L)
+  expect_length(grep("/assets?per_page=100", calls, fixed = TRUE), 12L)
+  expect_length(calls, 28L)
+})
+
+test_that("a replacement never changes the extension of the name it uploads under", {
+  # gh reads an asset's content type off the file extension as it uploads, and
+  # a rename changes the name and nothing else, so a name the replacement
+  # invents decides how the release serves those bytes for good. Measured
+  # against a scratch repository: out/code-manifest.json uploaded under its own
+  # name came back application/json, the same file uploaded as
+  # swap-next-code-manifest.json came back application/octet-stream and kept that
+  # through the rename that gave it the manifest's name, and uploaded as
+  # swap-next-code-manifest.json it came back application/json and kept that.
+  w <- .pub_shard_world()
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  left <- grep("^swap-(prev|next)-", names(.pub_assets(w, "metrics-2026-09-13")), value = TRUE)
+  expect_length(left, 4L)
+  names <- c(.pub_uploads(w), left)
+  expect_true(all(grepl("\\.(db|json)$", names)), info = paste(names, collapse = ", "))
+})
+
+test_that("the live asset is renamed out of the way before the new one takes its name", {
+  # The other order, deleting the live asset first, is what hands a reader that
+  # listed a moment earlier a hard 404 on an id that is gone.
+  w <- .pub_shard_world()
+  before <- .pub_assets(w, "metrics-2026-09-13")
+  expect_identical(.pub_publish(w)$status, 0L)
+
+  renames <- .pub_renames(w)
+  db <- grep("(^| )(swap-prev-)?bioc-code-metrics\\.db$", renames, value = TRUE)
+  expect_identical(db, c(sprintf("%s swap-prev-bioc-code-metrics.db", before[["bioc-code-metrics.db"]]$id),
+                         sprintf("%s bioc-code-metrics.db",
+                                 .pub_assets(w, "metrics-2026-09-13")[["bioc-code-metrics.db"]]$id)))
+  # Nothing a reader could be holding was deleted to make room.
+  expect_false(before[["bioc-code-metrics.db"]]$id %in% .pub_asset_deletes(w))
+})
+
+test_that("databases are replaced before manifests, whatever order they are passed in", {
+  w <- .pub_shard_world()
+  r <- .pub_publish(w, assets = paste(
+    "out/code-manifest.json out/bioc-code-metrics.db out/data-manifest.json",
+    "out/bioc-data-metrics.db"))
+  expect_identical(r$status, 0L, info = r$output)
+  # The renames that give an asset the name a reader asks for, in the order
+  # they went; the other four move the displaced copy out of the way.
+  swapped <- grep(" swap-(prev|next)-", .pub_renames(w), value = TRUE, invert = TRUE)
+  expect_length(swapped, 4L)
+  expect_true(all(grepl("\\.db$", swapped[1:2])))
+  expect_true(all(grepl("\\.json$", swapped[3:4])))
+})
+
+test_that("the previous copy is left for the next replacement to delete", {
+  # Deleting an asset cuts off a download of it that is already running, and the
+  # merger's is tens of seconds long, so the copy a reader may still be pulling
+  # stays until the next publish under this tag has no use for it.
+  w <- .pub_shard_world()
+  expect_identical(.pub_publish(w)$status, 0L)
+  expect_true("swap-prev-bioc-code-metrics.db" %in% names(.pub_assets(w, "metrics-2026-09-13")))
+  expect_length(.pub_asset_deletes(w), 0L)
+
+  prev <- .pub_assets(w, "metrics-2026-09-13")[["swap-prev-bioc-code-metrics.db"]]$id
+  file.create(w$log)
+  expect_identical(.pub_publish(w)$status, 0L)
+  expect_true(prev %in% .pub_asset_deletes(w))
+  expect_length(grep("^swap-prev-", names(.pub_assets(w, "metrics-2026-09-13"))), 4L)
+})
+
+test_that("an upload that never lands leaves the live asset where readers find it", {
+  w <- .pub_shard_world()
+  .pub_fail(w, "upload-swap-next-bioc-code-metrics.db", 99L)
+  before <- .pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("bioc-code-metrics.db", r$output, fixed = TRUE))
+  expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"), before)
+  expect_length(.pub_renames(w), 0L)
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_identical(read$status, 0L, info = read$output)
+  expect_identical(read$output, .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
+})
+
+test_that("a temporary asset that landed short or under the wrong digest never takes the name", {
+  for (how in c("short", "corrupt")) {
+    w <- .pub_shard_world()
+    .pub_fail(w, sprintf("%s-swap-next-bioc-code-metrics.db", how), 1L)
+    before <- .pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+    r <- .pub_publish(w)
+    expect_false(identical(r$status, 0L))
+    expect_true(grepl("swap-next-bioc-code-metrics.db", r$output, fixed = TRUE), info = r$output)
+    expect_length(.pub_renames(w), 0L)
+    expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"), before)
+    # Read five times before refusing: a release that has not caught up with an
+    # upload is not the same thing as an asset that landed wrong.
+    expect_gte(length(grep("/assets", .pub_calls(w), fixed = TRUE)), 5L)
+  }
+})
+
+test_that("a temporary asset still half-written after the upload never takes the name", {
+  # gh returning 0 is not proof the bytes are servable: measured against a
+  # scratch repository, one upload of 300 MiB was still answering BlobNotFound
+  # 24.5 s after gh exited 0.
+  w <- .pub_shard_world()
+  .pub_fail(w, "starter-swap-next-bioc-code-metrics.db", 99L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("starter", r$output, fixed = TRUE), info = r$output)
+  expect_length(.pub_renames(w), 0L)
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_identical(read$output, .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
+})
+
+test_that("the first rename failing leaves the release exactly as it was", {
+  w <- .pub_shard_world()
+  .pub_fail(w, "patch-swap-prev-bioc-code-metrics.db", 99L)
+  before <- .pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"), before)
+  expect_length(grep("swap-prev-bioc-code-metrics.db$", .pub_renames(w)), 5L)
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_identical(read$output, .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
+})
+
+test_that("a rename that landed but reported failure is safe to make again", {
+  # The retry names the same asset id, and renaming an asset to the name it
+  # already holds is a 200 that changes nothing.
+  w <- .pub_shard_world()
+  .pub_fail(w, "patch-after-bioc-code-metrics.db", 1L)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_length(grep(" bioc-code-metrics.db$", .pub_renames(w)), 2L)
+})
+
+test_that("a second rename that never lands puts the live asset back under its name", {
+  w <- .pub_shard_world()
+  before <- .pub_assets(w, "metrics-2026-09-13")
+  .pub_fail(w, "patch-bioc-code-metrics.db", 5L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  # Five attempts at the second rename, then the rollback, all by asset id.
+  expect_length(grep(" bioc-code-metrics.db$", .pub_renames(w)), 6L)
+  expect_identical(.pub_assets(w, "metrics-2026-09-13")[["bioc-code-metrics.db"]]$id,
+                   before[["bioc-code-metrics.db"]]$id)
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_identical(read$status, 0L, info = read$output)
+  expect_identical(read$output, .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
+  # Nothing beyond the database was touched after it failed.
+  expect_false(any(grepl("bioc-data-metrics", .pub_uploads(w), fixed = TRUE)))
+})
+
+test_that("the swap waits longer after each failed rename", {
+  w <- .pub_shard_world()
+  .pub_fail(w, "patch-swap-prev-bioc-code-metrics.db", 2L)
+  .pub_fail(w, "patch-bioc-code-metrics.db", 2L)
+  slept <- file.path(w$dir, "slept")
+  r <- .pub_sh(w, c(sprintf("sleep() { echo \"$1\" >> %s; }", shQuote(slept)),
+                    "replace_asset metrics-2026-09-13 2 out/bioc-code-metrics.db || exit 1"),
+               wait = NA)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(readLines(slept), c("10", "20", "5", "10"))
+})
+
+test_that("a name that cannot be put back is restored from the previous copy next time", {
+  # The one state that hurts: the release carries no bioc-code-metrics.db, so a
+  # by-name read fails and the next run's preflight would refuse the release it
+  # resolved. The repair at the start of the next replacement undoes it.
+  w <- .pub_shard_world()
+  before <- .pub_assets(w, "metrics-2026-09-13")
+  .pub_fail(w, "patch-bioc-code-metrics.db", 6L)
+  r <- .pub_publish(w)
+  expect_false(identical(r$status, 0L))
+  expect_true(grepl("swap-prev-bioc-code-metrics.db", r$output, fixed = TRUE), info = r$output)
+  left <- names(.pub_assets(w, "metrics-2026-09-13"))
+  expect_false("bioc-code-metrics.db" %in% left)
+  expect_true(all(c("swap-prev-bioc-code-metrics.db", "swap-next-bioc-code-metrics.db") %in% left))
+  expect_false(identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$status, 0L))
+
+  file.remove(file.path(w$fails, "patch-bioc-code-metrics.db"))
+  file.create(w$log)
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  # The copy that came back is the one that was live before any of this.
+  renames <- .pub_renames(w)
+  expect_identical(renames[[1L]],
+                   sprintf("%s bioc-code-metrics.db", before[["bioc-code-metrics.db"]]$id))
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("an upload cut off part way is cleared before the next attempt, by id", {
+  # A killed upload leaves an asset in state "starter" at the full size. gh
+  # cannot see it, so --clobber does not clear it, and it does not clear
+  # itself.
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("bioc-code-metrics.db", 4000L),
+    .pub_asset("swap-next-bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_identical(.pub_asset_deletes(w)[[1L]], "900")
+})
+
+test_that("a complete temporary asset left by an earlier run is cleared, not collided with", {
+  # An upload onto a name that is taken is refused with 422 before the body is
+  # read, so this is the leftover that would stop the run outright.
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("bioc-code-metrics.db", 4000L),
+    .pub_asset("swap-next-bioc-code-metrics.db", 5000L, id = 900L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_identical(.pub_asset_deletes(w)[[1L]], "900")
+})
+
+test_that("an asset left only under the temporary name is renamed into place", {
+  # What the old ordering, deleting before uploading, leaves behind.
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("swap-next-bioc-code-metrics.db", 4444L, id = 900L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_renames(w), "900 bioc-code-metrics.db")
+  expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"),
+                   "900 4444 uploaded")
+  read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+  expect_identical(read$status, 0L, info = read$output)
+
+  # And running it again changes nothing.
+  file.create(w$log)
+  expect_identical(.pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1")$status, 0L)
+  expect_length(.pub_renames(w), 0L)
+  expect_length(.pub_asset_deletes(w), 0L)
+})
+
+test_that("a half-written asset with nothing under the name is cleared and the name uploaded fresh", {
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("swap-next-bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_identical(.pub_asset_deletes(w)[[1L]], "900")
+  # Nothing to protect, so no temporary name and no swap for that one.
+  expect_false("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("a run stopped between the renames is repaired before the release is read", {
+  # The repair is what the download step runs on the release it resolved,
+  # before it decides which databases that release carries.
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("swap-prev-bioc-code-metrics.db", 4000L, id = 900L),
+    .pub_asset("swap-next-bioc-code-metrics.db", 5000L, id = 901L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db bioc-data-metrics.db || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  # Rolled back, not rolled forward: the manifests were not swapped either, so
+  # the old database and the old manifest are the pair the day started with.
+  expect_identical(.pub_renames(w), "900 bioc-code-metrics.db")
+  expect_identical(.pub_asset_deletes(w), "901")
+  expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"),
+                   "900 4000 uploaded")
+})
+
+test_that("the repair has nothing to say about a release that never carried the asset", {
+  # A legacy release carries one series, and a cold start has no release at all.
+  w <- .pub_shard_world(assets = list(.pub_asset("bioc-code-metrics.db", 4000L)))
+  r <- .pub_sh(w, c("repair_release metrics-2026-09-13 bioc-data-metrics.db data-manifest.json || exit 1",
+                    'repair_release "" bioc-code-metrics.db || exit 1',
+                    'echo "went on"'))
+  expect_identical(r$status, 0L, info = r$output)
+  expect_true(grepl("went on", r$output, fixed = TRUE))
+  expect_length(.pub_renames(w), 0L)
+  expect_length(.pub_asset_deletes(w), 0L)
+  expect_length(grep("releases/tags/", .pub_calls(w), fixed = TRUE), 1L)
+})
+
+test_that("a release the repair cannot read stops the caller instead of reading as clean", {
+  w <- .pub_shard_world()
+  .pub_fail(w, "api-assets", 99L)
+  r <- .pub_sh(w, c("repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1",
+                    'echo "went on"'))
+  expect_false(identical(r$status, 0L))
+  expect_false(grepl("went on", r$output, fixed = TRUE))
+  expect_length(grep("/assets", .pub_calls(w), fixed = TRUE), 5L)
+})
+
+# ---------------------------------------------------------------------------
 # The heartbeat
 # ---------------------------------------------------------------------------
 
@@ -639,17 +1057,59 @@ test_that("a read waits ten seconds longer after each failed attempt", {
     shQuote(tag)))
 }
 
-test_that("the heartbeat refreshes both manifests on a published release", {
+test_that("the heartbeat swaps each manifest in rather than deleting the live one", {
+  # This one writes to the release the whole catalogue is being read from, on
+  # every day that publishes nothing, which is most days between Bioconductor
+  # releases.
   w <- .pub_world(list(.pub_prior()))
+  before <- .pub_assets(w, "metrics-2026-09-12")
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_identical(r$status, 0L, info = r$output)
-  expect_identical(.pub_uploads(w), c("code-manifest.json", "data-manifest.json"))
-  prior <- .pub_releases(w, "metrics-2026-09-12")[[1L]]
-  sizes <- setNames(vapply(prior$assets, function(a) as.numeric(a$size), 1),
-                    vapply(prior$assets, function(a) a$name, ""))
-  expect_equal(sizes[["code-manifest.json"]], 120)
-  expect_equal(sizes[["bioc-code-metrics.db"]], 4000)
+  expect_identical(.pub_uploads(w), c("swap-next-code-manifest.json", "swap-next-data-manifest.json"))
+  expect_length(.pub_asset_deletes(w), 0L)
+  after <- .pub_assets(w, "metrics-2026-09-12")
+  expect_equal(as.numeric(after[["code-manifest.json"]]$size), 120)
+  expect_identical(after[["swap-prev-code-manifest.json"]]$id, before[["code-manifest.json"]]$id)
+  # The databases are not touched at all.
+  expect_equal(as.numeric(after[["bioc-code-metrics.db"]]$size), 4000)
+  expect_identical(after[["bioc-code-metrics.db"]]$id, before[["bioc-code-metrics.db"]]$id)
+  expect_identical(.pub_read(w, "metrics-2026-09-12", "code-manifest.json")$output,
+                   .pub_bytes_of(w, "code-manifest.json"))
   expect_false(any(grepl("^gh release (create|delete|edit) ", .pub_calls(w))))
+})
+
+test_that("the heartbeat puts back a manifest an earlier one left half-swapped", {
+  # Between Bioconductor releases this is the only thing writing to the release
+  # the merger reads, so a heartbeat interrupted between the two renames would
+  # otherwise leave it without a manifest until something published again.
+  prior <- .pub_prior()
+  prior$assets <- list(.pub_asset("bioc-code-metrics.db", 4000L),
+                       .pub_asset("bioc-data-metrics.db", 2000L),
+                       .pub_asset("swap-prev-code-manifest.json", 8L, id = 900L),
+                       .pub_asset("swap-next-code-manifest.json", 120L, id = 901L),
+                       .pub_asset("data-manifest.json", 9L))
+  w <- .pub_world(list(prior))
+  r <- .pub_heartbeat(w, "metrics-2026-09-12")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_renames(w)[[1L]], "900 code-manifest.json")
+  expect_true("901" %in% .pub_asset_deletes(w))
+  after <- .pub_assets(w, "metrics-2026-09-12")
+  expect_equal(as.numeric(after[["code-manifest.json"]]$size), 120)
+  expect_identical(.pub_read(w, "metrics-2026-09-12", "code-manifest.json")$output,
+                   .pub_bytes_of(w, "code-manifest.json"))
+})
+
+test_that("a manifest the release never carried is uploaded under its own name", {
+  # The legacy code-/data- releases carry one series each, and there is nothing
+  # to protect under a name the release does not have.
+  prior <- .pub_prior()
+  prior$assets <- list(.pub_asset("bioc-code-metrics.db", 4000L),
+                       .pub_asset("code-manifest.json", 8L))
+  w <- .pub_world(list(prior))
+  r <- .pub_heartbeat(w, "metrics-2026-09-12")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_uploads(w), c("swap-next-code-manifest.json", "data-manifest.json"))
+  expect_equal(as.numeric(.pub_assets(w, "metrics-2026-09-12")[["data-manifest.json"]]$size), 140)
 })
 
 test_that("the heartbeat refuses to write into a draft", {
@@ -675,10 +1135,12 @@ test_that("the heartbeat refuses a doubled tag and names the releases by id", {
 
 test_that("the heartbeat fails when its upload never lands", {
   w <- .pub_world(list(.pub_prior()))
-  .pub_fail(w, "upload-data-manifest.json", 99L)
+  .pub_fail(w, "upload-swap-next-data-manifest.json", 99L)
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_false(identical(r$status, 0L))
-  expect_identical(sum(.pub_uploads(w) == "data-manifest.json"), 5L)
+  expect_identical(sum(.pub_uploads(w) == "swap-next-data-manifest.json"), 5L)
+  # The manifest a reader asks for is the one that was there before.
+  expect_equal(as.numeric(.pub_assets(w, "metrics-2026-09-12")[["data-manifest.json"]]$size), 9)
 })
 
 test_that("the heartbeat reads the release again when a read fails once", {
@@ -686,11 +1148,10 @@ test_that("the heartbeat reads the release again when a read fails once", {
   # last_checked where it was, and the merger's readiness gate reads freshness
   # from last_checked, so one 5xx would make this pipeline look late.
   w <- .pub_world(list(.pub_prior()))
-  .pub_fail(w, "list", 1L)
-  .pub_fail(w, "view", 1L)
+  for (what in c("list", "view", "api-tags", "api-assets")) .pub_fail(w, what, 1L)
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_identical(r$status, 0L, info = r$output)
-  expect_identical(.pub_uploads(w), c("code-manifest.json", "data-manifest.json"))
+  expect_identical(.pub_uploads(w), c("swap-next-code-manifest.json", "swap-next-data-manifest.json"))
 })
 
 test_that("the heartbeat fails when the release list never reads", {
@@ -704,10 +1165,13 @@ test_that("the heartbeat fails when the release list never reads", {
 
 test_that("the heartbeat fails when a manifest landed at the wrong size", {
   w <- .pub_world(list(.pub_prior()))
-  .pub_fail(w, "short-code-manifest.json", 1L)
+  .pub_fail(w, "short-swap-next-code-manifest.json", 1L)
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_false(identical(r$status, 0L))
-  expect_true(grepl("code-manifest.json 120", r$output, fixed = TRUE))
+  expect_true(grepl("swap-next-code-manifest.json is [uploaded 119", r$output, fixed = TRUE),
+              info = r$output)
+  expect_true(grepl("wanted [uploaded 120", r$output, fixed = TRUE), info = r$output)
+  expect_length(.pub_renames(w), 0L)
 })
 
 test_that("the heartbeat names a missing manifest before it touches the release", {
@@ -807,6 +1271,59 @@ test_that("a draft that will not delete waits for the next run, and a listing th
   expect_length(.pub_tags(w, drafts = TRUE), 2L)
 })
 
+test_that("the prune clears the copies a replacement left on the releases it keeps", {
+  # Tomorrow publishes under a new tag and never comes back to today's, so the
+  # copy each replacement sets aside would sit on every kept release for good:
+  # one extra database per release-day. The prune is the only step that visits
+  # a release again after its day.
+  w <- .pub_world(list(
+    .pub_release(1L, "metrics-2026-09-12", assets = list(
+      .pub_asset("bioc-code-metrics.db", 4000L),
+      .pub_asset("swap-prev-bioc-code-metrics.db", 3900L, id = 900L),
+      .pub_asset("code-manifest.json", 8L),
+      .pub_asset("swap-next-code-manifest.json", 9L, state = "starter", id = 901L))),
+    .pub_release(2L, "metrics-2026-09-13", assets = list(
+      .pub_asset("bioc-code-metrics.db", 4100L),
+      .pub_asset("swap-prev-bioc-code-metrics.db", 4000L, id = 902L))),
+    .pub_release(3L, "code-2026-01-01", assets = list(
+      .pub_asset("swap-prev-bioc-code-metrics.db", 10L, id = 903L)))))
+  r <- .pub_sh(w, "sweep_swap_leftovers metrics metrics-2026-09-13 || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_setequal(.pub_asset_deletes(w), c("900", "901"))
+  # Today's release is left alone, because a publish may still be part way
+  # through a replacement on it, and another series is not this one's business.
+  expect_identical(names(.pub_assets(w, "metrics-2026-09-13")),
+                   c("bioc-code-metrics.db", "swap-prev-bioc-code-metrics.db"))
+  expect_identical(names(.pub_assets(w, "code-2026-01-01")), "swap-prev-bioc-code-metrics.db")
+  expect_identical(names(.pub_assets(w, "metrics-2026-09-12")),
+                   c("bioc-code-metrics.db", "code-manifest.json"))
+})
+
+test_that("the prune restores a name rather than stripping the copy that holds it", {
+  # A release left between the two renames carries the bytes only under swap-prev-.
+  # Deleting that as a leftover is exactly the loss this is meant to prevent.
+  w <- .pub_world(list(
+    .pub_release(1L, "metrics-2026-09-12", assets = list(
+      .pub_asset("swap-prev-bioc-code-metrics.db", 4000L, id = 900L),
+      .pub_asset("swap-next-bioc-code-metrics.db", 5000L, id = 901L))),
+    .pub_release(2L, "metrics-2026-09-13")))
+  r <- .pub_sh(w, "sweep_swap_leftovers metrics metrics-2026-09-13 || exit 1")
+  expect_identical(r$status, 0L, info = r$output)
+  expect_identical(.pub_renames(w), "900 bioc-code-metrics.db")
+  expect_identical(.pub_asset_deletes(w), "901")
+  read <- .pub_read(w, "metrics-2026-09-12", "bioc-code-metrics.db")
+  expect_identical(read$status, 0L, info = read$output)
+})
+
+test_that("a sweep that cannot read a release stops the step", {
+  w <- .pub_world(list(.pub_prior(), .pub_release(2L, "metrics-2026-09-13")))
+  .pub_fail(w, "api-assets", 99L)
+  r <- .pub_sh(w, c("sweep_swap_leftovers metrics metrics-2026-09-13 || exit 1",
+                    'echo "went on past the copies"'))
+  expect_false(identical(r$status, 0L))
+  expect_false(grepl("went on past the copies", r$output, fixed = TRUE))
+})
+
 # ---------------------------------------------------------------------------
 # The scripts as written
 # ---------------------------------------------------------------------------
@@ -826,6 +1343,13 @@ test_that("a draft that will not delete waits for the next run, and a listing th
   grep("(^|[\\s$(;])gh (release|api) ", lines, value = TRUE, perl = TRUE)
 }
 
+# The helpers in scripts/publish.sh that can fail, so a call to one has to be
+# guarded exactly like a gh call.
+.PUB_HELPERS <- paste0(
+  "release_state|release_rows|release_id|release_assets|upload_asset|verify_assets|",
+  "verify_asset|edit_release|file_bytes|file_sha256|rename_asset|delete_asset|",
+  "repair_asset|repair_release|swap_asset|replace_asset")
+
 test_that("every gh call in scripts/publish.sh stops the function when it fails", {
   # A function called as `f || exit 1` runs with errexit off, so a failed gh
   # call inside it is ignored unless the line itself returns. The same holds
@@ -834,14 +1358,33 @@ test_that("every gh call in scripts/publish.sh stops the function when it fails"
   expect_true(length(gh) > 0L)
   lines <- .pub_logical_lines(.pub_script())
   lines <- lines[!grepl("^\\s*#", lines)]
-  helpers <- grep("\\b(release_state|release_rows|upload_asset|verify_assets|edit_release|file_bytes)[ )]",
-                  lines, value = TRUE, perl = TRUE)
-  expect_gte(length(helpers), 8L)
+  helpers <- grep(sprintf("\\b(%s)[ )]", .PUB_HELPERS), lines, value = TRUE, perl = TRUE)
+  expect_gte(length(helpers), 20L)
   expect_true(any(grepl("gh api ", gh, fixed = TRUE)))
   calls <- c(gh, helpers)
+  # Either the line returns when the call fails, or the call is the condition
+  # of an if, where its status is read rather than dropped.
   guarded <- grepl("\\|\\| return 1", calls) |
-    grepl("^\\s*if !? ?([a-z_]+=\\$\\()?gh ", calls)
+    grepl(sprintf("^\\s*if !? ?([a-z_]+=\\$\\()?(gh|%s) ", .PUB_HELPERS), calls)
   expect_true(all(guarded), info = paste(calls[!guarded], collapse = "\n"))
+})
+
+test_that("nothing in scripts/publish.sh clobbers an asset a reader asks for by name", {
+  # --clobber deletes the live asset before uploading its replacement. It is
+  # only safe where no reader can be asking for the name: an empty draft, and
+  # the temporary name a replacement uploads under.
+  lines <- .pub_logical_lines(.pub_script())
+  lines <- lines[!grepl("^\\s*#", lines)]
+  uploads <- grep("gh release upload ", lines, value = TRUE, fixed = TRUE)
+  expect_length(uploads, 1L)
+  expect_true(grepl("--clobber", uploads, fixed = TRUE))
+  # The one upload takes whatever path it is handed, and both callers of the
+  # swap hand it a name nothing reads.
+  sh <- paste(lines, collapse = "\n")
+  swap <- regmatches(sh, regexpr("(?s)replace_asset\\(\\) \\{.*?\n\\}", sh, perl = TRUE))
+  expect_length(swap, 1L)
+  expect_true(grepl("swap-next-", swap, fixed = TRUE))
+  expect_true(grepl("repair_asset", swap, fixed = TRUE))
 })
 
 test_that("update.yml resolves only published releases and publishes through scripts/publish.sh", {
@@ -885,6 +1428,33 @@ test_that("the prune clears the drafts a failed publish left on an earlier day",
   expect_length(body, 1L)
   expect_true(grepl("gh api -X DELETE", body, fixed = TRUE))
   expect_false(grepl("gh release delete", body, fixed = TRUE))
+})
+
+test_that("the prune also clears the copies a replacement leaves on the releases it keeps", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  start <- grep("- name: Prune old dated releases", yml, fixed = TRUE)
+  prune <- yml[start:length(yml)]
+  expect_true(any(grepl('sweep_swap_leftovers metrics "metrics-$(date -u +%Y-%m-%d)" || exit 1',
+                        prune, fixed = TRUE)))
+})
+
+test_that("the download step repairs the release it resolved before reading what it carries", {
+  # A replacement stopped between its two renames leaves the release without
+  # the asset under its plain name. Nothing else in a later run looks at that:
+  # the download step would see a release carrying no database and preflight
+  # would refuse it, which is the stranding this whole file is about.
+  yml <- paste(.pub_logical_lines(file.path("..", "..", ".github", "workflows", "update.yml")),
+               collapse = "\n")
+  repairs <- regmatches(yml, gregexpr("repair_release [^\n]*", yml))[[1L]]
+  expect_gte(length(repairs), 2L)
+  expect_true(all(grepl("|| exit 1", repairs, fixed = TRUE)), info = paste(repairs, collapse = "\n"))
+  for (name in c("bioc-code-metrics.db", "bioc-data-metrics.db",
+                 "code-manifest.json", "data-manifest.json")) {
+    expect_true(any(grepl(name, repairs, fixed = TRUE)), info = name)
+  }
+  # Before the step decides which series the release advertises.
+  expect_lt(min(gregexpr("repair_release ", yml, fixed = TRUE)[[1L]]),
+            min(gregexpr("list_assets \"$CODE_SRC\"", yml, fixed = TRUE)[[1L]]))
 })
 
 test_that("update.yml tells preflight which releases it resolved", {

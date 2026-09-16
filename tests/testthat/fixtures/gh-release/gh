@@ -39,8 +39,9 @@
 #   - `gh api` prints the JSON error body on stdout, the "gh: ... (HTTP nnn)"
 #     line on stderr, and exits 1.
 #   - `release download -p` matches the asset NAME with filepath.Match: exact,
-#     case sensitive, and blind to the label. `db` does not match `db.next` or
-#     `db.prev`. With no match it prints "no assets match the file pattern"
+#     case sensitive, and blind to the label. Neither `db` nor `db*` matches
+#     `swap-next-db` or `swap-prev-db`. With no match it prints "no assets match the
+#     file pattern"
 #     and exits 1.
 #   - `release upload` names the asset after the basename of the path it was
 #     given and follows a symlink for the bytes, which is how a file gets a

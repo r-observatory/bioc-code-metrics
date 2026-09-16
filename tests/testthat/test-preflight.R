@@ -69,11 +69,11 @@ test_that("a database holding less than its manifest recorded stops the run", {
 })
 
 test_that("a database ahead of its manifest is a note, not a refusal", {
-  # A same-day publish replaces four assets one at a time with
-  # `gh release upload --clobber`, which cannot be atomic, so an interrupted
-  # publish leaves one shard's database beside an earlier shard's manifest.
-  # Refusing on that would make a transient upload failure permanent: the same
-  # release stays latest tomorrow.
+  # A same-day publish replaces four assets one at a time, each uploaded under
+  # <name>.next and then renamed into place, so an interrupted publish leaves
+  # one shard's database beside an earlier shard's manifest. Refusing on that
+  # would make a transient upload failure permanent: the same release stays
+  # latest tomorrow.
   out <- withr::local_tempdir()
   .pf_code_db(file.path(out, DB_FILENAME), 9L)
   write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
@@ -103,10 +103,10 @@ test_that("a manifest predating the series field is noted, not refused", {
 })
 
 test_that("a manifest that came back without its database stops the run", {
-  # A same-day publish replaces the database and the manifest one at a time
-  # with `gh release upload --clobber`, which deletes each existing asset before
-  # replacing it and cannot do so atomically. An interrupted publish can
-  # therefore leave a release advertising code-manifest.json and no
+  # A same-day publish replaces the database and the manifest one at a time,
+  # each uploaded under <name>.next and then renamed into place. A run stopped
+  # between those two renames leaves the bytes under <name>.prev and nothing
+  # under the name, so the release can advertise code-manifest.json and no
   # bioc-code-metrics.db, in which case the download step has nothing to fetch
   # and hands preflight an empty `expected`. The manifest that DID come back is
   # the evidence that this is not a cold start.
@@ -181,10 +181,11 @@ test_that("the data series is checked on its own tables", {
 # ---------------------------------------------------------------------------
 
 test_that("a release carrying a database and no manifest gets a baseline measured from it", {
-  # A same-day publish replaces four assets one at a time with --clobber, so a
-  # run that died in that window leaves a release with its database and no
-  # manifest. The database is right there and it is the thing worth protecting,
-  # so measure it rather than have nothing to check against.
+  # A same-day publish replaces four assets one at a time, each uploaded under
+  # <name>.next and then renamed into place, so a run that died between two of
+  # them leaves a release with its database and no manifest. The database is
+  # right there and it is the thing worth protecting, so measure it rather than
+  # have nothing to check against.
   out <- withr::local_tempdir()
   .pf_code_db(file.path(out, DB_FILENAME), 4L)
 
@@ -338,6 +339,19 @@ test_that("the repair advice deletes a release that carries nothing along with i
 # ---------------------------------------------------------------------------
 # The workflow half: the download that must not swallow its failure
 # ---------------------------------------------------------------------------
+
+test_that("update.yml keeps the prior manifest under the name preflight reads", {
+  # The download step fetches the manifest off the release and renames it on
+  # disk, and preflight_prior_dbs looks for that name and nothing else. The
+  # swap-prev-<name> a replacement leaves on the release is a different thing
+  # that never reaches the runner, so the two must not drift into each other.
+  yml <- paste(readLines(file.path("..", "..", ".github", "workflows", "update.yml")),
+               collapse = "\n")
+  for (spec in .preflight_specs()) {
+    expect_true(grepl(sprintf("mv out/%s out/%s", spec$manifest_asset, spec$manifest),
+                      yml, fixed = TRUE), info = spec$series)
+  }
+})
 
 test_that("update.yml fails the run when a prior asset does not arrive", {
   workflow_path <- file.path("..", "..", ".github", "workflows", "update.yml")
