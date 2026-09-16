@@ -132,9 +132,25 @@ release_state() {
 # and pkg/cmd/release/delete/delete.go deletes what that hands back. So a
 # delete by tag aimed at the draft is a race it can lose, and there is no
 # arranging for it to win.
+#
+# Read up to five times, 10 s, then 20 s and so on apart, like every other
+# listing here. Every caller runs in the prune step, after the run's own
+# publish has landed, so a single 500 here used to redden a run that had
+# already done everything it was asked. The rows are this function's stdout,
+# so the attempt messages go to stderr.
 release_rows() {
-  gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
-    -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"' || return 1
+  local n rows
+  for n in 1 2 3 4 5; do
+    if rows=$(gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
+                -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"'); then
+      printf '%s\n' "$rows"
+      return 0
+    fi
+    echo "attempt ${n}: could not list the releases" >&2
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+  done
+  echo "::error::five attempts failed to list the releases." >&2
+  return 1
 }
 
 # The numeric id of the PUBLISHED release a tag names.

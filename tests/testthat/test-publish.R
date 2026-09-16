@@ -432,8 +432,9 @@ test_that("the refusal over two releases under one tag names them by id, not by 
   expect_false(any(grepl("^gh release (create|delete|upload|edit) |-X DELETE", .pub_calls(w))))
   expect_length(.pub_state(w), 3L)
 
-  # The ids could not be read: still refused, and it says where to find them.
-  .pub_fail(w, "api", 1L)
+  # The ids could not be read, five times over: still refused, and it says
+  # where to find them.
+  .pub_fail(w, "api", 5L)
   r <- .pub_publish(w)
   expect_false(identical(r$status, 0L))
   expect_true(grepl("could not list their ids", r$output, fixed = TRUE), info = r$output)
@@ -1512,9 +1513,18 @@ test_that("a draft that will not delete waits for the next run, and a listing th
               info = r$output)
   expect_identical(.pub_tags(w, drafts = TRUE), "metrics-2026-09-14")
 
-  # A listing that cannot be read is not "no drafts".
+  # This step runs after the publish has landed, so a listing that fails once
+  # is read again rather than reddening a run that had already done its work.
   w <- .pub_world(stale)
   .pub_fail(w, "api", 1L)
+  r <- .pub_sh(w, step)
+  expect_identical(r$status, 0L, info = r$output)
+  expect_true(grepl("went on past the drafts", r$output, fixed = TRUE), info = r$output)
+  expect_length(.pub_tags(w, drafts = TRUE), 0L)
+
+  # A listing that cannot be read at all is not "no drafts".
+  w <- .pub_world(stale)
+  .pub_fail(w, "api", 5L)
   r <- .pub_sh(w, step)
   expect_false(identical(r$status, 0L))
   expect_false(grepl("went on past the drafts", r$output, fixed = TRUE))
