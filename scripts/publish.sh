@@ -362,10 +362,16 @@ verify_asset() {
 # failing, and this is one more call that can get a 500. What it does not do is
 # go quietly, so a delete that does not land names the asset by id and says
 # what a later run does with it.
+#
+# A read it could not make says the same thing as a maybe, because a check
+# refuses with "not on the release" precisely when the upload never landed, so
+# this branch cannot say the name holds anything. That read has already raised
+# an error of its own, and this call decides nothing, so it does not raise a
+# second one over the same event.
 discard_asset() {
   local rel="$1" name="$2" rows row id
   if ! rows=$(release_assets "$rel"); then
-    echo "::error::could not read the assets of release ${rel} to clear ${name}, which holds bytes this run refused; delete it by id, because a run that finds the release has lost the asset it was staged for gives that name to these bytes without measuring them again."
+    echo "::warning::could not read the assets of release ${rel} to clear ${name}; delete it by id if it is there, because a run that finds the release has lost the asset it was staged for gives that name to these bytes without measuring them again."
     return 0
   fi
   row=$(asset_row "$rows" "$name")

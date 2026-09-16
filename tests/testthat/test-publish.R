@@ -922,6 +922,30 @@ test_that("a staging copy the run cannot clear is named by id for the operator",
                    .pub_seeded_bytes("bioc-code-metrics.db", 4000L))
 })
 
+test_that("a clearing that could not read the release says the bytes may not be there", {
+  # The branch that never got as far as looking. It cannot say the staging name
+  # holds anything: the check refuses with "not on the release" precisely when
+  # an upload never landed, and an operator sent after an asset that was never
+  # created reads the message as a state the release is in.
+  w <- .pub_shard_world()
+  .pub_fail(w, "api-assets", 99L)
+  r <- .pub_sh(w, c("discard_asset 2 swap-next-bioc-code-metrics.db || exit 1",
+                    'echo "went on"'))
+  # Best effort, and never the caller's exit status: the caller is already
+  # failing, and this is one more call that can get a 500.
+  expect_identical(r$status, 0L, info = r$output)
+  expect_true(grepl("went on", r$output, fixed = TRUE))
+  lines <- strsplit(r$output, "\n", fixed = TRUE)[[1L]]
+  said <- grep("to clear swap-next-bioc-code-metrics.db", lines, value = TRUE, fixed = TRUE)
+  expect_length(said, 1L)
+  expect_true(grepl("delete it by id if it is there", said, fixed = TRUE), info = said)
+  # The read that failed is already an error of its own, and this is a call
+  # that decides nothing, so it does not raise a second one over the same event.
+  expect_length(grep("^::error::", lines), 1L)
+  expect_true(grepl("failed to list the assets of release 2", grep("^::error::", lines, value = TRUE),
+                    fixed = TRUE))
+})
+
 test_that("the first rename failing leaves the release exactly as it was", {
   w <- .pub_shard_world()
   .pub_fail(w, "patch-swap-prev-bioc-code-metrics.db", 99L)
