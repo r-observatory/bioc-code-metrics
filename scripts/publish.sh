@@ -504,6 +504,12 @@ repair_release() {
 # renames are by id anyway, so reading the listing again here would only add a
 # request to the hourly budget.
 #
+# An empty OLD is a release carrying no NAME: one that never carried it, or one
+# whose half-written copy the repair cleared. There is then nothing to move out
+# of the way and nothing to put back, and NEW takes the free name; the upload
+# still went up under the temporary name and was measured there, which is what
+# keeps bytes a check refuses off the name a reader asks for.
+#
 # The old one goes out of the way first rather than being deleted. Measured
 # over five trials each, deleting first hands a reader whose listing was taken
 # a moment earlier a hard 404 on an id that is gone, which happened in three of
@@ -520,24 +526,26 @@ repair_release() {
 # to GitHub inside this script.
 swap_asset() {
   local rel="$1" name="$2" old="$3" new="$4" rows n renamed
-  if [ -z "$old" ] || [ -z "$new" ]; then
-    echo "::error::release ${rel} does not carry both ${name} and swap-next-${name}; refusing to swap them."
+  if [ -z "$new" ]; then
+    echo "::error::release ${rel} does not carry swap-next-${name}; refusing to swap it in."
     return 1
   fi
 
   # Until this lands nothing has changed and the release still carries NAME.
-  renamed=""
-  for n in 1 2 3 4 5; do
-    if rename_asset "$old" "swap-prev-${name}"; then
-      renamed=yes
-      break
+  if [ -n "$old" ]; then
+    renamed=""
+    for n in 1 2 3 4 5; do
+      if rename_asset "$old" "swap-prev-${name}"; then
+        renamed=yes
+        break
+      fi
+      echo "attempt ${n}: could not rename ${name} out of the way on release ${rel}"
+      if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+    done
+    if [ -z "$renamed" ]; then
+      echo "::error::five attempts failed to rename ${name} to swap-prev-${name}; the release still carries ${name} as it was."
+      return 1
     fi
-    echo "attempt ${n}: could not rename ${name} out of the way on release ${rel}"
-    if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
-  done
-  if [ -z "$renamed" ]; then
-    echo "::error::five attempts failed to rename ${name} to swap-prev-${name}; the release still carries ${name} as it was."
-    return 1
   fi
 
   # From here until this lands a reader asking for NAME gets nothing, so the
@@ -556,6 +564,10 @@ swap_asset() {
   rows=$(release_assets "$rel") || return 1
   if [ "$(asset_row "$rows" "$name" | cut -d' ' -f1)" = "$new" ]; then
     return 0
+  fi
+  if [ -z "$old" ]; then
+    echo "::error::${name} on release ${rel} could not be given to the new upload, and the release carried no ${name} before this run, so it carries none now. The bytes are whole under swap-next-${name}, and the repair at the start of the next run gives them the name."
+    return 1
   fi
   if rename_asset "$old" "$name"; then
     echo "::error::${name} on release ${rel} could not be given to the new upload, so the copy that was live is back under the name. Nothing was lost; the run fails so the next one replaces it again."
@@ -599,21 +611,21 @@ swap_asset() {
 # swap-prev-NAME is left behind on purpose. Deleting it here would cut off a
 # reader already pulling the old copy, and the repair at the start of the next
 # replacement deletes it instead.
+#
+# A release carrying no NAME at all, one that never carried this asset or one
+# whose half-written copy the repair just cleared, is staged for the same way.
+# The upload could take the free name directly and save a rename, but bytes
+# uploaded onto the name a reader asks for are bytes the run has to leave there
+# when it measures them and refuses them: only a copy under a name nothing
+# reads can be taken away again. So every upload onto a published release goes
+# up as swap-next-NAME and is measured before it is given a name, and the only
+# thing an empty NAME changes is that nothing is moved aside first.
 replace_asset() {
   local tag="$1" rel="$2" file="$3" name size sha live new stage
   name=$(basename "$file")
   size=$(file_bytes "$file") || return 1
   sha=$(file_sha256 "$file") || return 1
   live=$(repair_asset "$rel" "$name") || return 1
-
-  # Nothing under the name to protect: a release that never carried this asset,
-  # or one whose half-written copy the repair just cleared. The upload can take
-  # the name directly, and there is nothing to swap.
-  if [ -z "$live" ]; then
-    upload_asset "$tag" "$file" || return 1
-    verify_asset "$rel" "$name" "$size" "$sha" > /dev/null || return 1
-    return 0
-  fi
 
   stage="$(dirname "$file")/.swap-stage"
   mkdir -p "$stage" || return 1

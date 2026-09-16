@@ -1047,7 +1047,7 @@ test_that("an asset left only under the temporary name is renamed into place", {
   expect_length(.pub_asset_deletes(w), 0L)
 })
 
-test_that("a half-written asset with nothing under the name is cleared and the name uploaded fresh", {
+test_that("a half-written asset with nothing under the name is cleared and the name filled again", {
   w <- .pub_shard_world(assets = list(
     .pub_asset("swap-next-bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
     .pub_asset("bioc-data-metrics.db", 2000L),
@@ -1056,8 +1056,17 @@ test_that("a half-written asset with nothing under the name is cleared and the n
   expect_identical(r$status, 0L, info = r$output)
   .pub_expect_published(w)
   expect_identical(.pub_asset_deletes(w)[[1L]], "900")
-  # Nothing to protect, so no temporary name and no swap for that one.
-  expect_false("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  # There is nothing under the name to move aside, but the upload still goes up
+  # under the temporary name and is measured there. Bytes uploaded straight
+  # onto the name a reader asks for are bytes the run has to leave under it when
+  # the measurement refuses them.
+  expect_true("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  expect_false(any(grepl("upload metrics-2026-09-13 out/bioc-code-metrics.db",
+                         .pub_calls(w), fixed = TRUE)))
+  # One rename, because nothing had to be moved out of the way first.
+  expect_identical(grep("bioc-code-metrics\\.db$", .pub_renames(w), value = TRUE),
+                   sprintf("%s bioc-code-metrics.db",
+                           .pub_assets(w, "metrics-2026-09-13")[["bioc-code-metrics.db"]]$id))
   expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
                    .pub_bytes_of(w, "bioc-code-metrics.db"))
 })
@@ -1094,10 +1103,10 @@ test_that("a live name the release does not list as whole is cleared before anyt
   }
 })
 
-test_that("a live name holding an upload that was cut off is cleared and uploaded fresh", {
-  # Nothing is left to put the name back on, so the replacement has nothing to
-  # protect: the file takes the name directly rather than going up beside bytes
-  # no reader can be served and swapping with them.
+test_that("a live name holding an upload that was cut off is cleared and filled again", {
+  # Nothing is left to put the name back on, so there is nothing for the
+  # replacement to move aside. The upload goes up under the temporary name all
+  # the same, and only the copy the release has been asked about takes the name.
   w <- .pub_shard_world(assets = list(
     .pub_asset("bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
     .pub_asset("bioc-data-metrics.db", 2000L),
@@ -1106,9 +1115,70 @@ test_that("a live name holding an upload that was cut off is cleared and uploade
   expect_identical(r$status, 0L, info = r$output)
   .pub_expect_published(w)
   expect_identical(.pub_asset_deletes(w), "900")
-  expect_false("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  expect_true("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  expect_false(any(grepl("upload metrics-2026-09-13 out/bioc-code-metrics.db",
+                         .pub_calls(w), fixed = TRUE)))
+  expect_identical(grep("bioc-code-metrics\\.db$", .pub_renames(w), value = TRUE),
+                   sprintf("%s bioc-code-metrics.db",
+                           .pub_assets(w, "metrics-2026-09-13")[["bioc-code-metrics.db"]]$id))
   expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
                    .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
+test_that("bytes a run refuses are never left under the name, with or without a copy beside them", {
+  # The hazard the whole replacement exists to close, in the one state where a
+  # release carries nothing under the name: the run uploads, measures those
+  # bytes against the file they came from, refuses them, and the release is left
+  # advertising them. A later repair walks past, because an asset that finished
+  # uploading at the wrong size is still "uploaded".
+  #
+  # A cut-off upload under the live name is how a release reaches that state:
+  # the repair clears it, and whatever the replacement does next has no live
+  # copy to fall back on. The injected failure names both the live name and the
+  # temporary one, so the upload lands a byte short whichever it goes up under.
+  for (aside in c(FALSE, TRUE)) {
+    assets <- list(
+      .pub_asset("bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
+      .pub_asset("bioc-data-metrics.db", 2000L),
+      .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L))
+    # The displaced copy of an earlier replacement, beside the cut-off upload.
+    if (aside) assets <- append(assets, list(.pub_asset("swap-prev-bioc-code-metrics.db",
+                                                        4000L, id = 901L)))
+    w <- .pub_shard_world(assets = assets)
+    kept <- .pub_assets(w, "metrics-2026-09-13")[["swap-prev-bioc-code-metrics.db"]]$digest
+    .pub_fail(w, "short-bioc-code-metrics.db", 99L)
+    .pub_fail(w, "short-swap-next-bioc-code-metrics.db", 99L)
+    r <- .pub_publish(w)
+    expect_false(identical(r$status, 0L), info = r$output)
+
+    left <- names(.pub_assets(w, "metrics-2026-09-13"))
+    if (aside) {
+      # The copy set aside took the name back before the upload, so it is what
+      # a reader is served and the refused bytes never came near the name.
+      expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"),
+                       "901 4000 uploaded")
+      expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                       sprintf("bioc-code-metrics.db 4000 %s", kept))
+      expect_false("swap-next-bioc-code-metrics.db" %in% left)
+    } else {
+      # Nothing was left to put back, so the release carries no database at all,
+      # which is what preflight refuses to build on and what the next run
+      # replaces. What it must not carry is the copy this run measured.
+      expect_false(any(grepl("bioc-code-metrics", left)), info = paste(left, collapse = ", "))
+      read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+      expect_false(identical(read$status, 0L), info = read$output)
+      expect_true(grepl("no assets match the file pattern", read$output, fixed = TRUE),
+                  info = read$output)
+    }
+
+    # And the next run's repair finds nothing it could give the name to.
+    file.create(w$log)
+    r <- .pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1")
+    expect_identical(r$status, 0L, info = r$output)
+    expect_length(.pub_renames(w), 0L)
+    expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"),
+                     if (aside) "901 4000 uploaded" else NA_character_)
+  }
 })
 
 test_that("a staging copy that was refused is never the copy a later repair promotes", {
@@ -1232,17 +1302,24 @@ test_that("the heartbeat puts back a manifest an earlier one left half-swapped",
                    .pub_bytes_of(w, "code-manifest.json"))
 })
 
-test_that("a manifest the release never carried is uploaded under its own name", {
-  # The legacy code-/data- releases carry one series each, and there is nothing
-  # to protect under a name the release does not have.
+test_that("a manifest the release never carried goes up under the temporary name too", {
+  # The legacy code-/data- releases carry one series each, so there is nothing
+  # to move aside under a name the release does not have. The upload is still
+  # measured under the temporary name before it takes that name, because bytes
+  # a check refuses can only be taken away again from a name nothing reads.
   prior <- .pub_prior()
   prior$assets <- list(.pub_asset("bioc-code-metrics.db", 4000L),
                        .pub_asset("code-manifest.json", 8L))
   w <- .pub_world(list(prior))
   r <- .pub_heartbeat(w, "metrics-2026-09-12")
   expect_identical(r$status, 0L, info = r$output)
-  expect_identical(.pub_uploads(w), c("swap-next-code-manifest.json", "data-manifest.json"))
-  expect_equal(as.numeric(.pub_assets(w, "metrics-2026-09-12")[["data-manifest.json"]]$size), 140)
+  expect_identical(.pub_uploads(w),
+                   c("swap-next-code-manifest.json", "swap-next-data-manifest.json"))
+  after <- .pub_assets(w, "metrics-2026-09-12")
+  expect_equal(as.numeric(after[["data-manifest.json"]]$size), 140)
+  # One rename for the name that was free, two for the one that was not.
+  expect_identical(grep("data-manifest\\.json$", .pub_renames(w), value = TRUE),
+                   sprintf("%s data-manifest.json", after[["data-manifest.json"]]$id))
 })
 
 test_that("the heartbeat refuses to write into a draft", {
@@ -1518,6 +1595,12 @@ test_that("nothing in scripts/publish.sh clobbers an asset a reader asks for by 
   expect_length(swap, 1L)
   expect_true(grepl("swap-next-", swap, fixed = TRUE))
   expect_true(grepl("repair_asset", swap, fixed = TRUE))
+  # One upload, under the temporary name, however little the release carries
+  # under the real one. An upload onto the name a reader asks for is one the
+  # run cannot take back when it measures those bytes and refuses them.
+  ups <- grep("upload_asset ", strsplit(swap, "\n", fixed = TRUE)[[1L]], value = TRUE)
+  expect_length(ups, 1L)
+  expect_true(grepl("swap-next-", ups, fixed = TRUE), info = ups)
 })
 
 test_that("update.yml resolves only published releases and publishes through scripts/publish.sh", {
