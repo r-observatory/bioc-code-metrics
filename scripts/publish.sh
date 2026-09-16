@@ -350,8 +350,16 @@ verify_asset() {
 # Put back whatever an interrupted replacement left of NAME on release REL,
 # before anything else touches it.
 #
-# The five states a replacement can be caught in were built on a real published
+# The states a replacement can be caught in were built on a real published
 # release and read back the way the merger reads one:
+#
+#   NAME held by an upload that did not finish, whatever else is there. The
+#   asset sits at the full declared size with no digest, and its bytes are not
+#   servable: a download of it answers BlobNotFound. It is deleted first, and
+#   the rules below then decide what takes the name, so a copy that can be
+#   served is never set aside for one that cannot. Only "uploaded" counts as
+#   finished: a cut-off upload measures as "starter", which the documented
+#   states, uploaded and open, do not carry, so the set is not closed.
 #
 #   NAME there, plus a swap-next-NAME in any state. The upload was cut off or
 #   had just finished. A reader is fine. Delete swap-next-NAME, because an
@@ -390,6 +398,18 @@ repair_asset() {
   live=$(asset_row "$rows" "$name")
   prev=$(asset_row "$rows" "swap-prev-${name}")
   next=$(asset_row "$rows" "swap-next-${name}")
+  # Whatever holds NAME is only the live asset if the release says its upload
+  # finished. One that did not is deleted here, before the rules below read
+  # what is left, so that they never set aside a copy a reader can be served in
+  # favour of bytes nobody can download.
+  if [ -n "$live" ]; then
+    read -r id state _ <<< "$live"
+    if [ "$state" != uploaded ]; then
+      echo "::warning::${name} on release ${rel} is an upload that did not finish (state ${state}); its bytes are not servable, so it is deleted before anything else." >&2
+      delete_asset "$id" || return 1
+      live=""
+    fi
+  fi
   if [ -n "$live" ]; then
     if [ -n "$prev" ]; then
       echo "clearing swap-prev-${name} on release ${rel}, the copy the last replacement set aside" >&2

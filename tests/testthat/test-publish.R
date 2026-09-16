@@ -1006,6 +1006,55 @@ test_that("a half-written asset with nothing under the name is cleared and the n
                    .pub_bytes_of(w, "bioc-code-metrics.db"))
 })
 
+test_that("a live name the release does not list as whole is cleared before anything else", {
+  # An upload that was cut off sits under the name it was uploaded to, at the
+  # full declared size and with no digest, and its bytes are not servable: a
+  # download of it answers BlobNotFound. Reading that row as the live asset
+  # deletes swap-prev-<name>, the only copy on this release a reader can be
+  # served, and leaves the name on bytes nobody can download.
+  #
+  # "starter" is what a cut-off upload measures as, and the documented states,
+  # uploaded and open, do not carry it, so the set is not closed and only
+  # "uploaded" counts as whole.
+  for (state in c("starter", "open")) {
+    w <- .pub_shard_world(assets = list(
+      .pub_asset("bioc-code-metrics.db", 5000L, state = state, id = 900L),
+      .pub_asset("swap-prev-bioc-code-metrics.db", 4000L, id = 901L),
+      .pub_asset("bioc-data-metrics.db", 2000L),
+      .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+    aside <- .pub_assets(w, "metrics-2026-09-13")[["swap-prev-bioc-code-metrics.db"]]
+    r <- .pub_sh(w, "repair_release metrics-2026-09-13 bioc-code-metrics.db || exit 1")
+    expect_identical(r$status, 0L, info = paste(state, r$output))
+    # The copy that was not whole goes, and the one that was keeps its bytes
+    # and takes the name back.
+    expect_identical(.pub_asset_deletes(w), "900", info = state)
+    expect_identical(.pub_renames(w), "901 bioc-code-metrics.db", info = state)
+    expect_identical(.pub_asset_line(w, "metrics-2026-09-13", "bioc-code-metrics.db"),
+                     "901 4000 uploaded", info = state)
+    expect_identical(.pub_assets(w, "metrics-2026-09-13")[["bioc-code-metrics.db"]]$digest,
+                     aside$digest, info = state)
+    read <- .pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")
+    expect_identical(read$status, 0L, info = paste(state, read$output))
+  }
+})
+
+test_that("a live name holding an upload that was cut off is cleared and uploaded fresh", {
+  # Nothing is left to put the name back on, so the replacement has nothing to
+  # protect: the file takes the name directly rather than going up beside bytes
+  # no reader can be served and swapping with them.
+  w <- .pub_shard_world(assets = list(
+    .pub_asset("bioc-code-metrics.db", 5000L, state = "starter", id = 900L),
+    .pub_asset("bioc-data-metrics.db", 2000L),
+    .pub_asset("code-manifest.json", 8L), .pub_asset("data-manifest.json", 9L)))
+  r <- .pub_publish(w)
+  expect_identical(r$status, 0L, info = r$output)
+  .pub_expect_published(w)
+  expect_identical(.pub_asset_deletes(w), "900")
+  expect_false("swap-next-bioc-code-metrics.db" %in% .pub_uploads(w))
+  expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
+                   .pub_bytes_of(w, "bioc-code-metrics.db"))
+})
+
 test_that("a run stopped between the renames is repaired before the release is read", {
   # The repair is what the download step runs on the release it resolved,
   # before it decides which databases that release carries.
