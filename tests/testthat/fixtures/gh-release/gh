@@ -9,10 +9,14 @@
 #   - `release list` returns drafts unless --exclude-drafts is passed.
 #   - `view`, `upload`, `edit`, `download` and `delete` find a release by tag.
 #     gh looks the tag up as a published release and as a draft at the same
-#     time and takes whichever answer comes back first, so when both exist its
-#     choice is a race. This fake always takes the published one, the choice
-#     that loses a day's databases, so a path that deletes by tag in that state
-#     shows it.
+#     time and takes whichever answer comes back first: gh 2.100.0
+#     pkg/cmd/release/shared/fetch.go starts both lookups as goroutines on one
+#     channel and returns the first result carrying no error, so when both
+#     exist its choice is a race. This fake settles that race published-first
+#     every time, which is the fake's own choice and not a rule of gh's. It is
+#     also the answer that loses a day's databases, so a path that deletes by
+#     tag in that state shows it, and nothing a test asserts may rest on the
+#     order.
 #   - `api` lists every release with its id, newest first as REST orders them,
 #     and deletes one by id. The {owner}/{repo} placeholders stay literal.
 #   - `upload --clobber` deletes the existing asset before the new one lands.

@@ -99,8 +99,8 @@ latest_tag() {
 
 # "published", "draft", nothing when no release carries the tag, or one line
 # per release when more than one does. GitHub does not stop a draft from
-# sharing a tag with another release, and gh then picks whichever lookup
-# answers first, so that case has no safe reading.
+# sharing a tag with another release, and gh then acts on whichever of its two
+# lookups answers first (release_rows), so that case has no safe reading.
 #
 # The listing is read up to five times, 10 s, then 20 s and so on apart. Most
 # days publish nothing and only get as far as the heartbeat, and a single
@@ -126,7 +126,12 @@ release_state() {
 # than `gh release list`, which has no id to give. An id is the only safe way
 # to name one of two releases under the same tag: `gh release delete TAG`
 # looks the tag up as a published release and as a draft at the same time and
-# acts on whichever answer comes back first.
+# acts on whichever answer comes back first. Read out of gh 2.100.0, where
+# shared.FetchRelease in pkg/cmd/release/shared/fetch.go runs both lookups as
+# goroutines on one channel and returns the first result carrying no error,
+# and pkg/cmd/release/delete/delete.go deletes what that hands back. So a
+# delete by tag aimed at the draft is a race it can lose, and there is no
+# arranging for it to win.
 release_rows() {
   gh api "repos/{owner}/{repo}/releases?per_page=100" --paginate \
     -q '.[] | "\(.id) \(.tag_name) \(if .draft then "draft" else "published" end)"' || return 1
@@ -608,10 +613,11 @@ edit_release() {
 # release and as a draft at the same time and acts on whichever answer comes
 # back first (release_rows). So when the listing has not caught up with a
 # release published under the same tag, the delete can take that release
-# instead, and each repeat is another chance to. A draft the one attempt leaves
-# is deleted by the next publish under the tag, or by delete_stale_drafts once
-# the day has passed. The listing, the uploads, the read-back and the edits
-# land the same however often they run, and each is retried.
+# instead, and each repeat is another chance to. A draft the one attempt
+# leaves is deleted by the next publish under the tag, or by
+# delete_stale_drafts once the day has passed. The listing, the uploads, the
+# read-back and the edits land the same however often they run, and each is
+# retried.
 #
 # Databases go up before manifests whatever order they are passed in. The four
 # assets are still replaced one at a time, so a run that stops part way leaves
