@@ -554,6 +554,15 @@ repair_release() {
 # difference is one process start and one TLS handshake in the middle of it.
 # Half a second, a few times a day, does not buy a second way of authenticating
 # to GitHub inside this script.
+#
+# Both halves back off 2 s, then 4 s and so on, where every listing here waits
+# 10 s and up. A listing is read again while the release is whole and a reader
+# is being served, so the only cost of waiting there is the run's own time. A
+# rename is not: the second one is the half in which a reader finds no NAME,
+# and the first is what decides how long that half is put off for. Four waits
+# at 10 s and four at 5 s put roughly 100 s between the two halves and left
+# about 50 s with nothing under the name, against a swap that measured half a
+# second when the renames land. Four waits of 2/4/6/8 hold both to about 20 s.
 swap_asset() {
   local rel="$1" name="$2" old="$3" new="$4" rows n renamed
   if [ -z "$new" ]; then
@@ -570,7 +579,7 @@ swap_asset() {
         break
       fi
       echo "attempt ${n}: could not rename ${name} out of the way on release ${rel}"
-      if [ "$n" -lt 5 ]; then publish_backoff "$n" 10; fi
+      if [ "$n" -lt 5 ]; then publish_backoff "$n" 2; fi
     done
     if [ -z "$renamed" ]; then
       echo "::error::five attempts failed to rename ${name} to swap-prev-${name}; the release still carries ${name} as it was."
@@ -585,7 +594,7 @@ swap_asset() {
       break
     fi
     echo "attempt ${n}: could not give ${name} to the new upload on release ${rel}"
-    if [ "$n" -lt 5 ]; then publish_backoff "$n" 5; fi
+    if [ "$n" -lt 5 ]; then publish_backoff "$n" 2; fi
   done
 
   # The release decides, not the PATCH. One that returns 500 can still have

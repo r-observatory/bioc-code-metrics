@@ -987,7 +987,11 @@ test_that("a second rename that never lands puts the live asset back under its n
   expect_false(any(grepl("bioc-data-metrics", .pub_uploads(w), fixed = TRUE)))
 })
 
-test_that("the swap waits longer after each failed rename", {
+test_that("the swap waits longer after each failed rename, in seconds not tens of them", {
+  # Both halves are seconds apart. The second is the half in which a reader
+  # finds no asset under the name, and the first is what decides how long that
+  # half is put off for, so waiting tens of seconds in either one stretches the
+  # window the whole replacement exists to keep short.
   w <- .pub_shard_world()
   .pub_fail(w, "patch-swap-prev-bioc-code-metrics.db", 2L)
   .pub_fail(w, "patch-bioc-code-metrics.db", 2L)
@@ -996,7 +1000,7 @@ test_that("the swap waits longer after each failed rename", {
                     "replace_asset metrics-2026-09-13 2 out/bioc-code-metrics.db || exit 1"),
                wait = NA)
   expect_identical(r$status, 0L, info = r$output)
-  expect_identical(readLines(slept), c("10", "20", "5", "10"))
+  expect_identical(readLines(slept), c("2", "4", "2", "4"))
 })
 
 test_that("a name that cannot be put back is restored from the previous copy next time", {
