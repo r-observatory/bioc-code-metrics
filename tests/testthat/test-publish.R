@@ -909,8 +909,13 @@ test_that("a staging copy the run cannot clear is named by id for the operator",
   r <- .pub_publish(w)
   expect_false(identical(r$status, 0L))
   left <- .pub_assets(w, "metrics-2026-09-13")[["swap-next-bioc-code-metrics.db"]]
-  expect_true(grepl(sprintf("asset %s", left$id), r$output, fixed = TRUE), info = r$output)
-  expect_true(grepl("delete it by id", r$output, fixed = TRUE), info = r$output)
+  # The id has to be in the line an operator is left with, not only in the one
+  # the run printed on its way into a delete that then failed.
+  said <- grep("^::error::could not clear ", strsplit(r$output, "\n", fixed = TRUE)[[1L]],
+               value = TRUE)
+  expect_length(said, 1L)
+  expect_true(grepl(sprintf("asset %s", left$id), said, fixed = TRUE), info = said)
+  expect_true(grepl("delete it by id", said, fixed = TRUE), info = said)
   # A delete it could not make is not a reason to touch the live asset.
   expect_length(.pub_renames(w), 0L)
   expect_identical(.pub_read(w, "metrics-2026-09-13", "bioc-code-metrics.db")$output,
