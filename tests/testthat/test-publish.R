@@ -1256,14 +1256,25 @@ test_that("a run stopped between the renames is repaired before the release is r
                    "900 4000 uploaded")
 })
 
-test_that("the repair has nothing to say about a release that never carried the asset", {
-  # A legacy release carries one series, and a cold start has no release at all.
+test_that("the repair says so when the release has nothing to give the name back to", {
+  # The one state nothing here can put right: no <name>, and neither of the
+  # names a replacement stages under. Every other state either repairs itself
+  # or leaves a copy a reader can still be served, so this is the one the
+  # operator has to hear about, and it is the state a legacy release carrying
+  # only the other series is in. It is not a failure: the caller may be about
+  # to upload the asset. A cold start has no release to say anything about.
   w <- .pub_shard_world(assets = list(.pub_asset("bioc-code-metrics.db", 4000L)))
   r <- .pub_sh(w, c("repair_release metrics-2026-09-13 bioc-data-metrics.db data-manifest.json || exit 1",
                     'repair_release "" bioc-code-metrics.db || exit 1',
                     'echo "went on"'))
   expect_identical(r$status, 0L, info = r$output)
   expect_true(grepl("went on", r$output, fixed = TRUE))
+  said <- grep("^::warning::", strsplit(r$output, "\n")[[1L]], value = TRUE)
+  expect_length(said, 2L)
+  expect_true(all(grepl("release 2 carries no", said, fixed = TRUE)),
+              info = paste(said, collapse = " | "))
+  expect_true(any(grepl("no bioc-data-metrics.db", said, fixed = TRUE)), info = r$output)
+  expect_true(any(grepl("no data-manifest.json", said, fixed = TRUE)), info = r$output)
   expect_length(.pub_renames(w), 0L)
   expect_length(.pub_asset_deletes(w), 0L)
   expect_length(grep("releases/tags/", .pub_calls(w), fixed = TRUE), 1L)

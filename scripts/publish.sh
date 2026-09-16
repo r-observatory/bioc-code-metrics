@@ -423,7 +423,13 @@ discard_asset() {
 #   Delete it; the caller is about to upload the name again, and when no
 #   caller is, preflight is the guard that refuses to build on that release.
 #
-#   Nothing of either name. Nothing to repair.
+#   Nothing of either name. Nothing to repair, and the one state no code here
+#   can put right: the release carries no copy of the asset under any of the
+#   three names, so a reader asking for it gets nothing until something
+#   uploads it again. Every other state either repairs itself or leaves a copy
+#   a reader can still be served, so this is the one the operator has to be
+#   told about. It is not a failure: a caller that is about to upload the
+#   asset, and a legacy release carrying only the other series, are both in it.
 #
 # All by id, from the assets endpoint, because that is the only listing that
 # shows a half-written upload. Running it twice is a no-op the second time.
@@ -483,6 +489,8 @@ repair_asset() {
     fi
     echo "::warning::release ${rel} carries no ${name}, and swap-next-${name} never finished uploading; deleting it." >&2
     delete_asset "$id" || return 1
+  else
+    echo "::warning::release ${rel} carries no ${name}, and nothing a replacement set aside or staged for it, so there is nothing to put the name back on." >&2
   fi
   return 0
 }
