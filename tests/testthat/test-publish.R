@@ -19,7 +19,34 @@
   normalizePath(file.path("..", "..", "scripts", "publish.sh"), mustWork = FALSE)
 }
 
-.pub_asset <- function(name, size) list(name = name, size = size, state = "uploaded")
+# One asset on a seeded release. A half-written upload ("starter") carries no
+# digest, as the release endpoint reports it. The id is filled in by
+# .pub_world, so a test only names one when it wants to assert on it.
+.pub_asset <- function(name, size, state = "uploaded", id = NULL) {
+  a <- list(name = name, size = size, state = state)
+  if (!is.null(id)) a$id <- id
+  a
+}
+
+# Give every seeded asset the id and digest a real release would report. The
+# ids run from 1001 so they cannot be confused with a release id in the call
+# log, and the digest stands in for bytes this fake does not hold.
+.pub_with_asset_ids <- function(releases) {
+  next_id <- 1000L
+  lapply(releases, function(rel) {
+    rel$assets <- lapply(rel$assets %||% list(), function(a) {
+      if (is.null(a$id)) {
+        next_id <<- next_id + 1L
+        a$id <- next_id
+      }
+      if (identical(a$state, "uploaded") && is.null(a$digest)) {
+        a$digest <- paste0("sha256:", digest::digest(paste(a$name, a$size), algo = "sha256"))
+      }
+      a
+    })
+    rel
+  })
+}
 
 # Yesterday's release, published, Latest and complete.
 .pub_prior <- function() list(
@@ -60,7 +87,7 @@
   for (f in names(sizes)) writeBin(as.raw(rep(65L, sizes[[f]])), file.path(dir, "out", f))
   writeLines("notes", file.path(dir, "out", "release-notes-code.md"))
 
-  jsonlite::write_json(releases, w$state, auto_unbox = TRUE)
+  jsonlite::write_json(.pub_with_asset_ids(releases), w$state, auto_unbox = TRUE)
   w
 }
 
