@@ -70,7 +70,7 @@ test_that("a database holding less than its manifest recorded stops the run", {
 
 test_that("a database ahead of its manifest is a note, not a refusal", {
   # A same-day publish replaces four assets one at a time, each uploaded under
-  # <name>.next and then renamed into place, so an interrupted publish leaves
+  # swap-next-<name> and then renamed into place, so an interrupted publish leaves
   # one shard's database beside an earlier shard's manifest. Refusing on that
   # would make a transient upload failure permanent: the same release stays
   # latest tomorrow.
@@ -104,8 +104,8 @@ test_that("a manifest predating the series field is noted, not refused", {
 
 test_that("a manifest that came back without its database stops the run", {
   # A same-day publish replaces the database and the manifest one at a time,
-  # each uploaded under <name>.next and then renamed into place. A run stopped
-  # between those two renames leaves the bytes under <name>.prev and nothing
+  # each uploaded under swap-next-<name> and then renamed into place. A run
+  # stopped between those renames leaves the bytes under swap-prev-<name> and nothing
   # under the name, so the release can advertise code-manifest.json and no
   # bioc-code-metrics.db, in which case the download step has nothing to fetch
   # and hands preflight an empty `expected`. The manifest that DID come back is
@@ -182,7 +182,7 @@ test_that("the data series is checked on its own tables", {
 
 test_that("a release carrying a database and no manifest gets a baseline measured from it", {
   # A same-day publish replaces four assets one at a time, each uploaded under
-  # <name>.next and then renamed into place, so a run that died between two of
+  # swap-next-<name> and then renamed into place, so a run that died between two of
   # them leaves a release with its database and no manifest. The database is
   # right there and it is the thing worth protecting, so measure it rather than
   # have nothing to check against.
@@ -334,6 +334,22 @@ test_that("the repair advice deletes a release that carries nothing along with i
   # release instead, so that case goes by id.
   expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>", advice, fixed = TRUE))
   expect_true(grepl("force_full", advice, fixed = TRUE))
+})
+
+test_that("the repair advice describes how a publish leaves a release now", {
+  # It used to say the publish deletes each asset before uploading its
+  # replacement, which is what sent an operator looking for a release that had
+  # lost one outright. A replacement uploads beside the live asset and renames,
+  # so what is actually left is a database from one shard beside a manifest
+  # from another, or the bytes sitting under swap-prev-<name> with nothing under the
+  # name; and the next run repairs the second of those by itself.
+  advice <- preflight_repair_advice()
+  expect_false(grepl("--clobber", advice, fixed = TRUE))
+  expect_true(grepl("swap-prev-<name>", advice, fixed = TRUE))
+  expect_true(grepl("renamed into place", advice, fixed = TRUE))
+  # And it says how to see an upload that was cut off, which gh release view
+  # does not list.
+  expect_true(grepl("releases/<id>/assets", advice, fixed = TRUE))
 })
 
 # ---------------------------------------------------------------------------

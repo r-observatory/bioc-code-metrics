@@ -124,9 +124,9 @@
 #'
 #' One-sided on purpose. Only `now < was` is the signature this is for: a
 #' truncated file, or a database from before the rows the manifest counted. The
-#' other direction is what an interrupted `gh release upload --clobber` leaves
-#' when this shard's database lands beside the previous shard's manifest, and
-#' it costs nothing, so it is reported by prior_db_notes() instead.
+#' other direction is what an interrupted publish leaves when this shard's
+#' database lands beside the previous shard's manifest, and it costs nothing,
+#' so it is reported by prior_db_notes() instead.
 #'
 #' @param series "code" or "data".
 #' @param counts list(n_packages, n_versions) measured from the downloaded DB.
@@ -204,9 +204,9 @@ prior_db_notes <- function(series, counts, prior, tables) {
 #' A baseline measured from a downloaded database, for a release that
 #' published no manifest.
 #'
-#' The publish is not atomic (four assets replaced one at a time with --clobber,
-#' each existing asset deleted before its replacement lands), so a run that
-#' died in that window can leave a release carrying its database and no
+#' The publish is not atomic (four assets replaced one at a time, each uploaded
+#' under a temporary name and renamed into place), so a run that died between
+#' two of them can leave a release carrying its database and no
 #' code-manifest.json. There was nothing to check such a database against, so
 #' it was checked against the row count alone and a release that lost one asset
 #' was refused every day after, since the same release stays latest.
@@ -257,9 +257,10 @@ ensure_prior_baseline <- function(out_dir) {
     if (is.null(derived)) next
     jsonlite::write_json(derived, mpath, auto_unbox = TRUE, pretty = TRUE)
     notes <- c(notes, sprintf(paste0(
-      "the prior release carries %s but no %s, which is what an interrupted ",
-      "`gh release upload --clobber` leaves. The baseline for this run was ",
-      "measured from the database instead: %s packages, %s rows in %s. ",
+      "the prior release carries %s but no %s, which is what a publish ",
+      "interrupted between two of its assets leaves. The baseline for this ",
+      "run was measured from the database instead: %s packages, %s rows in ",
+      "%s. ",
       "Re-upload the manifest that belongs with that database so the next run ",
       "has a published record to check against."),
       spec$db, spec$manifest_asset, .pf_fmt(derived$n_packages),
@@ -386,15 +387,21 @@ preflight_prior_dbs <- function(out_dir, expected = character(0L),
 preflight_repair_advice <- function() {
   paste0(
     "\nLook at the PREVIOUS release first. A same-day publish replaces four ",
-    "assets one at a time with `gh release upload --clobber`, which deletes ",
-    "each existing asset before uploading its replacement and cannot do so ",
-    "atomically, so an interrupted publish can leave one shard's database ",
-    "beside another shard's manifest, or a database that never finished ",
-    "uploading.\n",
-    "If that is what happened, open the release the download step resolved as ",
-    "code src / data src and make its assets agree again: re-upload the ",
-    "database and the manifest that belong together, or delete that release ",
-    "so the day before it becomes latest again. Then re-run.\n",
+    "assets one at a time, each uploaded under swap-next-<name> and then ",
+    "renamed into place, so an interrupted publish can leave one shard's ",
+    "database beside another shard's manifest, or an asset sitting under ",
+    "swap-prev-<name> with nothing under the name itself.\n",
+    "The second of those repairs itself: the next run puts swap-prev-<name> ",
+    "back under the name before it reads the release, so re-running is the ",
+    "first thing to try. ",
+    "`gh api repos/{owner}/{repo}/releases/tags/TAG -q .id` and ",
+    "`gh api repos/{owner}/{repo}/releases/<id>/assets` show what the release ",
+    "is actually carrying, including an upload that was cut off part way, ",
+    "which `gh release view` does not list.\n",
+    "If instead the assets disagree with each other, open the release the ",
+    "download step resolved as code src / data src and make them agree again: ",
+    "re-upload the database and the manifest that belong together, or delete ",
+    "that release so the day before it becomes latest again. Then re-run.\n",
     "If that release carries no assets at all for the series, there is nothing ",
     "in it to repair. Delete it with `gh release delete TAG --yes --cleanup-tag`, ",
     "so its git tag goes with it, then re-run. If `gh release list` shows a ",
