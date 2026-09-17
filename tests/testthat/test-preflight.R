@@ -69,10 +69,11 @@ test_that("a database holding less than its manifest recorded stops the run", {
 })
 
 test_that("a database ahead of its manifest is a note, not a refusal", {
-  # publish_metrics uploads four assets in one `gh release upload --clobber`,
-  # which cannot be atomic, so an interrupted publish leaves one shard's
-  # database beside an earlier shard's manifest. Refusing on that would make a
-  # transient upload failure permanent: the same release stays latest tomorrow.
+  # A same-day publish replaces four assets one at a time, each uploaded under
+  # swap-next-<name> and then renamed into place, so an interrupted publish leaves
+  # one shard's database beside an earlier shard's manifest. Refusing on that
+  # would make a transient upload failure permanent: the same release stays
+  # latest tomorrow.
   out <- withr::local_tempdir()
   .pf_code_db(file.path(out, DB_FILENAME), 9L)
   write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
@@ -102,10 +103,10 @@ test_that("a manifest predating the series field is noted, not refused", {
 })
 
 test_that("a manifest that came back without its database stops the run", {
-  # publish_metrics uploads the database and the manifest in one
-  # `gh release upload --clobber`, which deletes each existing asset before
-  # replacing it and cannot do so atomically. An interrupted publish can
-  # therefore leave a release advertising code-manifest.json and no
+  # A same-day publish replaces the database and the manifest one at a time,
+  # each uploaded under swap-next-<name> and then renamed into place. A run
+  # stopped between those renames leaves the bytes under swap-prev-<name> and nothing
+  # under the name, so the release can advertise code-manifest.json and no
   # bioc-code-metrics.db, in which case the download step has nothing to fetch
   # and hands preflight an empty `expected`. The manifest that DID come back is
   # the evidence that this is not a cold start.
@@ -180,10 +181,11 @@ test_that("the data series is checked on its own tables", {
 # ---------------------------------------------------------------------------
 
 test_that("a release carrying a database and no manifest gets a baseline measured from it", {
-  # publish_metrics uploads four assets in one non-atomic --clobber, so a run
-  # that died in that window leaves a release with its database and no
-  # manifest. The database is right there and it is the thing worth protecting,
-  # so measure it rather than have nothing to check against.
+  # A same-day publish replaces four assets one at a time, each uploaded under
+  # swap-next-<name> and then renamed into place, so a run that died between two of
+  # them leaves a release with its database and no manifest. The database is
+  # right there and it is the thing worth protecting, so measure it rather than
+  # have nothing to check against.
   out <- withr::local_tempdir()
   .pf_code_db(file.path(out, DB_FILENAME), 4L)
 
@@ -244,8 +246,128 @@ test_that("a database with nothing to measure yields no baseline", {
 })
 
 # ---------------------------------------------------------------------------
+# A release that resolved and carried nothing
+# ---------------------------------------------------------------------------
+
+test_that("a resolved release carrying neither database nor manifest stops the run", {
+  # Keyed on the files alone, a release with no assets at all looks exactly
+  # like no release: nothing advertised, nothing downloaded. That is the shape
+  # a failed `gh release create` leaves when its uploads and its cleanup both
+  # fail, and read as a cold start it would publish one shard as latest. The
+  # resolved tag is what says a release was there.
+  out <- withr::local_tempdir()
+  res <- preflight_prior_dbs(out, character(0L),
+                             resolved = c(code = "metrics-2026-09-13",
+                                          data = "metrics-2026-09-13"))
+  v <- res$violations
+  expect_length(v, 2L)
+  expect_true(all(grepl("metrics-2026-09-13", v, fixed = TRUE)))
+  expect_true(any(grepl("bioc-code-metrics.db", v, fixed = TRUE) &
+                  grepl("code-manifest.json", v, fixed = TRUE)))
+  expect_true(any(grepl("bioc-data-metrics.db", v, fixed = TRUE) &
+                  grepl("data-manifest.json", v, fixed = TRUE)))
+  expect_setequal(res$checked, c("code", "data"))
+  # The download step resolves published releases only, so the release named
+  # here is a published one. Calling it a draft sends the operator to the
+  # repair for a release that has no git tag.
+  expect_false(any(grepl("draft", v, ignore.case = TRUE)))
+})
+
+test_that("a run that resolved no release is still a cold start", {
+  out <- withr::local_tempdir()
+  res <- preflight_prior_dbs(out, character(0L), resolved = c(code = "", data = ""))
+  expect_identical(res$violations, character(0L))
+  expect_identical(res$checked, character(0L))
+})
+
+test_that("a resolved release holds only the series it resolved for", {
+  # The legacy split tags resolve code and data separately, so a code release
+  # with no data release beside it is a cold start for the data series only.
+  out <- withr::local_tempdir()
+  .pf_code_db(file.path(out, DB_FILENAME), 4L)
+  write_manifest(file.path(out, "prev-code-manifest.json"), .pf_manifest())
+  res <- preflight_prior_dbs(out, "code", resolved = c(code = "code-2026-07-01", data = ""))
+  expect_identical(res$violations, character(0L))
+  expect_identical(res$checked, "code")
+})
+
+test_that("preflight reads the resolved tags off its command line", {
+  a <- .pf_parse_args(c("out/", "--code-src=metrics-2026-09-13", "--data-src=", "code"))
+  expect_identical(a$out_dir, "out/")
+  expect_identical(a$expected, "code")
+  expect_identical(a$resolved, c(code = "metrics-2026-09-13", data = ""))
+
+  a <- .pf_parse_args(c("out/", "code", "data"))
+  expect_identical(a$expected, c("code", "data"))
+  expect_identical(a$resolved, c(code = "", data = ""))
+})
+
+test_that("the preflight script refuses a resolved release that carried nothing", {
+  skip_on_os("windows")
+  out <- withr::local_tempdir()
+  script <- normalizePath(file.path("..", "..", "scripts", "preflight.R"))
+  run <- function(...) {
+    res <- suppressWarnings(system2(file.path(R.home("bin"), "Rscript"),
+                                    c(shQuote(script), shQuote(out), ...),
+                                    stdout = TRUE, stderr = TRUE))
+    list(status = attr(res, "status") %||% 0L, output = paste(res, collapse = "\n"))
+  }
+
+  bad <- run("--code-src=metrics-2026-09-13", "--data-src=metrics-2026-09-13")
+  expect_false(identical(bad$status, 0L))
+  expect_true(grepl("metrics-2026-09-13", bad$output, fixed = TRUE))
+
+  cold <- run("--code-src=", "--data-src=")
+  expect_identical(cold$status, 0L, info = cold$output)
+  expect_true(grepl("starts from nothing", cold$output, fixed = TRUE))
+})
+
+test_that("the repair advice deletes a release that carries nothing along with its tag", {
+  # What reaches the refusal is a published release, and it has a git tag.
+  # Deleted without --cleanup-tag, the tag stays behind where the prune, which
+  # lists releases, never finds it, and a later publish under that date
+  # attaches to the old commit.
+  advice <- preflight_repair_advice()
+  expect_true(grepl("gh release delete TAG --yes --cleanup-tag", advice, fixed = TRUE))
+  expect_false(grepl("without --cleanup-tag", advice, fixed = TRUE))
+  # When a draft shares the tag, a delete by tag can take the published
+  # release instead, so that case goes by id.
+  expect_true(grepl("gh api -X DELETE repos/{owner}/{repo}/releases/<id>", advice, fixed = TRUE))
+  expect_true(grepl("force_full", advice, fixed = TRUE))
+})
+
+test_that("the repair advice describes how a publish leaves a release now", {
+  # It used to say the publish deletes each asset before uploading its
+  # replacement, which is what sent an operator looking for a release that had
+  # lost one outright. A replacement uploads beside the live asset and renames,
+  # so what is actually left is a database from one shard beside a manifest
+  # from another, or the bytes sitting under swap-prev-<name> with nothing under the
+  # name; and the next run repairs the second of those by itself.
+  advice <- preflight_repair_advice()
+  expect_false(grepl("--clobber", advice, fixed = TRUE))
+  expect_true(grepl("swap-prev-<name>", advice, fixed = TRUE))
+  expect_true(grepl("renamed into place", advice, fixed = TRUE))
+  # And it says how to see an upload that was cut off, which gh release view
+  # does not list.
+  expect_true(grepl("releases/<id>/assets", advice, fixed = TRUE))
+})
+
+# ---------------------------------------------------------------------------
 # The workflow half: the download that must not swallow its failure
 # ---------------------------------------------------------------------------
+
+test_that("update.yml keeps the prior manifest under the name preflight reads", {
+  # The download step fetches the manifest off the release and renames it on
+  # disk, and preflight_prior_dbs looks for that name and nothing else. The
+  # swap-prev-<name> a replacement leaves on the release is a different thing
+  # that never reaches the runner, so the two must not drift into each other.
+  yml <- paste(readLines(file.path("..", "..", ".github", "workflows", "update.yml")),
+               collapse = "\n")
+  for (spec in .preflight_specs()) {
+    expect_true(grepl(sprintf("mv out/%s out/%s", spec$manifest_asset, spec$manifest),
+                      yml, fixed = TRUE), info = spec$series)
+  }
+})
 
 test_that("update.yml fails the run when a prior asset does not arrive", {
   workflow_path <- file.path("..", "..", ".github", "workflows", "update.yml")

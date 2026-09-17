@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# A stand-in for the `gh release` subcommands and the `gh api` calls
+# scripts/publish.sh makes, for tests/testthat/test-publish.R. Nothing here
+# touches the network.
+#
+# It models the parts of gh 2.100.0 that decide whether a publish can strand a
+# draft, read from gh's own source when metrics-2026-09-13 was stranded in the
+# sibling cran-code-metrics pipeline:
+#   - `release list` returns drafts unless --exclude-drafts is passed.
+#   - `view`, `upload`, `edit`, `download` and `delete` find a release by tag.
+#     gh looks the tag up as a published release and as a draft at the same
+#     time and takes whichever answer comes back first: gh 2.100.0
+#     pkg/cmd/release/shared/fetch.go starts both lookups as goroutines on one
+#     channel and returns the first result carrying no error, so when both
+#     exist its choice is a race. This fake settles that race published-first
+#     every time, which is the fake's own choice and not a rule of gh's. It is
+#     also the answer that loses a day's databases, so a path that deletes by
+#     tag in that state shows it, and nothing a test asserts may rest on the
+#     order.
+#   - `api` lists every release with its id, newest first as REST orders them,
+#     and deletes one by id. The {owner}/{repo} placeholders stay literal.
+#   - `upload --clobber` deletes the existing asset before the new one lands.
+#   - `delete --cleanup-tag` deletes the release and then fails, because a
+#     draft has no git tag to clean up.
+#
+# The asset endpoints, and everything below about what an asset looks like
+# while it is being replaced, were measured against a real published release on
+# a scratch repository rather than read from gh:
+#   - An upload in flight, or one that was cut off, is an asset in state
+#     "starter" at the full declared size with no digest. GET on the release's
+#     assets endpoint is the only listing that shows it: the tag listing that
+#     `release view` and `release download` read leaves it out, so `upload
+#     --clobber` cannot delete it either. It does not hold its name: the next
+#     upload under that name displaces it and takes a new id.
+#   - A finished asset carries digest "sha256:<64 hex>" of its bytes, and gh
+#     returning 0 is not proof the bytes are servable yet.
+#   - PATCH of an asset with {"name": ...} changes the name and nothing else:
+#     the id, the size and the digest stay, and a download by name follows the
+#     new name. A name another asset of the same release holds is refused with
+#     422 already_exists, compared case-insensitively; renaming an asset to the
+#     name it already holds is a 200 that changes nothing; an id that does not
+#     exist is 404.
+#   - `gh api` prints the JSON error body on stdout, the "gh: ... (HTTP nnn)"
+#     line on stderr, and exits 1.
+#   - `release download -p` matches the asset NAME with filepath.Match: exact,
+#     case sensitive, and blind to the label. Neither `db` nor `db*` matches
+#     `swap-next-db` or `swap-prev-db`. With no match it prints "no assets match the
+#     file pattern"
+#     and exits 1.
+#   - `release upload` names the asset after the basename of the path it was
+#     given and follows a symlink for the bytes, which is how a file gets a
+#     temporary name without being copied.
+#   - Both listings order assets by the asset's CURRENT name, so a rename moves
+#     one in the listing.
+#   - `release view --json assets` gives the node id, not the numeric one, so
+#     nothing can take a numeric asset id from it.
+#
+# State lives in $GH_STATE, a JSON array of
+#   {id, tagName, isDraft, isLatest, name,
+#    assets: [{id, name, size, state, digest}]}.
+# This fake holds no asset bytes. A download writes "<name> <size> <digest>"
+# in their place, which is enough to tell one copy of an asset from another.
+# Every call is appended to $GH_LOG. Failures are injected through counters in
+# $GH_FAILS: a file holding N makes the next N matching calls fail.
+#   upload-<asset>  the upload returns HTTP 500 and leaves a half-written asset
+#   short-<asset>   the upload succeeds but records one byte fewer than sent
+#   corrupt-<asset> the upload succeeds at the right size under a digest that
+#                   is not the file's
+#   starter-<asset> the upload returns 0 but the asset stays half-written
+#   create          the POST returns HTTP 500 after the draft was created
+#   publish         `edit --draft=false` returns HTTP 500 and changes nothing
+#   publish-after   `edit --draft=false` applies, then returns HTTP 500
+#   edit            any other `edit` returns HTTP 500 and changes nothing
+#   delete          `release delete` returns HTTP 500 and deletes nothing
+#   list            `release list` returns HTTP 500
+#   view            `release view` returns HTTP 502
+#   stale-<asset>   `release view` leaves that asset out, as a read that has
+#                   not caught up with its upload would
+#   api             `api` listing the releases returns HTTP 500
+#   api-delete      `api -X DELETE` of a release by id returns HTTP 500
+#   api-tags        `api` reading a release by tag returns HTTP 500
+#   api-assets      `api` listing a release's assets returns HTTP 500
+#   patch-<name>    the PATCH that renames an asset TO <name> returns HTTP 500
+#                   and changes nothing
+#   patch-after-<name>  that PATCH applies, then returns HTTP 500
+#   lag-<name>      that PATCH applies and answers 200, and then the next N
+#                   reads of the release's assets still show the state it
+#                   found, as a listing taken inside the window of a write
+#                   that has already answered does
+#   asset-delete    `api -X DELETE` of an asset by id returns HTTP 500
+# Anything this fake does not model exits 2, so a publish that starts calling
+# gh some other way fails its test instead of passing by accident.
+set -u
+
+printf 'gh %s\n' "$*" >> "$GH_LOG"
+
+die() { echo "$1" >&2; exit "${2:-1}"; }
+state() { cat "$GH_STATE"; }
+save() { local t; t=$(mktemp) && cat > "$t" && mv "$t" "$GH_STATE"; }
+nbytes() { wc -c < "$1" | tr -d ' '; }
+# The sha256 of the bytes a path leads to, symlink and all.
+digest_of() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; }
+
+# How a failed `gh api` call answers: the body on stdout, the summary line on
+# stderr, exit 1. $2 names the call, for the summary line of a 5xx.
+api_die() {
+  case "$1" in
+    404) echo '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}'
+         echo "gh: Not Found (HTTP 404)" >&2 ;;
+    422) echo '{"message":"Validation Failed","errors":[{"resource":"ReleaseAsset","code":"already_exists","field":"name"}],"documentation_url":"https://docs.github.com/rest/releases/assets#update-a-release-asset","status":"422"}'
+         echo "gh: Validation Failed (HTTP 422)" >&2 ;;
+    *)   echo "{\"message\":\"Server Error\",\"status\":\"$1\"}"
+         echo "gh: HTTP $1 ($2)" >&2 ;;
+  esac
+  exit 1
+}
+
+take_failure() {
+  local f="$GH_FAILS/$1" n
+  [ -f "$f" ] || return 1
+  n=$(cat "$f")
+  [ "$n" -gt 0 ] || return 1
+  echo $((n - 1)) > "$f"
+}
+
+# The id of the release a tag names: the published one if there is one, else a
+# draft carrying that tag. gh's FetchRelease races the two lookups instead; see
+# the top of this file for why the fake settles that race this way.
+resolve() {
+  state | jq -e --arg t "$1" '
+    ([.[] | select(.tagName == $t and (.isDraft | not))] +
+     [.[] | select(.tagName == $t and .isDraft)]) | .[0].id' 2>/dev/null ||
+    die "release not found"
+}
+
+# The assets of one release, as the REST endpoint gives them: every asset,
+# ordered by its current name. $2 is the state to read them out of, so a
+# listing that has not caught up with the last write can be answered from the
+# state before it.
+assets_of() {
+  jq --argjson id "$1" '[.[] | select(.id == $id)][0].assets | sort_by(.name)' "${2:-$GH_STATE}"
+}
+
+if [ "${1:-}" = api ]; then
+  shift
+  method=GET; path=""; query=""; field=""; silent=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X) method="$2"; shift ;;
+      -q) query="$2"; shift ;;
+      -f|--field)
+        case "$2" in
+          name=*) field="${2#name=}" ;;
+          *) die "fake gh: only -f name=... is modelled, not $2" 2 ;;
+        esac
+        shift ;;
+      --silent) silent=true ;;
+      --paginate) ;;
+      -*) die "fake gh: unsupported api argument $1" 2 ;;
+      *) [ -z "$path" ] || die "fake gh: more than one api path" 2; path="$1" ;;
+    esac
+    shift
+  done
+  bare="${path%%\?*}"
+  case "$method $bare" in
+    "GET repos/{owner}/{repo}/releases")
+      [ "$path" = "repos/{owner}/{repo}/releases?per_page=100" ] ||
+        die "fake gh: unsupported api call GET $path" 2
+      if take_failure api; then die "HTTP 500 (GET releases)"; fi
+      state | jq -r "[sort_by(-.id)[] | {id, tag_name: .tagName, draft: .isDraft, name, assets}] | ${query:-.}"
+      ;;
+    "GET repos/{owner}/{repo}/releases/tags/"*)
+      tag="${bare##*/}"
+      if take_failure api-tags; then api_die 500 "GET releases/tags/$tag"; fi
+      # The tags endpoint answers for published releases only, and leaves a
+      # half-written asset out the way the tag listing does.
+      one=$(state | jq --arg t "$tag" '[.[] | select(.tagName == $t and (.isDraft | not))][0] // empty')
+      [ -n "$one" ] || api_die 404 "GET releases/tags/$tag"
+      printf '%s\n' "$one" | jq -r "{id, tag_name: .tagName, draft: .isDraft, name,
+        assets: (.assets | map(select(.state == \"uploaded\")) | sort_by(.name))} | ${query:-.}"
+      ;;
+    "GET repos/{owner}/{repo}/releases/"*"/assets")
+      rel="${bare#repos/\{owner\}/\{repo\}/releases/}"; rel="${rel%/assets}"
+      case "$rel" in ""|*[!0-9]*) die "fake gh: not a release id: $rel" 2 ;; esac
+      if take_failure api-assets; then api_die 500 "GET releases/$rel/assets"; fi
+      state | jq -e --argjson id "$rel" 'any(.[]; .id == $id)' > /dev/null ||
+        api_die 404 "GET releases/$rel/assets"
+      # A listing taken inside the window of a rename that has answered can
+      # still show the state before it, which "lag-<name>" sets up.
+      if [ -f "$GH_STATE.lagging" ] && take_failure lag-assets; then
+        assets_of "$rel" "$GH_STATE.lagging" | jq -r "${query:-.}"
+      else
+        assets_of "$rel" | jq -r "${query:-.}"
+      fi
+      ;;
+    "PATCH repos/{owner}/{repo}/releases/assets/"*)
+      aid="${bare##*/}"
+      case "$aid" in ""|*[!0-9]*) die "fake gh: not an asset id: $aid" 2 ;; esac
+      [ -n "$field" ] || die "fake gh: only a rename (-f name=...) is modelled" 2
+      if take_failure "patch-$field"; then api_die 500 "PATCH assets/$aid"; fi
+      state | jq -e --argjson a "$aid" 'any(.[].assets[]; .id == $a)' > /dev/null ||
+        api_die 404 "PATCH assets/$aid"
+      # Another asset of the same release holding that name, case-insensitively.
+      if state | jq -e --argjson a "$aid" --arg n "$field" '
+           ([.[] | select(any(.assets[]; .id == $a))][0].assets // [])
+           | any(.[]; .id != $a and ((.name | ascii_downcase) == ($n | ascii_downcase)))' > /dev/null; then
+        api_die 422 "PATCH assets/$aid"
+      fi
+      # A write that has answered is not the same thing as every read agreeing
+      # with it. "lag-<name>" hands the next N assets listings the state this
+      # PATCH found, so a caller reading the release straight after a rename
+      # that returned 200 sees what it was before.
+      if [ -s "$GH_FAILS/lag-$field" ] && [ "$(cat "$GH_FAILS/lag-$field")" -gt 0 ]; then
+        cp "$GH_STATE" "$GH_STATE.lagging"
+        mv "$GH_FAILS/lag-$field" "$GH_FAILS/lag-assets"
+      fi
+      # Name and nothing else: the id, the size and the digest stay put.
+      state | jq --argjson a "$aid" --arg n "$field" \
+        'map(.assets |= map(if .id == $a then .name = $n else . end))' | save
+      if take_failure "patch-after-$field"; then api_die 500 "PATCH assets/$aid"; fi
+      if [ "$silent" = false ]; then
+        state | jq -r --argjson a "$aid" "[.[].assets[] | select(.id == \$a)][0] | ${query:-.}"
+      fi
+      ;;
+    "DELETE repos/{owner}/{repo}/releases/assets/"*)
+      aid="${bare##*/}"
+      case "$aid" in ""|*[!0-9]*) die "fake gh: not an asset id: $aid" 2 ;; esac
+      if take_failure asset-delete; then api_die 500 "DELETE assets/$aid"; fi
+      state | jq -e --argjson a "$aid" 'any(.[].assets[]; .id == $a)' > /dev/null ||
+        api_die 404 "DELETE assets/$aid"
+      state | jq --argjson a "$aid" 'map(.assets |= map(select(.id != $a)))' | save
+      ;;
+    "DELETE repos/{owner}/{repo}/releases/"*)
+      id="${bare##*/}"
+      case "$id" in ""|*[!0-9]*) die "fake gh: not a release id: $id" 2 ;; esac
+      if take_failure api-delete; then die "HTTP 500 (DELETE releases/$id)"; fi
+      state | jq -e --argjson id "$id" 'any(.[]; .id == $id)' > /dev/null ||
+        die "HTTP 404: Not Found (DELETE releases/$id)"
+      state | jq --argjson id "$id" 'map(select(.id != $id))' | save
+      ;;
+    *) die "fake gh: unsupported api call $method $path" 2 ;;
+  esac
+  exit 0
+fi
+
+[ "${1:-}" = release ] || die "fake gh: unsupported command ${1:-}" 2
+sub="${2:-}"
+shift 2
+
+case "$sub" in
+  list)
+    exclude=false; query='.'
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --exclude-drafts) exclude=true ;;
+        -q) query="$2"; shift ;;
+        --limit|--json) shift ;;
+        *) die "fake gh: unsupported list argument $1" 2 ;;
+      esac
+      shift
+    done
+    if take_failure list; then die "HTTP 500 (GraphQL releases)"; fi
+    state | jq -r --argjson x "$exclude" \
+      "[sort_by(-.id)[] | select((\$x and .isDraft) | not)] | $query"
+    ;;
+
+  view)
+    tag="$1"; shift; query='.'
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -q) query="$2"; shift ;;
+        --json) shift ;;
+        *) die "fake gh: unsupported view argument $1" 2 ;;
+      esac
+      shift
+    done
+    if take_failure view; then die "HTTP 502 (GET releases/tags/$tag)"; fi
+    id=$(resolve "$tag") || exit 1
+    # The tag listing leaves a half-written asset out, and gives the node id
+    # rather than the numeric one.
+    one=$(state | jq --argjson id "$id" '.[] | select(.id == $id)
+      | .assets |= (map(select(.state == "uploaded"))
+                    | sort_by(.name)
+                    | map({name, size, state,
+                           id: "RA_kwDO\(.id)",
+                           apiUrl: "https://api.github.com/repos/o/r/releases/assets/\(.id)"}))')
+    for f in "$GH_FAILS"/stale-*; do
+      [ -e "$f" ] || continue
+      n="${f##*/stale-}"
+      if take_failure "stale-$n"; then
+        one=$(printf '%s\n' "$one" | jq --arg n "$n" '.assets |= map(select(.name != $n))')
+      fi
+    done
+    printf '%s\n' "$one" | jq -r "$query"
+    ;;
+
+  download)
+    tag="$1"; shift; pattern=""; dir=""; to_stdout=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p|--pattern) pattern="$2"; shift ;;
+        -D|--dir) dir="$2"; shift ;;
+        -O) [ "$2" = "-" ] || die "fake gh: only -O - is modelled" 2; to_stdout=true; shift ;;
+        *) die "fake gh: unsupported download argument $1" 2 ;;
+      esac
+      shift
+    done
+    [ -n "$pattern" ] || die "fake gh: only a --pattern download is modelled" 2
+    id=$(resolve "$tag") || exit 1
+    rows=$(assets_of "$id" | jq -r '.[] | select(.state == "uploaded") | "\(.name) \(.size) \(.digest)"')
+    matched=0
+    while read -r n s d; do
+      [ -n "$n" ] || continue
+      # filepath.Match on the name: exact and case sensitive. The pattern is
+      # deliberately left unquoted, because -p takes a glob.
+      # shellcheck disable=SC2254
+      case "$n" in $pattern) ;; *) continue ;; esac
+      matched=1
+      if [ "$to_stdout" = true ]; then
+        echo "$n $s $d"
+      else
+        mkdir -p "${dir:-.}" && echo "$n $s $d" > "${dir:-.}/$n"
+      fi
+    done <<< "$rows"
+    [ "$matched" -eq 1 ] || die "no assets match the file pattern"
+    ;;
+
+  create)
+    tag="$1"; shift; draft=false; title=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --draft) draft=true ;;
+        --title) title="$2"; shift ;;
+        --notes-file) [ -f "$2" ] || die "open $2: no such file"; shift ;;
+        *) die "fake gh: only an empty --draft create is modelled, not $1" 2 ;;
+      esac
+      shift
+    done
+    [ "$draft" = true ] || die "fake gh: only an empty --draft create is modelled" 2
+    id=$(( $(state | jq 'map(.id) | max // 0') + 1 ))
+    state | jq --argjson id "$id" --arg t "$tag" --arg n "$title" \
+      '. + [{id: $id, tagName: $t, isDraft: true, isLatest: false, name: $n, assets: []}]' | save
+    if take_failure create; then die "HTTP 500 (POST releases)"; fi
+    ;;
+
+  upload)
+    tag="$1"; shift; clobber=false; files=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --clobber) clobber=true ;;
+        -*) die "fake gh: unsupported upload argument $1" 2 ;;
+        *) files+=("$1") ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    for f in "${files[@]}"; do
+      n=$(basename "$f")
+      # A finished asset holds its name: gh refuses unless --clobber, and
+      # --clobber deletes it first. A half-written one is invisible to gh, so
+      # it holds nothing and the new upload simply displaces it.
+      if state | jq -e --argjson id "$id" --arg n "$n" \
+           'any(.[] | select(.id == $id) | .assets[]; .name == $n and .state == "uploaded")' > /dev/null; then
+        [ "$clobber" = true ] || die "asset under the same name already exists: [$n]"
+      fi
+      state | jq --argjson id "$id" --arg n "$n" \
+        'map(if .id == $id then .assets |= map(select(.name != $n)) else . end)' | save
+      size=$(nbytes "$f"); st=uploaded; dg="\"sha256:$(digest_of "$f")\""; rc=0
+      if take_failure "upload-$n"; then st=starter; dg=null; rc=1
+      elif take_failure "starter-$n"; then st=starter; dg=null
+      elif take_failure "short-$n"; then size=$((size - 1))
+      elif take_failure "corrupt-$n"; then dg="\"sha256:$(printf 0%.0s $(seq 64))\""
+      fi
+      aid=$(( $(state | jq '[.[].assets[].id] | max // 1000') + 1 ))
+      state | jq --argjson id "$id" --argjson aid "$aid" --arg n "$n" \
+        --argjson s "$size" --arg st "$st" --argjson dg "$dg" \
+        'map(if .id == $id
+             then .assets += [{id: $aid, name: $n, size: $s, state: $st, digest: $dg}]
+             else . end)' | save
+      [ "$rc" -eq 0 ] || die "HTTP 500 (uploads.github.com assets?name=$n)"
+    done
+    ;;
+
+  edit)
+    tag="$1"; shift; draft=""; latest=false; title=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --draft=false) draft=false ;;
+        --draft=true) draft=true ;;
+        --latest) latest=true ;;
+        --title) title="$2"; shift ;;
+        --notes-file) [ -f "$2" ] || die "open $2: no such file"; shift ;;
+        *) die "fake gh: unsupported edit argument $1" 2 ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    if [ "$draft" = false ]; then
+      if take_failure publish; then die "HTTP 500 (PATCH release)"; fi
+    elif take_failure edit; then die "HTTP 500 (PATCH release)"
+    fi
+    state | jq --argjson id "$id" --arg d "$draft" --argjson l "$latest" --arg n "$title" '
+      map(if .id == $id then
+            (if $d == "" then . else .isDraft = ($d == "true") end)
+            | (if $n == "" then . else .name = $n end)
+            | (if $l then .isLatest = true else . end)
+          elif $l then .isLatest = false
+          else . end)' | save
+    if [ "$draft" = false ] && take_failure publish-after; then die "HTTP 500 (PATCH release)"; fi
+    ;;
+
+  delete)
+    tag="$1"; shift; cleanup=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --yes) ;;
+        --cleanup-tag) cleanup=true ;;
+        *) die "fake gh: unsupported delete argument $1" 2 ;;
+      esac
+      shift
+    done
+    id=$(resolve "$tag") || exit 1
+    if take_failure delete; then die "HTTP 500 (DELETE releases/$id)"; fi
+    was_draft=$(state | jq --argjson id "$id" '.[] | select(.id == $id) | .isDraft')
+    state | jq --argjson id "$id" 'map(select(.id != $id))' | save
+    if [ "$cleanup" = true ] && [ "$was_draft" = true ]; then
+      die "HTTP 422: Reference does not exist (refs/tags/$tag)"
+    fi
+    ;;
+
+  *) die "fake gh: unsupported release $sub" 2 ;;
+esac
