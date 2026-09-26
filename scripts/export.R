@@ -394,7 +394,10 @@ metrics_fingerprint <- function(summary_df) {
   # The title of the help page documenting this dataset. Not a property of the
   # data: two packages carrying identical bytes may document them differently,
   # or one may not document them at all.
-  title = "TEXT"
+  title = "TEXT",
+  # The help page's \source text and whether it has a \format block (analyzer 0.5.0).
+  dataset_doc_source = "TEXT",
+  dataset_doc_format = "INTEGER"
 )
 
 # How a profile digest is built. The pair separator joins a field's name, the

@@ -150,6 +150,14 @@
   keys
 }
 
+# Declared for the analyzer 0.5.0 reader; a build before it leaves them NULL.
+.CONTRACT_FROM_050 <- c("dataset_doc_source", "dataset_doc_format")
+
+.contract_not_emitted <- function() {
+  if (analyzer_at_least(rpkg_analyzer_version(), "0.5.0")) return(.CONTRACT_NOT_EMITTED)
+  c(.CONTRACT_NOT_EMITTED, .CONTRACT_FROM_050)
+}
+
 .declared_dataset_cols <- function() {
   c(names(.DATASET_CONTENT_COLS), names(.DATASET_VERSION_COLS),
     names(.DATASET_IDENTITY_COLS))
@@ -295,7 +303,7 @@ test_that("every dataset field the analyzer emits is declared by a column spec",
 test_that("every declared dataset column is one the analyzer emits", {
   keys <- .contract_setup()
   missing <- sort(setdiff(.declared_dataset_cols(),
-                          c(keys$top, .CONTRACT_NOT_EMITTED)))
+                          c(keys$top, .contract_not_emitted())))
   expect_identical(
     missing, character(0L),
     info = paste0(

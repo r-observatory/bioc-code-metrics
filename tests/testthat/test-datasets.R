@@ -1960,3 +1960,28 @@ test_that("the migration that retires a moved column cannot reach a table's own"
                            "current_version", "current_content_id"),
                          names(.DATASET_CONTENT_COLS)), character(0L))
 })
+
+test_that("how a help page documents a dataset lands on its identity row", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  row <- .mk_wide_row()
+  row$dataset_doc_source <- "Collected by the authors in 2020."
+  row$dataset_doc_format <- 1L
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, row, "p"))
+
+  got <- DBI::dbGetQuery(con, "SELECT dataset_doc_source, dataset_doc_format FROM bioc_datasets")
+  expect_identical(got$dataset_doc_source, "Collected by the authors in 2020.")
+  expect_identical(got$dataset_doc_format, 1L)
+  expect_false(any(c("dataset_doc_source", "dataset_doc_format") %in%
+                     DBI::dbListFields(con, "bioc_dataset_contents")))
+})
+
+test_that("a catalog written before the documentation columns gains them empty", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con))
+  DBI::dbWithTransaction(con, .write_datasets_normalized(con, .mk_wide_row(), "p"))
+  info <- DBI::dbGetQuery(con, "PRAGMA table_info(bioc_datasets)")
+  expect_identical(info$type[match(c("dataset_doc_source", "dataset_doc_format"), info$name)],
+                   c("TEXT", "INTEGER"))
+  expect_true(is.na(DBI::dbGetQuery(con, "SELECT dataset_doc_format FROM bioc_datasets")[[1L]]))
+})
