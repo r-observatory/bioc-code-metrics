@@ -18,6 +18,12 @@
     sprintf('  echo "rpkg-analyzer %s"', version),
     "  exit 0",
     "fi",
+    # The one package it reads is the self-check a 0.5.0 build is asked first.
+    'dir=$(echo "$1" | tr -d "\'")',
+    'if grep -q "^Package: selfcheck" "$dir/DESCRIPTION" 2>/dev/null; then',
+    '  echo "{\\"rec\\":\\"summary\\",\\"input_kind\\":\\"git\\"}"',
+    "  exit 0",
+    "fi",
     # A binary that answers for itself and fails on the package is what
     # "installed, and cannot read this one" looks like in production.
     "exit 1"), stub)

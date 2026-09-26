@@ -320,3 +320,69 @@ test_that("analyze_with_binary passes the input kind after the directory", {
   expect_identical(attr(metrics, "dcf"), c(Package = "demo"))
   expect_null(attr(metrics, "release_notes"))
 })
+
+# A stub that answers --version and, on any package, prints one summary naming
+# `input_kind` when it is given, the way a 0.5.0 build does.
+.write_selfcheck_stub <- function(dir, version, input_kind = NULL) {
+  kind <- if (is.null(input_kind)) "" else
+    sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
+  stub <- file.path(dir, "stub-selfcheck.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then',
+    sprintf('  echo "rpkg-analyzer %s"', version),
+    "  exit 0",
+    "fi",
+    sprintf('echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1%s}"', kind)), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("the self-check passes only when the analyzer names the kind it was given", {
+  skip_on_os("windows")
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test", input_kind = "git"))
+  expect_true(rpkg_analyzer_selfcheck("git"))
+  expect_false(rpkg_analyzer_selfcheck("release"))
+
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test"))
+  expect_false(rpkg_analyzer_selfcheck("git"))
+})
+
+.sc_io <- function() list(
+  package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
+                                       stringsAsFactors = FALSE),
+  clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
+
+test_that("a 0.5.0 analyzer that does not name the kind stops the run before any shard", {
+  skip_on_os("windows")
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test"))
+  out <- withr::local_tempdir()
+  expect_error(run_update(.sc_io(), out, shard_size = 10L), "--input-kind git")
+  expect_false(file.exists(file.path(out, DB_FILENAME)))
+})
+
+test_that("a build before 0.5.0 is never asked for the self-check", {
+  skip_on_os("windows")
+  # This stub would fail the self-check, so reaching the shard proves it was skipped.
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.4.0-test"))
+  out <- withr::local_tempdir()
+  m <- suppressWarnings(run_update(.sc_io(), out, shard_size = 10L))
+  expect_identical(m$n_shard, 1L)
+})
+
+test_that("the analyzer CI installs answers the self-check package", {
+  # Before 0.5.0 the flag is ignored and a summary still comes back; from 0.5.0 it
+  # must name the kind, or every scheduled run stops before its first shard.
+  skip_on_os("windows")
+  skip_if(!nzchar(rpkg_analyzer_bin()), "needs rpkg-analyzer")
+  dir <- withr::local_tempdir()
+  writeLines(c("Package: selfcheck", "Version: 0.0.1"), file.path(dir, "DESCRIPTION"))
+  expect_false(is.null(analyze_with_binary(dir)))
+  if (analyzer_at_least(rpkg_analyzer_version(), "0.5.0")) {
+    expect_true(rpkg_analyzer_selfcheck())
+  }
+})

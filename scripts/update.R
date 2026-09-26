@@ -563,6 +563,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
+  # A build that rejected the flag would exit 2 on every package and leave every
+  # row to the R fallback, so a 0.5.0 build proves it reads the flag first.
+  if (analyzer_at_least(analyzer_version, "0.5.0") &&
+      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
+    stop(sprintf(paste0(
+      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it; ",
+      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND),
+      call. = FALSE)
+  }
 
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 

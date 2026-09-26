@@ -298,3 +298,15 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND) {
   attr(metrics, "release_notes") <- parsed$release_notes
   metrics
 }
+
+#' Whether the analyzer honours the input kind this pipeline passes: a
+#' DESCRIPTION-only package must come back with a summary naming `kind`.
+rpkg_analyzer_selfcheck <- function(kind = ANALYZER_INPUT_KIND) {
+  dir <- tempfile("selfcheck_")
+  dir.create(dir)
+  on.exit(unlink(dir, recursive = TRUE, force = TRUE), add = TRUE)
+  writeLines(c("Package: selfcheck", "Version: 0.0.1"), file.path(dir, "DESCRIPTION"))
+  metrics <- analyze_with_binary(dir, kind = kind)
+  if (is.null(metrics)) return(FALSE)
+  identical(as.character(metrics[["input_kind"]] %||% NA_character_), kind)
+}
