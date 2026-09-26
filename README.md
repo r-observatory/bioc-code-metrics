@@ -36,6 +36,13 @@ Each dated release carries its own `manifest.json` asset (copied from
 written alongside but not published, carries the `changed` and
 `bootstrap_complete` flags that drive the shard loop.
 
+## Retired columns
+
+These columns are no longer published in `bioc_code_summary`. Each leaves the
+database on the first shard written by the analyzer version named.
+
+- `has_website`, `copyright_holder_declared` (analyzer 0.5.0)
+
 ## Running
 
 ```sh
