@@ -119,8 +119,11 @@ test_that("under a 0.5.0 build every analysed release has its history row", {
 
 test_that("releases the R fallback wrote contribute no text", {
   skip_on_os("windows")
-  withr::local_envvar(RPKG_ANALYZER_BIN = "/nonexistent/rpkg-analyzer")
-  skip_if(nzchar(unname(Sys.which("rpkg-analyzer"))), "a real rpkg-analyzer is on PATH")
+  # CI puts rpkg-analyzer on PATH, so hide the binary rather than skip there.
+  env <- environment(analyze_with_binary)
+  old <- get("rpkg_analyzer_bin", envir = env)
+  withr::defer(assign("rpkg_analyzer_bin", old, envir = env))
+  assign("rpkg_analyzer_bin", function() "", envir = env)
   repo <- file.path(withr::local_tempdir(), "pkgA")
   .art_repo(repo)
   text <- analyze_package(repo, "pkgA")$text
