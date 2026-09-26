@@ -583,6 +583,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   data_con <- open_or_init_data_db(data_db_path)
   on.exit(DBI::dbDisconnect(data_con), add = TRUE)
+  text_db_path <- file.path(out_dir, RELEASE_TEXT_DB_FILENAME)
+  shared_text  <- identical(RELEASE_TEXT_DB_FILENAME, DB_FILENAME)
+  text_con <- open_or_init_release_text_db(text_db_path,
+                                           con = if (shared_text) con else NULL)
+  if (!shared_text) on.exit(DBI::dbDisconnect(text_con), add = TRUE)
 
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
@@ -593,6 +598,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     }
     analyzed <- character(0L)
   } else {
+    # Before the queues are read, so a gap in the text history is re-read now.
+    .reconcile_release_text(con, text_con)
     analyzed_df <- db_analyzed_state(con)
     analyzed <- if (nrow(analyzed_df) > 0L) {
       setNames(as.character(analyzed_df$version),
@@ -714,6 +721,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_functions_list <- list()
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
+  shard_text_list      <- list()
   shard_failures       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
@@ -776,7 +784,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     list(package = pkg, ok = TRUE,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
-         binary_versions = res$binary_versions)
+         text = res$text, binary_versions = res$binary_versions)
   }
 
   results <- parallel::mclapply(shard_pkgs, .pkg_worker,
@@ -799,6 +807,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_functions_list[[pkg]] <- r$functions
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
+      shard_text_list[[pkg]]      <- r$text
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
@@ -822,6 +831,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_functions <- .rbind_union_all(shard_functions_list) %||% .empty_functions_df()
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
+  fresh_text      <- .bind_release_text(shard_text_list)
 
   # Which build scanned these rows is what the next run's staleness check reads,
   # and a scanned row that does not say reads as one an unknown build produced.
@@ -837,8 +847,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # fails afterwards the package stays on the to-do list and the next run
     # redoes both cleanly, rather than being marked done with datasets missing.
     upsert_datasets(data_con, fresh_datasets, fresh_pkgs)
+    # Before the code rows, so a failed text write leaves these packages unmarked.
+    upsert_release_text(text_con, fresh_text$description,
+                        fresh_text$release_notes, fresh_text$versions)
     upsert_shard(con, fresh_summary, fresh_churn, fresh_api,
                  fresh_functions, fresh_edges,
+                 description_df = fresh_text$description_latest,
+                 release_notes_df = fresh_text$release_notes_latest,
                  analyzer_version = analyzer_version)
   }
 
