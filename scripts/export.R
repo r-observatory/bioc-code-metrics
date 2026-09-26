@@ -1266,6 +1266,8 @@ open_or_init_db <- function(path) {
     "CREATE INDEX IF NOT EXISTS idx_api_pkg_ver ON bioc_api_history(package, version)")
   .drop_redundant_indexes(con)
 
+  .ensure_latest_text_tables(con)
+
   con
 }
 
@@ -1429,10 +1431,12 @@ db_analyzed_state <- function(con) {
 #'   untouched. Detail is expected to cover each package's latest version only;
 #'   the delete-by-package step still clears any prior-version detail rows so no
 #'   stale rows survive a re-analysis.
+#' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
 #' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
+                         description_df = NULL, release_notes_df = NULL,
                          analyzer_version = NA_character_) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
@@ -1501,6 +1505,11 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
+
+    # -- Replace the latest-only DESCRIPTION fields and release notes ---------
+    if (!is.null(description_df) || !is.null(release_notes_df)) {
+      .write_latest_text(con, pkgs, description_df, release_notes_df)
+    }
   })
 
   invisible(NULL)

@@ -1006,6 +1006,7 @@ if (identical(sys.nframe(), 0L)) {
                              pattern = "[.]R$", full.names = TRUE))) source(.f)
   source(file.path(.script_dir, "analyze.R"))
   source(file.path(.script_dir, "export.R"))
+  source(file.path(.script_dir, "release_text.R"))
 
   args <- commandArgs(trailingOnly = TRUE)
 

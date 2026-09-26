@@ -90,3 +90,17 @@ MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
 
 # Bioconductor rows describe the release branch as git holds it, before R CMD build.
 ANALYZER_INPUT_KIND <- "git"
+
+# DESCRIPTION and NEWS text for every analysed release, kept inside the code database.
+RELEASE_TEXT_DB_FILENAME    <- DB_FILENAME
+DESCRIPTION_HISTORY_TABLE   <- "bioc_description_history"
+RELEASE_NOTES_HISTORY_TABLE <- "bioc_release_notes_history"
+RELEASE_TEXT_VERSIONS_TABLE <- "bioc_release_text_versions"
+DESCRIPTION_FIELDS_TABLE    <- "bioc_description_fields"
+RELEASE_NOTES_TABLE         <- "bioc_release_notes"
+
+# The merged latest-only tables cap each value here, far under MySQL's 32 MiB packet.
+RELEASE_TEXT_FIELD_MAX_BYTES <- 16384L
+
+# More missing history than this means the text tables are the wrong copy.
+RELEASE_TEXT_REQUEUE_MAX <- 2000L
