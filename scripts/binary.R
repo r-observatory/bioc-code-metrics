@@ -36,6 +36,15 @@ rpkg_analyzer_version <- function() {
   if (!nzchar(v) || identical(v, out[[1L]])) NA_character_ else v
 }
 
+#' Whether a reported analyzer version is at least `min`. "0.5.0-test" reads as
+#' 0.5.0; NA, NULL, "" and "dev" read as older than every release.
+analyzer_at_least <- function(v, min) {
+  if (is.null(v) || length(v) != 1L || is.na(v)) return(FALSE)
+  lead <- regmatches(v, regexpr("^[0-9]+(\\.[0-9]+)*", v))
+  if (!length(lead)) return(FALSE)
+  utils::compareVersion(lead, min) >= 0L
+}
+
 # Extract one scalar field from a parsed NDJSON record, defaulting to NA.
 # With simplifyVector = FALSE, scalar JSON values decode to length-1 atomics.
 .rec_chr <- function(rec, key) {
@@ -174,14 +183,20 @@ rpkg_analyzer_version <- function() {
 #'                    (c/cpp/rust/fortran) carry NA for exported/n_params/
 #'                    cyclocomp, which R functions populate.
 #'   - "call_edge" -> one row in the edges frame.
-#' All other record types are ignored.
+#'   - "dataset"   -> one row in the datasets frame.
+#'   - "dcf"       -> the first such record, as a named character vector.
+#'   - "release_notes" -> the first such record, as a list.
+#' Record types not named here are skipped.
 #'
 #' @param lines Character vector of NDJSON lines (analyzer stdout).
-#' @return A list with three elements:
+#' @return A list:
 #'   $summary   flattened named list, or NULL if no summary record was present.
 #'   $functions data.frame(lang, name, exported, file, line, loc, n_params,
 #'              cyclocomp); zero rows when the stream has no function records.
 #'   $edges     data.frame(graph, from, to); zero rows when none present.
+#'   $datasets  data.frame of dataset records.
+#'   $dcf       DESCRIPTION fields; character(0) for an empty record, NULL for none.
+#'   $release_notes the release_notes record, or NULL.
 parse_analyzer_records <- function(lines) {
   summ <- NULL
   fn <- list(lang = character(0L), name = character(0L), exported = logical(0L),
@@ -189,6 +204,8 @@ parse_analyzer_records <- function(lines) {
              n_params = integer(0L), cyclocomp = integer(0L))
   eg <- list(graph = character(0L), from = character(0L), to = character(0L))
   ds_recs <- list()
+  dcf <- NULL
+  notes <- NULL
 
   for (line in lines) {
     parsed <- tryCatch(
@@ -216,6 +233,15 @@ parse_analyzer_records <- function(lines) {
       eg$to    <- c(eg$to,    .rec_chr(parsed, "to"))
     } else if (identical(rec, "dataset")) {
       ds_recs[[length(ds_recs) + 1L]] <- parsed
+    } else if (identical(rec, "dcf")) {
+      # An empty record still says the DESCRIPTION was read, so it stays character(0).
+      if (is.null(dcf)) {
+        fields <- parsed[setdiff(names(parsed), "rec")]
+        dcf <- vapply(fields, function(v) if (is.null(v)) NA_character_ else as.character(v)[[1L]],
+                      character(1L))
+      }
+    } else if (identical(rec, "release_notes")) {
+      if (is.null(notes)) notes <- parsed
     }
   }
 
@@ -234,25 +260,28 @@ parse_analyzer_records <- function(lines) {
     summary   = if (is.null(summ)) NULL else .flatten_summary(summ),
     functions = functions,
     edges     = edges,
-    datasets  = .datasets_frame(ds_recs)
+    datasets  = .datasets_frame(ds_recs),
+    dcf       = dcf,
+    release_notes = notes
   )
 }
 
 #' Run the analyzer over an extracted package directory.
 #'
 #' @param dir Path to the extracted package source (a DESCRIPTION at its root).
+#' @param kind The input kind passed as --input-kind.
 #' @return A flat named list of metrics for the version, with nested values
 #'   (maps and arrays) serialised to JSON strings to match how the R metric
 #'   groups store fields such as lang_breakdown. The per-function and
 #'   per-call-edge detail frames are attached as the "functions" and "edges"
 #'   attributes (data.frames without package/version stamps). NULL if the binary
 #'   is unavailable or does not produce a summary record.
-analyze_with_binary <- function(dir) {
+analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND) {
   bin <- rpkg_analyzer_bin()
   if (!nzchar(bin)) return(NULL)
 
   out <- tryCatch(
-    system2(bin, shQuote(dir), stdout = TRUE, stderr = FALSE),
+    system2(bin, c(shQuote(dir), "--input-kind", kind), stdout = TRUE, stderr = FALSE),
     error   = function(e) NULL,
     warning = function(w) NULL
   )
@@ -265,5 +294,7 @@ analyze_with_binary <- function(dir) {
   attr(metrics, "functions") <- parsed$functions
   attr(metrics, "edges")     <- parsed$edges
   attr(metrics, "datasets")  <- parsed$datasets
+  attr(metrics, "dcf")       <- parsed$dcf
+  attr(metrics, "release_notes") <- parsed$release_notes
   metrics
 }

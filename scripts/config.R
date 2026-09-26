@@ -87,3 +87,6 @@ MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
 `%||%` <- function(a, b) {
   if (is.null(a) || length(a) == 0L || (length(a) == 1L && is.na(a))) b else a
 }
+
+# Bioconductor rows describe the release branch as git holds it, before R CMD build.
+ANALYZER_INPUT_KIND <- "git"

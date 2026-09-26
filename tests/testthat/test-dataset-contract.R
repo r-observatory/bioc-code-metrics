@@ -77,7 +77,8 @@
   cached <- NULL
   function(bin) {
     if (!is.null(cached)) return(cached)
-    out <- suppressWarnings(system2(bin, shQuote(.contract_fixture_pkg()),
+    out <- suppressWarnings(system2(bin, c(shQuote(.contract_fixture_pkg()),
+                                           "--input-kind", ANALYZER_INPUT_KIND),
                                     stdout = TRUE, stderr = FALSE))
     top <- character(0L)
     nested <- character(0L)

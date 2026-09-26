@@ -265,3 +265,58 @@ test_that("the analyzer reports the same version in its record and on --version"
   expect_identical(as.character(metrics[["analyzer_version"]]),
                    rpkg_analyzer_version())
 })
+
+# ---------------------------------------------------------------------------
+# The input kind, and what the analyzer prints besides the summary
+# ---------------------------------------------------------------------------
+
+test_that("analyzer_at_least reads the leading version and nothing else", {
+  expect_true(analyzer_at_least("0.5.0", "0.5.0"))
+  expect_true(analyzer_at_least("0.5.0-test", "0.5.0"))
+  expect_true(analyzer_at_least("0.10.0", "0.5.0"))
+  for (v in list("0.4.0", "0.4.0-test", NA, NA_character_, NULL, "", "dev")) {
+    expect_false(analyzer_at_least(v, "0.5.0"), info = format(v))
+  }
+})
+
+test_that("parse_analyzer_records keeps the first DESCRIPTION and release-notes records", {
+  parsed <- parse_analyzer_records(c(
+    '{"rec":"summary","package":"demo"}',
+    '{"rec":"dcf","Package":"demo","Version":"1.2.0","Config/testthat/edition":"3"}',
+    '{"rec":"dcf","Package":"second"}',
+    '{"rec":"release_notes","package_version":"1.2.0","news_file":"NEWS.md","release_notes_source":"news_md","release_notes":"- fixed","release_notes_truncated":false}',
+    '{"rec":"release_notes","package_version":"9.9.9"}',
+    '{"rec":"something_new","x":1}'))
+  expect_identical(parsed$dcf, c(Package = "demo", Version = "1.2.0",
+                                 `Config/testthat/edition` = "3"))
+  expect_identical(parsed$release_notes$package_version, "1.2.0")
+  expect_false(parsed$release_notes$release_notes_truncated)
+  expect_identical(parsed$summary$package, "demo")
+})
+
+test_that("an empty DESCRIPTION record is kept apart from a missing one", {
+  expect_identical(length(parse_analyzer_records('{"rec":"dcf"}')$dcf), 0L)
+  expect_false(is.null(parse_analyzer_records('{"rec":"dcf"}')$dcf))
+  expect_null(parse_analyzer_records('{"rec":"summary"}')$dcf)
+  expect_null(parse_analyzer_records('{"rec":"summary"}')$release_notes)
+})
+
+test_that("analyze_with_binary passes the input kind after the directory", {
+  skip_on_os("windows")
+  dir <- withr::local_tempdir()
+  args_file <- file.path(dir, "args.txt")
+  stub <- file.path(dir, "stub-args.sh")
+  writeLines(c("#!/bin/sh",
+               sprintf("printf '%%s\\n' \"$@\" > %s", shQuote(args_file)),
+               'echo "{\\"rec\\":\\"summary\\",\\"n_fns_r\\":1}"',
+               'echo "{\\"rec\\":\\"dcf\\",\\"Package\\":\\"demo\\"}"'), stub)
+  Sys.chmod(stub, mode = "0755")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+
+  pkg <- file.path(dir, "pkg")
+  dir.create(pkg)
+  metrics <- analyze_with_binary(pkg)
+  expect_identical(readLines(args_file), c(pkg, "--input-kind", ANALYZER_INPUT_KIND))
+  expect_identical(attr(metrics, "dcf"), c(Package = "demo"))
+  expect_null(attr(metrics, "release_notes"))
+})
