@@ -531,6 +531,7 @@ analyze_package <- function(repo_dir, package) {
   functions_rows     <- vector("list", nrow(versions_df))
   edges_rows         <- vector("list", nrow(versions_df))
   datasets_rows      <- vector("list", nrow(versions_df))
+  text_rows          <- vector("list", nrow(versions_df))
   # Whether the dataset reader ran on each version, which a zero-row dataset
   # frame cannot tell you: a package that ships no data and a package nothing
   # looked at both produce none.
@@ -639,6 +640,11 @@ analyze_package <- function(repo_dir, package) {
       detail_fns <- attr(metrics, "functions")
       detail_eg  <- attr(metrics, "edges")
       detail_ds  <- attr(metrics, "datasets")
+      text_row   <- if (binary_ran) {
+        .release_text_rows(package, v, attr(metrics, "dcf"),
+                           attr(metrics, "release_notes"),
+                           metrics[["analyzer_version"]])
+      }
 
       dep_sig <- tryCatch(
         deprecation_signals(ctx),
@@ -724,7 +730,7 @@ analyze_package <- function(repo_dir, package) {
       list(safe_metrics = safe_metrics, api_row = api_row, prev_exports = curr_exports,
            dep_sig = dep_sig, functions_row = functions_row, edges_row = edges_row,
            datasets_row = datasets_row, datasets_read = !is.null(detail_ds),
-           from_binary = binary_ran)
+           text_row = text_row, from_binary = binary_ran)
     })
 
     summary_rows[[i]]       <- iter$safe_metrics
@@ -732,6 +738,7 @@ analyze_package <- function(repo_dir, package) {
     functions_rows[[i]]     <- iter$functions_row
     edges_rows[[i]]         <- iter$edges_row
     datasets_rows[[i]]      <- iter$datasets_row
+    text_rows[i]            <- list(iter$text_row)
     datasets_read[[i]]      <- isTRUE(iter$datasets_read)
     from_binary[[i]]        <- isTRUE(iter$from_binary)
     prev_exports            <- iter$prev_exports
@@ -814,6 +821,9 @@ analyze_package <- function(repo_dir, package) {
     functions = functions_df,
     edges     = edges_df,
     datasets  = datasets_df,
+    # DESCRIPTION and release-notes text from the versions the analyzer read.
+    text      = .release_text_collect(
+      text_rows, if (nrow(versions_df)) versions_df$version[nrow(versions_df)] else NA_character_),
     # The versions the analyzer binary produced, which is the only thing that
     # tells those summary rows from the ones the pure-R fallback wrote once
     # they are in the same frame. The caller stamps the running build on these

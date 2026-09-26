@@ -41,13 +41,16 @@
 #' @param api_df     data.frame with columns package, version, exports_added,
 #'   exports_removed (JSON array strings), n_exports (integer), and optionally
 #'   cold_removals.
-export_metrics <- function(path, summary_df, churn_df, api_df) {
+export_metrics <- function(path, summary_df, churn_df, api_df,
+                           analyzer_version = NA_character_) {
   if (file.exists(path)) unlink(path)
   con <- DBI::dbConnect(RSQLite::SQLite(), path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
   # ---- bioc_code_summary -----------------------------------------------------
   write_summary <- .coerce_logicals(summary_df)
+  write_summary <- .apply_declared_types(write_summary, analyzer_version)
+  write_summary <- .strip_retired_columns(write_summary, analyzer_version)
   # Guarantee at least package and version columns for schema stability.
   if (!"package" %in% names(write_summary)) {
     write_summary[["package"]] <- rep(NA_character_, nrow(write_summary))
@@ -56,6 +59,7 @@ export_metrics <- function(path, summary_df, churn_df, api_df) {
     write_summary[["version"]] <- rep(NA_character_, nrow(write_summary))
   }
   DBI::dbWriteTable(con, "bioc_code_summary", write_summary, row.names = FALSE)
+  .ensure_summary_columns(con, analyzer_version)
   DBI::dbExecute(con,
     "CREATE UNIQUE INDEX idx_summary_pkg_ver ON bioc_code_summary(package, version)")
 
@@ -63,8 +67,6 @@ export_metrics <- function(path, summary_df, churn_df, api_df) {
   DBI::dbWriteTable(con, "bioc_code_churn", .coerce_logicals(churn_df), row.names = FALSE)
   DBI::dbExecute(con,
     "CREATE INDEX idx_churn_pkg_ver ON bioc_code_churn(package, version)")
-  DBI::dbExecute(con,
-    "CREATE INDEX idx_churn_pkg ON bioc_code_churn(package)")
 
   # ---- bioc_api_history ------------------------------------------------------
   DBI::dbWriteTable(con, "bioc_api_history", .coerce_logicals(api_df), row.names = FALSE)
@@ -151,9 +153,18 @@ metrics_fingerprint <- function(summary_df) {
   DBI::dbExecute(con, sprintf(
     "CREATE INDEX IF NOT EXISTS idx_%s_pkg_ver ON %s(package, version)",
     table, table))
-  DBI::dbExecute(con, sprintf(
-    "CREATE INDEX IF NOT EXISTS idx_%s_pkg ON %s(package)",
-    table, table))
+  invisible(NULL)
+}
+
+# Single-column (package) indexes that the (package, version) index already
+# serves; each is a second copy of the table's package column on disk.
+.REDUNDANT_INDEXES <- c("idx_churn_pkg", "idx_bioc_functions_pkg",
+                        "idx_bioc_call_edges_pkg")
+
+.drop_redundant_indexes <- function(con) {
+  for (idx in .REDUNDANT_INDEXES) {
+    DBI::dbExecute(con, sprintf('DROP INDEX IF EXISTS "%s"', idx))
+  }
   invisible(NULL)
 }
 
@@ -387,7 +398,10 @@ metrics_fingerprint <- function(summary_df) {
   # The title of the help page documenting this dataset. Not a property of the
   # data: two packages carrying identical bytes may document them differently,
   # or one may not document them at all.
-  title = "TEXT"
+  title = "TEXT",
+  # The help page's \source text and whether it has a \format block (analyzer 0.5.0).
+  dataset_doc_source = "TEXT",
+  dataset_doc_format = "INTEGER"
 )
 
 # How a profile digest is built. The pair separator joins a field's name, the
@@ -1249,9 +1263,10 @@ open_or_init_db <- function(path) {
   DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON bioc_code_churn(package, version)")
   DBI::dbExecute(con,
-    "CREATE INDEX IF NOT EXISTS idx_churn_pkg ON bioc_code_churn(package)")
-  DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_api_pkg_ver ON bioc_api_history(package, version)")
+  .drop_redundant_indexes(con)
+
+  .ensure_latest_text_tables(con)
 
   con
 }
@@ -1312,6 +1327,83 @@ db_analyzed_state <- function(con) {
   rbind(primary, fallback)
 }
 
+# Every summary column rpkg-analyzer 0.5.0 adds, with its SQLite type. A first
+# shard where a text column is all NA would otherwise type it INTEGER for good.
+.SUMMARY_050_COLS <- c(
+  input_kind = "TEXT",
+  has_citation = "INTEGER", citation_read = "TEXT", citation_kind = "TEXT",
+  citation_n_entries = "INTEGER", citation_bibtype = "TEXT",
+  citation_dois = "TEXT", citation_venue = "TEXT",
+  has_rd_bibliography = "INTEGER",
+  n_help_topics = "INTEGER", n_help_topics_internal = "INTEGER",
+  n_help_topics_data = "INTEGER", n_help_topics_package = "INTEGER",
+  examples_coverage_fn = "REAL", examples_coverage_fn_basis = "TEXT",
+  rd_example_pages = "INTEGER", rd_example_pages_run = "INTEGER",
+  rd_example_pages_donttest_only = "INTEGER",
+  rd_example_pages_never_run = "INTEGER", rd_example_pages_empty = "INTEGER",
+  rd_example_pages_conditional = "INTEGER",
+  test_framework_primary = "TEXT", test_frameworks_used = "TEXT",
+  test_frameworks_declared = "TEXT", n_test_units = "INTEGER",
+  test_unit = "TEXT", n_rout_save = "INTEGER", n_test_blocks = "INTEGER",
+  n_test_blocks_cran_skipped = "INTEGER", tests_gated_not_cran = "INTEGER",
+  vignette_eval_gated = "INTEGER",
+  news_file = "TEXT", changelog_file = "TEXT", release_notes_source = "TEXT",
+  build_ignored = "TEXT", build_ignore_bad_lines = "INTEGER"
+)
+
+#' Coerce each declared 0.5.0 column in a shard frame to its declared class.
+.apply_declared_types <- function(df, analyzer_version) {
+  if (!analyzer_at_least(analyzer_version, "0.5.0")) return(df)
+  for (col in intersect(names(.SUMMARY_050_COLS), names(df))) {
+    df[[col]] <- switch(.SUMMARY_050_COLS[[col]],
+                        TEXT    = as.character(df[[col]]),
+                        INTEGER = as.integer(df[[col]]),
+                        REAL    = as.double(df[[col]]))
+  }
+  df
+}
+
+#' Add every declared 0.5.0 column the summary table lacks, with its declared type.
+.ensure_summary_columns <- function(con, analyzer_version) {
+  if (!analyzer_at_least(analyzer_version, "0.5.0")) return(invisible(character(0L)))
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(character(0L)))
+  add <- setdiff(names(.SUMMARY_050_COLS), DBI::dbListFields(con, SUMMARY_TABLE))
+  for (col in add) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" ADD COLUMN "%s" %s',
+                                SUMMARY_TABLE, col, .SUMMARY_050_COLS[[col]]))
+  }
+  invisible(add)
+}
+
+# Each retired column and the analyzer version that stopped emitting it.
+.RETIRED_SUMMARY_COLS <- c(has_website = "0.5.0", copyright_holder_declared = "0.5.0")
+
+# The retired names whose analyzer version the running build has reached.
+.retired_now <- function(analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  keep <- vapply(unname(retired), function(v) analyzer_at_least(analyzer_version, v),
+                 logical(1L))
+  names(retired)[keep]
+}
+
+#' Remove retired columns from a shard frame, so no row can add one back.
+.strip_retired_columns <- function(df, analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  gone <- intersect(.retired_now(analyzer_version, retired), names(df))
+  if (length(gone)) df <- df[, setdiff(names(df), gone), drop = FALSE]
+  df
+}
+
+#' Drop retired columns once the running analyzer is past them. Gated on the build,
+#' not the frame: an R-fallback shard under an old pin must not drop a filled column.
+.drop_retired_columns <- function(con, analyzer_version, retired = .RETIRED_SUMMARY_COLS) {
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(invisible(character(0L)))
+  gone <- intersect(.retired_now(analyzer_version, retired),
+                    DBI::dbListFields(con, SUMMARY_TABLE))
+  for (col in gone) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" DROP COLUMN "%s"', SUMMARY_TABLE, col))
+  }
+  invisible(gone)
+}
+
 #' Upsert one shard's rows into the pipeline database in-place.
 #'
 #' For each package present in summary_df, deletes all prior rows from the
@@ -1339,9 +1431,13 @@ db_analyzed_state <- function(con) {
 #'   untouched. Detail is expected to cover each package's latest version only;
 #'   the delete-by-package step still clears any prior-version detail rows so no
 #'   stale rows survive a re-analysis.
+#' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
+#' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
-                         functions_df = NULL, edges_df = NULL) {
+                         functions_df = NULL, edges_df = NULL,
+                         description_df = NULL, release_notes_df = NULL,
+                         analyzer_version = NA_character_) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -1366,13 +1462,18 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
 
     # -- Insert fresh summary rows (with schema-growth handling) -------------
     summary_write <- .coerce_logicals(summary_df)
+    summary_write <- .apply_declared_types(summary_write, analyzer_version)
+    summary_write <- .strip_retired_columns(summary_write, analyzer_version)
+    .drop_retired_columns(con, analyzer_version)
     tables        <- DBI::dbListTables(con)
 
     if (!"bioc_code_summary" %in% tables) {
       # First-ever write: create the table from the data.frame schema.
       DBI::dbWriteTable(con, "bioc_code_summary", summary_write,
                         row.names = FALSE, overwrite = FALSE, append = FALSE)
+      .ensure_summary_columns(con, analyzer_version)
     } else {
+      .ensure_summary_columns(con, analyzer_version)
       # Possibly new columns have appeared since the table was first created.
       existing_cols <- DBI::dbListFields(con, "bioc_code_summary")
       for (col in setdiff(names(summary_write), existing_cols)) {
@@ -1404,6 +1505,11 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     # -- Insert fresh per-function / per-call-edge detail --------------------
     .append_detail_table(con, "bioc_functions",  functions_df)
     .append_detail_table(con, "bioc_call_edges", edges_df)
+
+    # -- Replace the latest-only DESCRIPTION fields and release notes ---------
+    if (!is.null(description_df) || !is.null(release_notes_df)) {
+      .write_latest_text(con, pkgs, description_df, release_notes_df)
+    }
   })
 
   invisible(NULL)

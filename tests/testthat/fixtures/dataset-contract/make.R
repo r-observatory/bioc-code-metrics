@@ -246,7 +246,8 @@ saveRDS(data.frame(x = 1:3), file.path(root, "inst", "extdata", "an_object.rds")
 
 # ---- the package itself ---------------------------------------------------
 # A DESCRIPTION is what makes the directory a package the analyzer will read,
-# and the help pages are where dataset titles come from.
+# and the help pages are where dataset titles come from. The \format and \source
+# lines give dataset_doc_format and dataset_doc_source a value on some record.
 writeLines(c(
   "Package: bcmfixtures",
   "Version: 0.1.0",
@@ -261,6 +262,8 @@ writeLines(c(
   "\\docType{data}",
   "\\title{One column of every profiled type}",
   "\\description{A frame carrying each column type the profiler reports on.}",
+  "\\format{A data frame with one column of each profiled type.}",
+  "\\source{Written by make.R for the contract test.}",
   "\\keyword{datasets}"
 ), file.path(root, "man", "every_type.Rd"))
 

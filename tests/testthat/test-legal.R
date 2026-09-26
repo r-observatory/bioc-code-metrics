@@ -228,73 +228,15 @@ test_that("metrics_legal: license_file_completeness TRUE for BSD_2_clause proper
 })
 
 # ---------------------------------------------------------------------------
-# copyright_holder_declared
-# ---------------------------------------------------------------------------
-
-test_that("metrics_legal: copyright_holder_declared TRUE when Authors@R has cph role", {
-  map <- list(
-    "DESCRIPTION" = paste0(
-      "Package: p\nVersion: 1.0\nLicense: MIT\n",
-      'Authors@R: person("Jane", "Doe", role = c("aut", "cph"))\n'
-    )
-  )
-  m <- metrics_legal(make_ctx(map))
-  expect_true(m$copyright_holder_declared)
-})
-
-test_that("metrics_legal: copyright_holder_declared FALSE when Authors@R lacks cph", {
-  map <- list(
-    "DESCRIPTION" = paste0(
-      "Package: p\nVersion: 1.0\nLicense: MIT\n",
-      'Authors@R: person("Jane", "Doe", role = c("aut", "cre"))\n'
-    )
-  )
-  m <- metrics_legal(make_ctx(map))
-  expect_false(m$copyright_holder_declared)
-})
-
-test_that("metrics_legal: copyright_holder_declared TRUE for single-quoted 'cph'", {
-  map <- list(
-    "DESCRIPTION" = paste0(
-      "Package: p\nVersion: 1.0\nLicense: MIT\n",
-      "Authors@R: person('Jane', 'Doe', role = 'cph')\n"
-    )
-  )
-  m <- metrics_legal(make_ctx(map))
-  expect_true(m$copyright_holder_declared)
-})
-
-test_that("metrics_legal: copyright_holder_declared TRUE when Author field is non-empty (no Authors@R)", {
-  map <- list(
-    "DESCRIPTION" = "Package: p\nVersion: 1.0\nLicense: MIT\nAuthor: Jane Doe\n"
-  )
-  m <- metrics_legal(make_ctx(map))
-  expect_true(m$copyright_holder_declared)
-})
-
-test_that("metrics_legal: copyright_holder_declared NA when both Authors@R and Author are absent", {
-  map <- list("DESCRIPTION" = "Package: p\nVersion: 1.0\nLicense: MIT\n")
-  m   <- metrics_legal(make_ctx(map))
-  expect_true(is.na(m$copyright_holder_declared))
-})
-
-test_that("metrics_legal: copyright_holder_declared NA when DESCRIPTION is absent entirely", {
-  map <- list("R/foo.R" = "foo <- function() NULL\n")
-  m   <- metrics_legal(make_ctx(map))
-  expect_true(is.na(m$copyright_holder_declared))
-})
-
-# ---------------------------------------------------------------------------
 # Return structure
 # ---------------------------------------------------------------------------
 
-test_that("metrics_legal: always returns a named list with the five expected metrics", {
+test_that("metrics_legal: always returns a named list with the four expected metrics", {
   map <- list("DESCRIPTION" = "Package: p\nVersion: 1.0\n")
   m   <- metrics_legal(make_ctx(map))
   expect_setequal(
     names(m),
-    c("license", "spdx_valid", "osi_approved",
-      "license_file_completeness", "copyright_holder_declared")
+    c("license", "spdx_valid", "osi_approved", "license_file_completeness")
   )
 })
 

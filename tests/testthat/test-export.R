@@ -156,7 +156,7 @@ test_that("indexes exist on all three tables", {
   expect_true(any(grepl("api",     idx)))
 })
 
-test_that("churn table has both (package,version) and (package) indexes", {
+test_that("churn table keeps only the (package, version) index", {
   tmp <- tempfile(fileext = ".db")
   on.exit(unlink(tmp), add = TRUE)
 
@@ -168,7 +168,8 @@ test_that("churn table has both (package,version) and (package) indexes", {
   idx <- DBI::dbGetQuery(con,
     "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='bioc_code_churn'")$name
 
-  expect_gte(length(idx), 2L)
+  # The (package) index is gone: the (package, version) one serves both lookups.
+  expect_identical(idx, "idx_churn_pkg_ver")
 })
 
 # ---------------------------------------------------------------------------
@@ -296,7 +297,8 @@ test_that("open_or_init_db creates DB with fixed-schema tables and failures tabl
   # indexes on churn
   idx <- DBI::dbGetQuery(con,
     "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='bioc_code_churn'")$name
-  expect_gte(length(idx), 2L)
+  # The (package) index is gone: the (package, version) one serves both lookups.
+  expect_identical(idx, "idx_churn_pkg_ver")
 })
 
 test_that("open_or_init_db on existing DB is idempotent and returns a valid connection", {
@@ -524,4 +526,18 @@ test_that("record/read changed packages unions and dedupes", {
 
 test_that("read_changed_packages returns empty when absent", {
   expect_identical(read_changed_packages(tempfile()), character(0L))
+})
+
+test_that("repository-only zeros stay zeros on the git input", {
+  # A Bioconductor branch is the repository, so a 0 there is a real absence.
+  expect_false(exists(".null_repository_only_columns"))
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  upsert_shard(con, data.frame(package = "p", version = "3.23", ci_present = 0L,
+                               has_pkgdown = 0L, stringsAsFactors = FALSE),
+               churn_df = .empty_churn(), api_df = .empty_api())
+  got <- DBI::dbGetQuery(con, "SELECT ci_present, has_pkgdown FROM bioc_code_summary")
+  expect_identical(got$ci_present, 0L)
+  expect_identical(got$has_pkgdown, 0L)
 })

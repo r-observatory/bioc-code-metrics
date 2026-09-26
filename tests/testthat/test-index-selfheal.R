@@ -15,7 +15,7 @@ test_that("open_or_init_db backfills churn/api indexes on an unindexed DB", {
 
   con <- open_or_init_db(path); on.exit(DBI::dbDisconnect(con))
   expect_true("idx_churn_pkg_ver" %in% .idx_on(con, "bioc_code_churn"))
-  expect_true("idx_churn_pkg"     %in% .idx_on(con, "bioc_code_churn"))
+  expect_false("idx_churn_pkg"    %in% .idx_on(con, "bioc_code_churn"))
   expect_true("idx_api_pkg_ver"   %in% .idx_on(con, "bioc_api_history"))
 })
 
@@ -25,8 +25,7 @@ test_that(".append_detail_table backfills indexes on an existing unindexed detai
   DBI::dbExecute(con, "CREATE TABLE bioc_functions (package TEXT, version TEXT, name TEXT)")  # no index
   .append_detail_table(con, "bioc_functions",
                        data.frame(package = "pkgA", version = "1.0", name = "f", stringsAsFactors = FALSE))
-  expect_equal(.idx_on(con, "bioc_functions"),
-               c("idx_bioc_functions_pkg", "idx_bioc_functions_pkg_ver"))
+  expect_equal(.idx_on(con, "bioc_functions"), "idx_bioc_functions_pkg_ver")
 })
 
 test_that("upsert_shard keeps the summary UNIQUE index present on a pre-existing summary table", {
@@ -50,4 +49,27 @@ test_that("open_or_init_data_db backfills dataset indexes on an unindexed data D
   dcon <- open_or_init_data_db(path); on.exit(DBI::dbDisconnect(dcon))
   expect_true("idx_bioc_dsv_content" %in% .idx_on(dcon, "bioc_dataset_versions"))
   expect_true("idx_bioc_dsc_schema"  %in% .idx_on(dcon, "bioc_dataset_contents"))
+})
+
+test_that("open_or_init_db drops the package-only indexes the composite ones already serve", {
+  path <- withr::local_tempfile(fileext = ".db")
+  raw <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(raw, "CREATE TABLE bioc_code_churn (package TEXT, version TEXT, file TEXT, added INTEGER, deleted INTEGER)")
+  DBI::dbExecute(raw, "CREATE INDEX idx_churn_pkg ON bioc_code_churn(package)")
+  DBI::dbExecute(raw, "CREATE INDEX idx_churn_pkg_ver ON bioc_code_churn(package, version)")
+  for (t in c("bioc_functions", "bioc_call_edges")) {
+    DBI::dbExecute(raw, sprintf("CREATE TABLE %s (package TEXT, version TEXT)", t))
+    DBI::dbExecute(raw, sprintf("CREATE INDEX idx_%s_pkg ON %s(package)", t, t))
+    DBI::dbExecute(raw, sprintf("CREATE INDEX idx_%s_pkg_ver ON %s(package, version)", t, t))
+  }
+  DBI::dbDisconnect(raw)
+
+  con <- open_or_init_db(path); on.exit(DBI::dbDisconnect(con))
+  expect_identical(.idx_on(con, "bioc_code_churn"), "idx_churn_pkg_ver")
+  for (t in c("bioc_functions", "bioc_call_edges")) {
+    expect_identical(.idx_on(con, t), sprintf("idx_%s_pkg_ver", t), info = t)
+  }
+  # A delete by package still uses an index rather than scanning the table.
+  plan <- DBI::dbGetQuery(con, "EXPLAIN QUERY PLAN DELETE FROM bioc_code_churn WHERE package IN ('a', 'b')")
+  expect_true(any(grepl("idx_churn_pkg_ver", plan$detail, fixed = TRUE)))
 })

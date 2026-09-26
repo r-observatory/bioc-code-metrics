@@ -27,6 +27,14 @@ pruned on a retention schedule):
 - `bioc_code_churn` - added and deleted lines per file between consecutive
   releases.
 - `bioc_api_history` - exported-symbol additions and removals per release.
+- `bioc_description_fields` - the latest analysed release's RdMacros,
+  RoxygenNote, SystemRequirements, Language, LazyData, Date and `Config/*`
+  DESCRIPTION fields, each value capped at 16,384 bytes.
+- `bioc_release_notes` - the NEWS section for the latest analysed release's
+  DESCRIPTION Version, when the analyzer found one, capped at 16,384 bytes.
+- `bioc_description_history`, `bioc_release_notes_history` and
+  `bioc_release_text_versions` - every DESCRIPTION field and NEWS section of
+  every analysed release, and which releases were read. Not merged downstream.
 
 `bioc-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
 release, and holds the dataset-focused tables.
@@ -35,6 +43,13 @@ Each dated release carries its own `manifest.json` asset (copied from
 `code-manifest.json` or `data-manifest.json`). A separate `run-status.json`,
 written alongside but not published, carries the `changed` and
 `bootstrap_complete` flags that drive the shard loop.
+
+## Retired columns
+
+These columns are no longer published in `bioc_code_summary`. Each leaves the
+database on the first shard written by the analyzer version named.
+
+- `has_website`, `copyright_holder_declared` (analyzer 0.5.0)
 
 ## Running
 

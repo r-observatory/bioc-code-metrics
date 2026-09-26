@@ -265,3 +265,124 @@ test_that("the analyzer reports the same version in its record and on --version"
   expect_identical(as.character(metrics[["analyzer_version"]]),
                    rpkg_analyzer_version())
 })
+
+# ---------------------------------------------------------------------------
+# The input kind, and what the analyzer prints besides the summary
+# ---------------------------------------------------------------------------
+
+test_that("analyzer_at_least reads the leading version and nothing else", {
+  expect_true(analyzer_at_least("0.5.0", "0.5.0"))
+  expect_true(analyzer_at_least("0.5.0-test", "0.5.0"))
+  expect_true(analyzer_at_least("0.10.0", "0.5.0"))
+  for (v in list("0.4.0", "0.4.0-test", NA, NA_character_, NULL, "", "dev")) {
+    expect_false(analyzer_at_least(v, "0.5.0"), info = format(v))
+  }
+})
+
+test_that("parse_analyzer_records keeps the first DESCRIPTION and release-notes records", {
+  parsed <- parse_analyzer_records(c(
+    '{"rec":"summary","package":"demo"}',
+    '{"rec":"dcf","Package":"demo","Version":"1.2.0","Config/testthat/edition":"3"}',
+    '{"rec":"dcf","Package":"second"}',
+    '{"rec":"release_notes","package_version":"1.2.0","news_file":"NEWS.md","release_notes_source":"news_md","release_notes":"- fixed","release_notes_truncated":false}',
+    '{"rec":"release_notes","package_version":"9.9.9"}',
+    '{"rec":"something_new","x":1}'))
+  expect_identical(parsed$dcf, c(Package = "demo", Version = "1.2.0",
+                                 `Config/testthat/edition` = "3"))
+  expect_identical(parsed$release_notes$package_version, "1.2.0")
+  expect_false(parsed$release_notes$release_notes_truncated)
+  expect_identical(parsed$summary$package, "demo")
+})
+
+test_that("an empty DESCRIPTION record is kept apart from a missing one", {
+  expect_identical(length(parse_analyzer_records('{"rec":"dcf"}')$dcf), 0L)
+  expect_false(is.null(parse_analyzer_records('{"rec":"dcf"}')$dcf))
+  expect_null(parse_analyzer_records('{"rec":"summary"}')$dcf)
+  expect_null(parse_analyzer_records('{"rec":"summary"}')$release_notes)
+})
+
+test_that("analyze_with_binary passes the input kind after the directory", {
+  skip_on_os("windows")
+  dir <- withr::local_tempdir()
+  args_file <- file.path(dir, "args.txt")
+  stub <- file.path(dir, "stub-args.sh")
+  writeLines(c("#!/bin/sh",
+               sprintf("printf '%%s\\n' \"$@\" > %s", shQuote(args_file)),
+               'echo "{\\"rec\\":\\"summary\\",\\"n_fns_r\\":1}"',
+               'echo "{\\"rec\\":\\"dcf\\",\\"Package\\":\\"demo\\"}"'), stub)
+  Sys.chmod(stub, mode = "0755")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+
+  pkg <- file.path(dir, "pkg")
+  dir.create(pkg)
+  metrics <- analyze_with_binary(pkg)
+  expect_identical(readLines(args_file), c(pkg, "--input-kind", ANALYZER_INPUT_KIND))
+  expect_identical(attr(metrics, "dcf"), c(Package = "demo"))
+  expect_null(attr(metrics, "release_notes"))
+})
+
+# A stub that answers --version and, on any package, prints one summary naming
+# `input_kind` when it is given, the way a 0.5.0 build does.
+.write_selfcheck_stub <- function(dir, version, input_kind = NULL) {
+  kind <- if (is.null(input_kind)) "" else
+    sprintf(',\\"input_kind\\":\\"%s\\"', input_kind)
+  stub <- file.path(dir, "stub-selfcheck.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then',
+    sprintf('  echo "rpkg-analyzer %s"', version),
+    "  exit 0",
+    "fi",
+    sprintf('echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1%s}"', kind)), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("the self-check passes only when the analyzer names the kind it was given", {
+  skip_on_os("windows")
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test", input_kind = "git"))
+  expect_true(rpkg_analyzer_selfcheck("git"))
+  expect_false(rpkg_analyzer_selfcheck("release"))
+
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test"))
+  expect_false(rpkg_analyzer_selfcheck("git"))
+})
+
+.sc_io <- function() list(
+  package_list = function() data.frame(package = "pkgA", latest_version = "1.0",
+                                       stringsAsFactors = FALSE),
+  clone = function(pkg, dest) { dir.create(dest, showWarnings = FALSE); TRUE })
+
+test_that("a 0.5.0 analyzer that does not name the kind stops the run before any shard", {
+  skip_on_os("windows")
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.5.0-test"))
+  out <- withr::local_tempdir()
+  expect_error(run_update(.sc_io(), out, shard_size = 10L), "--input-kind git")
+  expect_false(file.exists(file.path(out, DB_FILENAME)))
+})
+
+test_that("a build before 0.5.0 is never asked for the self-check", {
+  skip_on_os("windows")
+  # This stub would fail the self-check, so reaching the shard proves it was skipped.
+  withr::local_envvar(RPKG_ANALYZER_BIN = .write_selfcheck_stub(
+    withr::local_tempdir(), "0.4.0-test"))
+  out <- withr::local_tempdir()
+  m <- suppressWarnings(run_update(.sc_io(), out, shard_size = 10L))
+  expect_identical(m$n_shard, 1L)
+})
+
+test_that("the analyzer CI installs answers the self-check package", {
+  # Before 0.5.0 the flag is ignored and a summary still comes back; from 0.5.0 it
+  # must name the kind, or every scheduled run stops before its first shard.
+  skip_on_os("windows")
+  skip_if(!nzchar(rpkg_analyzer_bin()), "needs rpkg-analyzer")
+  dir <- withr::local_tempdir()
+  writeLines(c("Package: selfcheck", "Version: 0.0.1"), file.path(dir, "DESCRIPTION"))
+  expect_false(is.null(analyze_with_binary(dir)))
+  if (analyzer_at_least(rpkg_analyzer_version(), "0.5.0")) {
+    expect_true(rpkg_analyzer_selfcheck())
+  }
+})

@@ -77,7 +77,8 @@
   cached <- NULL
   function(bin) {
     if (!is.null(cached)) return(cached)
-    out <- suppressWarnings(system2(bin, shQuote(.contract_fixture_pkg()),
+    out <- suppressWarnings(system2(bin, c(shQuote(.contract_fixture_pkg()),
+                                           "--input-kind", ANALYZER_INPUT_KIND),
                                     stdout = TRUE, stderr = FALSE))
     top <- character(0L)
     nested <- character(0L)
@@ -147,6 +148,14 @@
                         "it predates the contract these lists are held to"),
                   rpkg_analyzer_version()))
   keys
+}
+
+# Declared for the analyzer 0.5.0 reader; a build before it leaves them NULL.
+.CONTRACT_FROM_050 <- c("dataset_doc_source", "dataset_doc_format")
+
+.contract_not_emitted <- function() {
+  if (analyzer_at_least(rpkg_analyzer_version(), "0.5.0")) return(.CONTRACT_NOT_EMITTED)
+  c(.CONTRACT_NOT_EMITTED, .CONTRACT_FROM_050)
 }
 
 .declared_dataset_cols <- function() {
@@ -294,7 +303,7 @@ test_that("every dataset field the analyzer emits is declared by a column spec",
 test_that("every declared dataset column is one the analyzer emits", {
   keys <- .contract_setup()
   missing <- sort(setdiff(.declared_dataset_cols(),
-                          c(keys$top, .CONTRACT_NOT_EMITTED)))
+                          c(keys$top, .contract_not_emitted())))
   expect_identical(
     missing, character(0L),
     info = paste0(

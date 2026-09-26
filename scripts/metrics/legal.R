@@ -114,24 +114,6 @@
   TRUE
 }
 
-# Determine whether a copyright holder is declared.
-#
-# Priority:
-#   1. Authors@R field present: TRUE iff it contains a quoted "cph" role string.
-#   2. Authors@R absent/empty: TRUE iff the Author field is non-empty.
-#   3. Both fields absent: NA.
-.legal_copyright_holder <- function(ctx) {
-  authors_r <- ctx$desc[["Authors@R"]]
-  if (!is.null(authors_r) && nzchar(trimws(authors_r))) {
-    return(grepl('"cph"|\'cph\'', authors_r, perl = TRUE))
-  }
-
-  author <- ctx$desc[["Author"]]
-  if (!is.null(author) && nzchar(trimws(author))) return(TRUE)
-
-  NA
-}
-
 #' Compute legal / licence metrics for a package version.
 #'
 #' All metrics are NA-safe: absent/empty/malformed input yields NA rather than
@@ -143,7 +125,6 @@
 #'   spdx_valid                logical    every token is in the R-canonical/SPDX allowlist
 #'   osi_approved              logical    every token is OSI-approved
 #'   license_file_completeness logical    file reference resolved + template placeholders filled
-#'   copyright_holder_declared logical    a "cph" role or Author field is present
 metrics_legal <- function(ctx) {
   lic_raw <- ctx$desc$License
   license <- if (is.null(lic_raw) || !nzchar(trimws(lic_raw %||% ""))) {
@@ -167,7 +148,6 @@ metrics_legal <- function(ctx) {
     license                   = license,
     spdx_valid                = spdx_valid,
     osi_approved              = osi_approved,
-    license_file_completeness = license_file_completeness,
-    copyright_holder_declared = .legal_copyright_holder(ctx)
+    license_file_completeness = license_file_completeness
   )
 }
