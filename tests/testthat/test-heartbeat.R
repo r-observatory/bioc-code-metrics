@@ -32,19 +32,31 @@ test_that("update.yml refuses to publish a heartbeat for an empty universe", {
 
 .stub_analyze <- function() {
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
-    # A package the analyzer read. The scan marker, the build that earned it
-    # and the version named as one the binary produced arrive together,
-    # because that is the only combination analyze_package can return: the
-    # reader that sets the marker is the producer that names the build. The
-    # build is whatever this machine's analyzer answers, so the row is one the
-    # re-scan queue reads as current rather than as collected by somebody else.
-    summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
-      latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
-      analyzer_version = rpkg_analyzer_version(), stringsAsFactors = FALSE),
-    churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL,
-    binary_versions = "1.0"),
-    envir = environment(run_update))
+  assign("analyze_package", function(dest, pkg) {
+    build <- rpkg_analyzer_version()
+    # The analyzer prints a dcf record, and from 0.5.0 a release_notes record too.
+    notes <- if (analyzer_at_least(build, "0.5.0")) {
+      list(rec = "release_notes", package_version = "1.0", news_file = "NEWS.md",
+           release_notes_source = "news_md", release_notes = "- first release",
+           release_notes_truncated = FALSE)
+    }
+    list(
+      # A package the analyzer read. The scan marker, the build that earned it
+      # and the version named as one the binary produced arrive together,
+      # because that is the only combination analyze_package can return: the
+      # reader that sets the marker is the producer that names the build. The
+      # build is whatever this machine's analyzer answers, so the row is one the
+      # re-scan queue reads as current rather than as collected by somebody else.
+      summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
+        latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
+        analyzer_version = build, stringsAsFactors = FALSE),
+      churn = NULL, api = NULL, functions = NULL, edges = NULL, datasets = NULL,
+      # The text reading analyze_package keeps for each version the binary produced.
+      text = .release_text_collect(list(.release_text_rows(
+        pkg, "1.0", c(Package = pkg, Version = "1.0", Title = "A Package"),
+        notes, build)), "1.0"),
+      binary_versions = "1.0")
+  }, envir = environment(run_update))
   old
 }
 
