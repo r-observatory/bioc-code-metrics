@@ -591,3 +591,57 @@ test_that("a weekly recheck that fails at a new stage publishes", {
   expect_identical(recheck$shard_failures$packages, "pkgF")
   expect_true(recheck$changed)
 })
+
+# ---------------------------------------------------------------------------
+# The standing over-cap list
+# ---------------------------------------------------------------------------
+
+test_that("a pass past the cap goes on the standing list, and a pass under it takes it off", {
+  out <- withr::local_tempdir()
+  .local_global("WORKER_TIMEOUT", 1L)
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
+  slow <- TRUE
+  .local_global("analyze_package", function(dest, pkg) {
+    if (slow) tryCatch(.busy(1.5), error = function(e) NULL)
+    .fv_result(pkg)
+  })
+  logged <- capture.output(.fv_run(.fv_io("pkgBig"), out))
+  expect_true(any(grepl("ok pkgBig: 1 versions in [0-9.]+s \\(past the 1s cap\\)", logged)))
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  row <- DBI::dbGetQuery(con, "SELECT * FROM bioc_over_cap")
+  expect_identical(row$package, "pkgBig")
+  expect_gte(row$elapsed_s, 1)
+  expect_identical(c(row$analyzer_version, row$last_run_id), c("", "r1"))
+  expect_identical(.over_cap_packages(con), "pkgBig")
+  DBI::dbDisconnect(con)
+
+  slow <- FALSE
+  .fv_run(.fv_io("pkgBig", "1.1"), out)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.over_cap_packages(con), character(0L))
+})
+
+test_that("the standing list is read longest first", {
+  con <- .fv_con()
+  DBI::dbExecute(con, "INSERT INTO bioc_over_cap (package, elapsed_s) VALUES
+    ('pkgA', 700), ('pkgB', 1500), ('pkgC', 700)")
+  expect_identical(.over_cap_packages(con), c("pkgB", "pkgA", "pkgC"))
+})
+
+test_that("a package on the standing list that then fails stays on it", {
+  out <- withr::local_tempdir()
+  .local_global("WORKER_TIMEOUT", 1L)
+  .local_global("analyze_package", function(dest, pkg) {
+    tryCatch(.busy(1.5), error = function(e) NULL)
+    .fv_result(pkg)
+  })
+  .fv_run(.fv_io("pkgBig"), out)
+  .local_global("analyze_package", function(dest, pkg) stop("broke"))
+  .fv_run(.fv_io("pkgBig", "1.1"), out)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.over_cap_packages(con), "pkgBig")
+  expect_identical(.fv_row(con, "pkgBig")$stage, "analyze")
+})

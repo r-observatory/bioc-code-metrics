@@ -209,6 +209,34 @@
   invisible(NULL)
 }
 
+# Keep the standing over-cap list. A pass past the cap ran uncapped after the cap
+# fired somewhere, so it goes on the list; a pass under the cap rewrote every
+# stored row without crossing, so it comes off. TRUE when the package is on it.
+.note_over_cap <- function(con, pkg, elapsed, build, run_id,
+                           worker_timeout = WORKER_TIMEOUT) {
+  if (!isTRUE(elapsed >= worker_timeout)) {
+    DBI::dbExecute(con, "DELETE FROM bioc_over_cap WHERE package = ?", params = list(pkg))
+    return(FALSE)
+  }
+  DBI::dbExecute(con, "
+    INSERT INTO bioc_over_cap (package, elapsed_s, analyzer_version, last_run_id, recorded_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(package) DO UPDATE SET
+      elapsed_s = excluded.elapsed_s, analyzer_version = excluded.analyzer_version,
+      last_run_id = excluded.last_run_id, recorded_at = excluded.recorded_at",
+    params = list(pkg, as.numeric(elapsed), .build_key(build),
+                  as.character(run_id %||% NA_character_),
+                  format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")))
+  TRUE
+}
+
+# The standing over-cap list, longest analysis first.
+.over_cap_packages <- function(con) {
+  if (!"bioc_over_cap" %in% DBI::dbListTables(con)) return(character(0L))
+  as.character(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_over_cap ORDER BY elapsed_s DESC, package")$package)
+}
+
 # Delete a package's failure record (reset after a successful analysis).
 .reset_failure <- function(con, pkg) {
   DBI::dbExecute(con,
@@ -974,6 +1002,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Verdicts this shard wrote. Each is news the next run needs, so the shard
   # publishes; a weekly recheck that failed where it failed before is not.
   n_verdicts_written   <- 0L
+  shard_over_cap       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
   shard_binary_keys    <- character(0L)
@@ -1081,6 +1110,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
+      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id)) {
+        shard_over_cap <- c(shard_over_cap, pkg)
+      }
       # Analysed, but was it read? A package the analyzer did not read carries
       # none of the fields the backfill queues wait on, and that attempt is
       # what eventually takes it out of them. A package that was read starts
