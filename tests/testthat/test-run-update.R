@@ -443,3 +443,91 @@ test_that("a package the reader looked at is marked scanned even with nothing to
   expect_true(isTRUE(res$summary$datasets_scanned[last]))
   expect_true(all(is.na(res$summary$datasets_scanned[-last])))
 })
+
+# ---------------------------------------------------------------------------
+# A release that cannot be extracted, or whose analyzer output does not parse,
+# fails the package and changes nothing
+# ---------------------------------------------------------------------------
+
+# A stub analyzer that reads every release and, on `bad_version`, also prints
+# a line that is not JSON.
+.stub_reads_bin <- function(dir, bad_version = "none") {
+  stub <- file.path(dir, "stub-reads.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then echo "rpkg-analyzer 0.4.0-test"; exit 0; fi',
+    'dir=$(echo "$1" | tr -d "\'")',
+    'v=$(sed -n "s/^Version: *//p" "$dir/DESCRIPTION" | head -1)',
+    'echo "{\\"rec\\":\\"summary\\",\\"loc_r\\":1,\\"n_fns_r\\":1}"',
+    sprintf('if [ "$v" = "%s" ]; then echo "{\\"rec\\":\\"function\\",\\"name\\":"; fi', bad_version),
+    "exit 0"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("analyze_package fails as a whole when one release cannot be extracted", {
+  repo <- tempfile("bcm_xf_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (grepl("RELEASE_1_1$", ref)) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  err <- tryCatch(analyze_package(repo, "pkgX"), error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$ref, "RELEASE_1_1")
+})
+
+test_that("a cap during extraction extracts again into an emptied directory", {
+  repo <- tempfile("bcm_xc_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) NULL)
+  want <- suppressWarnings(analyze_package(repo, "pkgX"))
+
+  real  <- extract_version
+  fired <- FALSE
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (!fired && grepl("RELEASE_1_1$", ref)) {
+      fired <<- TRUE
+      real(repo, ref, dest)
+      writeLines("leftover <- function() 1", file.path(dest, "R", "leftover.R"))
+      stop(.cap_error())
+    }
+    real(repo, ref, dest)
+  })
+  got <- suppressWarnings(analyze_package(repo, "pkgX"))
+  expect_true(fired)
+  expect_identical(got, want)
+})
+
+test_that("a release that cannot be extracted leaves the package's stored rows as they were", {
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  orig_cores <- ANALYSIS_CORES
+  ANALYSIS_CORES <<- 1L
+  on.exit(ANALYSIS_CORES <<- orig_cores, add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir()))
+
+  v1 <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  run_update(.fake_io(v1, version_map = list(pkgA = "1.0")), out_dir, shard_size = 10L)
+  before <- .package_rows(out_dir, "pkgA")
+  expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
+
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest) {
+    if (grepl("RELEASE_1_1$", ref)) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
+    real(repo, ref, dest)
+  })
+  v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
+  logged <- capture.output(m <- suppressWarnings(
+    run_update(.fake_io(v2, version_map = list(pkgA = c("1.0", "1.1"))),
+               out_dir, shard_size = 10L)))
+
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_identical(.package_rows(out_dir, "pkgA"), before)
+})

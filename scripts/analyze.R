@@ -574,10 +574,14 @@ analyze_package <- function(repo_dir, package) {
       dir.create(tmp, recursive = TRUE)
       on.exit(unlink(tmp, recursive = TRUE, force = TRUE), add = TRUE)
 
-      files <- tryCatch(
-        extract_version(repo_dir, ref, tmp),
-        error = function(e) character(0L)
-      )
+      # A version that cannot be extracted fails the whole package, so every
+      # stored row stays as it was. A cap that fires here extracts again into
+      # an emptied directory.
+      files <- .retry_after_time_limit({
+        unlink(list.files(tmp, all.files = TRUE, no.. = TRUE, full.names = TRUE),
+               recursive = TRUE, force = TRUE)
+        extract_version(repo_dir, ref, tmp)
+      }, error = function(e) stop(e))
 
       # Build a read_fn closed over this iteration's extraction directory
       read_fn <- local({

@@ -768,16 +768,18 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       .done(FALSE, "clone", 0L)
       return(list(package = pkg, ok = FALSE))
     }
+    stage <- "analyze"
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
+        if (inherits(e, "extract_failure")) stage <<- "extract"
         warning(sprintf("analyze_package failed for '%s': %s",
                         pkg, conditionMessage(e)))
         NULL
       }
     )
     if (is.null(res)) {
-      .done(FALSE, "analyze", 0L)
+      .done(FALSE, stage, 0L)
       return(list(package = pkg, ok = FALSE))
     }
     .done(TRUE, "ok", nrow(res$summary))
