@@ -62,3 +62,39 @@ test_that("a run status that cannot be read stops the shard loop with a warning"
     expect_true(any(grepl("^::warning::could not read ", res$output)))
   }
 })
+
+# ---------------------------------------------------------------------------
+# The run's summary on the Actions page
+# ---------------------------------------------------------------------------
+
+.step_summary <- function(status, secs, start) {
+  .loop_bash(sprintf("write_step_summary %%s %s %s", secs, start), status)
+}
+
+test_that("the step summary tabulates the run status and an ETA at this run's rate", {
+  status <- list(
+    changed = TRUE, bootstrap_complete = FALSE, n_remaining = 300L, n_shard = 400L,
+    failed_this_run = 3L, failed_by_stage = list(clone = 1L, timeout = 2L),
+    parked = list(fetch = 2L, analyze = 0L, timeout = 1L, legacy = 0L),
+    over_cap_ok = list(count = 2L, packages = I(c("mzR", "HMP16SData"))),
+    latest_by_build = list(`0.4.0` = 33000L, none = 5L))
+  res <- .step_summary(status, 3600, 1500)
+  expect_identical(res$status, 0L)
+  expect_identical(res$output, c(
+    "### Shard loop", "", "| | |", "|---|---|",
+    "| Packages still queued | 300 |",
+    "| Failed this run | 3 |",
+    "| Failed in the last shard, by stage | clone 1, timeout 2 |",
+    "| Parked | fetch 2, analyze 0, timeout 1, legacy 0 |",
+    "| Standing over-cap list | 2 (mzR, HMP16SData) |",
+    "| Latest rows by build | 0.4.0 33000, none 5 |",
+    "| ETA at this run's rate | about 0.3 h |"))
+})
+
+test_that("the step summary says done, or n/a, when there is no rate to go on", {
+  done <- .step_summary(list(n_remaining = 0L, n_shard = 0L), 60, 0)$output
+  expect_identical(done[[length(done)]], "| ETA at this run's rate | done |")
+  expect_true("| Parked | none |" %in% done)
+  stuck <- .step_summary(list(n_remaining = 50L, n_shard = 50L), 60, 50)$output
+  expect_identical(stuck[[length(stuck)]], "| ETA at this run's rate | n/a |")
+})

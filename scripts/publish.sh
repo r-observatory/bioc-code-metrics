@@ -976,3 +976,24 @@ shard_loop_done() {  # $1=run-status.json
   echo "Nothing left to do (complete=${complete}, changed=${changed}, remaining=${remaining}, shard=${shard})."
   return 0
 }
+
+# The run's summary for $GITHUB_STEP_SUMMARY, from the last shard's run-status.json.
+# The ETA is packages done since the queue held $3, over $2 seconds.
+write_step_summary() {  # $1=run-status.json $2=seconds so far $3=packages queued at the start
+  jq -r --argjson secs "${2:-0}" --argjson start "${3:-0}" '
+    def kv: to_entries | map("\(.key) \(.value)") | join(", ") | if . == "" then "none" else . end;
+    (.n_remaining // 0) as $left
+    | ($start - $left) as $done
+    | "### Shard loop",
+      "",
+      "| | |",
+      "|---|---|",
+      "| Packages still queued | \($left) |",
+      "| Failed this run | \(.failed_this_run // 0) |",
+      "| Failed in the last shard, by stage | \((.failed_by_stage // {}) | kv) |",
+      "| Parked | \((.parked // {}) | kv) |",
+      "| Standing over-cap list | \(.over_cap_ok.count // 0)\((.over_cap_ok.packages // []) | if length > 0 then " (" + join(", ") + ")" else "" end) |",
+      "| Latest rows by build | \((.latest_by_build // {}) | kv) |",
+      "| ETA at this run'"'"'s rate | \(if $left == 0 then "done" elif $done > 0 and $secs > 0 then "about \(($left * $secs / $done / 360 | round) / 10) h" else "n/a" end) |"
+  ' "$1"
+}

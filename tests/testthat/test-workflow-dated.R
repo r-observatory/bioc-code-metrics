@@ -53,3 +53,10 @@ test_that("unpark and requeue reach the first shard only, through env", {
     yml, fixed = TRUE)))
   expect_true(any(grepl("^            RELEASE=\\(\\)$", yml)))
 })
+
+test_that("the shard step leaves a summary of the run on the Actions page", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl(
+    'write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"',
+    yml, fixed = TRUE)))
+})
