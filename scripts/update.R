@@ -131,24 +131,70 @@
        reason = r$reason %||% "", from_parent = FALSE)
 }
 
-# Increment consecutive_failures for a package in bioc_metrics_failures.
-.record_failure <- function(con, pkg) {
-  now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
-  existing <- DBI::dbGetQuery(con,
-    "SELECT consecutive_failures FROM bioc_metrics_failures WHERE package = ?",
-    params = list(pkg))
-  if (nrow(existing) == 0L) {
-    DBI::dbExecute(con,
-      "INSERT INTO bioc_metrics_failures (package, consecutive_failures, last_attempt)
-       VALUES (?, 1, ?)",
-      params = list(pkg, now_str))
-  } else {
-    DBI::dbExecute(con,
-      "UPDATE bioc_metrics_failures
-       SET consecutive_failures = consecutive_failures + 1, last_attempt = ?
-       WHERE package = ?",
-      params = list(now_str, pkg))
-  }
+# The run a verdict belongs to: PIPELINE_RUN_ID, which the workflow sets in the
+# shard step alone. GITHUB_RUN_ID is never read, since Actions sets it in the
+# test steps too. NA outside a run, which keeps one attempt per shard.
+.current_run_id <- function() {
+  v <- Sys.getenv("PIPELINE_RUN_ID", "")
+  if (nzchar(v)) v else NA_character_
+}
+
+# The build a verdict names: "" when no binary ran.
+.build_key <- function(build) {
+  if (is.null(build) || length(build) != 1L || is.na(build)) "" else as.character(build)
+}
+
+# The counter a stage counts in. A fetch never reached the analyzer, so its
+# count carries across builds; the other two are verdicts on one build.
+.failure_class <- function(stage) {
+  if (stage %in% c("clone", "extract")) "fetch"
+  else if (stage %in% c("timeout", "crash", "git_timeout")) "timeout"
+  else "analyze"
+}
+
+# Record one failed attempt. fetch_failures restarts on a new latest_version and
+# any other verdict zeroes it; analyze_failures and timeout_failures restart on a
+# new build or a row from before stages were kept, and timeouts on a new cap.
+.record_failure <- function(con, pkg, stage, build, worker_timeout, run_id,
+                            elapsed, reason, latest_version) {
+  cls <- .failure_class(stage)
+  DBI::dbExecute(con, "
+    INSERT INTO bioc_metrics_failures
+      (package, consecutive_failures, last_attempt, stage, analyzer_version,
+       worker_timeout, fetch_failures, fetch_version, analyze_failures,
+       timeout_failures, last_run_id, elapsed_s, reason)
+    VALUES (:pkg, 1, :now, :stage, :build, :wt, :fetch,
+            CASE WHEN :fetch = 1 THEN :lv END, :analyze, :timeout,
+            :run_id, :elapsed, :reason)
+    ON CONFLICT(package) DO UPDATE SET
+      consecutive_failures = consecutive_failures + 1,
+      fetch_failures   = CASE WHEN :fetch = 1
+                              THEN (CASE WHEN IFNULL(fetch_version, '') = IFNULL(:lv, '')
+                                         THEN fetch_failures ELSE 0 END) + 1
+                              ELSE 0 END,
+      fetch_version    = CASE WHEN :fetch = 1 THEN :lv ELSE fetch_version END,
+      analyze_failures = (CASE WHEN stage IS NOT NULL
+                                AND IFNULL(analyzer_version, '') = :build
+                               THEN analyze_failures ELSE 0 END) + :analyze,
+      timeout_failures = (CASE WHEN stage IS NOT NULL
+                                AND IFNULL(analyzer_version, '') = :build
+                                AND worker_timeout = :wt
+                               THEN timeout_failures ELSE 0 END) + :timeout,
+      last_attempt     = excluded.last_attempt,
+      stage            = excluded.stage,
+      analyzer_version = excluded.analyzer_version,
+      worker_timeout   = excluded.worker_timeout,
+      last_run_id      = excluded.last_run_id,
+      elapsed_s        = excluded.elapsed_s,
+      reason           = excluded.reason",
+    params = list(
+      pkg = pkg, now = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      stage = stage, build = .build_key(build), wt = as.integer(worker_timeout),
+      fetch = as.integer(cls == "fetch"), analyze = as.integer(cls == "analyze"),
+      timeout = as.integer(cls == "timeout"),
+      lv = as.character(latest_version %||% NA_character_),
+      run_id = as.character(run_id %||% NA_character_),
+      elapsed = as.numeric(elapsed %||% NA_real_), reason = .redact_reason(reason)))
   invisible(NULL)
 }
 
@@ -739,6 +785,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
   perm_fail_pkgs <- .permanent_failures(con)
+  run_id <- .current_run_id()
+  lv_of  <- stats::setNames(as.character(universe$latest_version),
+                            as.character(universe$package))
 
   # Which builds count as this one, and how many latest rows they wrote.
   output_class <- .analyzer_output_class(analyzer_version)
@@ -847,6 +896,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_datasets_list  <- list()
   shard_text_list      <- list()
   shard_failures       <- character(0L)
+  shard_stages         <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
   shard_binary_keys    <- character(0L)
@@ -937,7 +987,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
         flush(stdout())
       }
       shard_failures <- c(shard_failures, pkg)
-      .record_failure(con, pkg)
+      shard_stages   <- c(shard_stages, v$stage)
+      .record_failure(con, pkg, v$stage, analyzer_version, WORKER_TIMEOUT, run_id,
+                      v$elapsed, v$reason, unname(lv_of[pkg]))
     } else {
       shard_summary_list[[pkg]]   <- r$summary
       shard_churn_list[[pkg]]     <- r$churn
