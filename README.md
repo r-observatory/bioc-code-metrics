@@ -65,6 +65,8 @@ databases plus their manifests. Only Bioconductor software and workflow
 packages have release-branch repositories; data packages are not covered. Set
 `GITHUB_TOKEN` so git fetches are authenticated.
 
+`test-record-memo.R` also runs the rpkg-analyzer builds that `RPA_TEST_BIN_040` and `RPA_TEST_BIN_050` name. `test-record-parse-corpus.R` holds the record parse and the dataset memo to the per-line parser over whole corpora of analyzer output when `RPA_PARSE_CORPUS_050` and `RPA_PARSE_CORPUS_040` name them as absolute paths: every `*.ndjson` or `*.ndjson.gz` file below, where the files under `mv/<package>/` are one package's versions in name order. With `RPA_PARSE_CORPUS_REPORT` set it appends one line per corpus, the label, the files read and the files found identical, separated by tabs.
+
 ## Notes
 
 Each package is cloned, analyzed across all its release branches, and deleted
