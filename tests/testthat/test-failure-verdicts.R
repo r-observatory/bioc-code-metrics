@@ -782,3 +782,67 @@ test_that("a re-run under the same run id skips what failed, unless the operator
   expect_identical(.fv_run(io, out)$n_shard, 0L)
   expect_identical(.fv_run(io, out, unpark = "pkgF")$n_shard, 1L)
 })
+
+# ---------------------------------------------------------------------------
+# What a run says about its verdicts
+# ---------------------------------------------------------------------------
+
+test_that("the progress lines count parked verdicts by class and failures by stage", {
+  con <- .fv_parked_con()
+  st <- .verdict_state(con, "0.5.0", 600L,
+                       .fv_universe(c("pkgAnalyze", "pkgFetch", "pkgLegacy", "pkgTimeout")))
+  expect_identical(.parked_counts(st), list(fetch = 1L, analyze = 1L, timeout = 1L, legacy = 1L))
+  expect_identical(.stage_counts(c("timeout", "clone", "timeout")), list(clone = 1L, timeout = 2L))
+  expect_identical(.stage_counts(character(0L)), stats::setNames(list(), character(0L)))
+  expect_identical(.verdict_plan_line("0.5.0", 2L, st, 3L), paste0(
+    "analyzer 0.5.0; verdicts released: 2; parked: fetch 1, analyze 1, timeout 1, ",
+    "legacy 1; skipped as tried this run: 3; fetch rechecks due: 0\n"))
+  expect_identical(.verdict_plan_line(NA_character_, 0L, st[0L, ], 0L), paste0(
+    "analyzer none; verdicts released: 0; parked: fetch 0, analyze 0, timeout 0, ",
+    "legacy 0; skipped as tried this run: 0; fetch rechecks due: 0\n"))
+  expect_identical(.verdict_receipt_line(c("clone", "timeout", "timeout"), "mzR", 4L), paste0(
+    "shard verdicts: 3 failed (clone 1, timeout 2); passed over the cap: 1 (mzR); ",
+    "standing over-cap list: 4\n"))
+  expect_identical(.verdict_receipt_line(character(0L), character(0L), 0L),
+    "shard verdicts: 0 failed; passed over the cap: 0; standing over-cap list: 0\n")
+})
+
+test_that("the manifest and run status carry the verdict counts, and the data manifest does not", {
+  out <- withr::local_tempdir()
+  .local_global("WORKER_TIMEOUT", 1L)
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
+  .local_global("analyze_package", function(dest, pkg) {
+    if (identical(pkg, "pkgBad")) stop("broke")
+    if (identical(pkg, "pkgBig")) tryCatch(.busy(1.5), error = function(e) NULL)
+    .fv_result(pkg)
+  })
+  io <- .fv_io(c("pkgBad", "pkgBig", "pkgGone", "pkgOk"), fail_clones = c(pkgGone = 128L))
+  logged <- capture.output(.fv_run(io, out))
+
+  expect_true(any(logged == paste0(
+    "analyzer none; verdicts released: 0; parked: fetch 0, analyze 0, timeout 0, ",
+    "legacy 0; skipped as tried this run: 0; fetch rechecks due: 0")))
+  expect_true(any(logged == paste0(
+    "shard verdicts: 2 failed (clone 1, analyze 1); passed over the cap: 1 (pkgBig); ",
+    "standing over-cap list: 1")))
+
+  cm <- jsonlite::read_json(file.path(out, "code-manifest.json"))$bootstrap
+  # jsonlite writes a key added twice as key.1, so each key is added once.
+  expect_false(any(grepl("\\.[0-9]+$", names(cm))))
+  expect_identical(cm$parked, list(fetch = 0L, analyze = 0L, timeout = 0L, legacy = 0L))
+  expect_identical(cm$failed_this_run, 2L)
+  expect_identical(cm$over_cap_ok, list(count = 1L, packages = list("pkgBig")))
+  expect_identical(cm$over_cap_this_run, 1L)
+  expect_null(jsonlite::read_json(file.path(out, "data-manifest.json"))$bootstrap$parked)
+
+  rs <- jsonlite::read_json(file.path(out, "run-status.json"))
+  expect_false(any(grepl("\\.[0-9]+$", names(rs))))
+  expect_identical(rs$failed_by_stage, list(clone = 1L, analyze = 1L))
+  expect_identical(rs[c("failed_this_run", "over_cap_this_run", "n_released",
+                        "n_tried_skipped", "n_recheck_due")],
+                   list(failed_this_run = 2L, over_cap_this_run = 1L, n_released = 0L,
+                        n_tried_skipped = 0L, n_recheck_due = 0L))
+  expect_identical(rs$parked, cm$parked)
+  expect_identical(rs$over_cap_ok, cm$over_cap_ok)
+  expect_identical(rs$latest_by_build, list(none = 2L))
+})

@@ -1729,6 +1729,14 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
     )
   )
 
+  # The code series also carries the failure verdicts: parked by class, the
+  # packages failed this run, and the over-cap list.
+  if (identical(series, "code")) {
+    extra <- bootstrap[intersect(c("parked", "failed_this_run", "over_cap_ok",
+                                   "over_cap_this_run"), names(bootstrap))]
+    out$bootstrap <- c(out$bootstrap, Filter(Negate(is.null), extra))
+  }
+
   # The names are capped and the count is not. A reader chasing this wants the
   # number first, and enough names to start looking; the full list is a query
   # against the database the manifest describes.

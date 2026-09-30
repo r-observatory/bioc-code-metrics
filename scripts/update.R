@@ -331,6 +331,67 @@
   pkgs
 }
 
+# Parked verdicts by class, and the rows from before stages were kept.
+.parked_counts <- function(st) {
+  list(fetch   = sum(st$class %in% "fetch"),
+       analyze = sum(st$class %in% "analyze"),
+       timeout = sum(st$class %in% "timeout"),
+       legacy  = sum(is.na(st$stage)))
+}
+
+# Failures by stage, in the order a package meets the stages; absent ones left out.
+.stage_counts <- function(stages) {
+  order <- c("clone", "extract", "git_timeout", "analyze", "timeout", "crash")
+  n <- vapply(order, function(x) sum(stages == x), integer(1L))
+  as.list(n[n > 0L])
+}
+
+# The standing over-cap list for a manifest: its size and the first 20 names.
+.over_cap_block <- function(con) {
+  p <- .over_cap_packages(con)
+  list(count = length(p), packages = I(utils::head(p, 20L)))
+}
+
+# How many latest rows each analyzer build wrote; "none" for the R fallback.
+.latest_by_build <- function(con) {
+  empty <- stats::setNames(list(), character(0L))
+  if (!"bioc_code_summary" %in% DBI::dbListTables(con)) return(empty)
+  fields <- DBI::dbListFields(con, "bioc_code_summary")
+  if (!"latest_release_date" %in% fields) return(empty)
+  build <- if ("analyzer_version" %in% fields) {
+    "IFNULL(NULLIF(analyzer_version, ''), 'none')"
+  } else {
+    "'none'"
+  }
+  df <- DBI::dbGetQuery(con, sprintf(
+    "SELECT %s AS build, COUNT(DISTINCT package) AS n FROM bioc_code_summary
+      WHERE latest_release_date IS NOT NULL GROUP BY 1 ORDER BY 1", build))
+  stats::setNames(as.list(as.integer(df$n)), df$build)
+}
+
+# The shard plan's verdict line.
+.verdict_plan_line <- function(build, n_released, st, n_tried) {
+  p <- .parked_counts(st)
+  b <- .build_key(build)
+  sprintf(paste0("analyzer %s; verdicts released: %d; parked: fetch %d, analyze %d, ",
+                 "timeout %d, legacy %d; skipped as tried this run: %d; ",
+                 "fetch rechecks due: %d\n"),
+          if (nzchar(b)) b else "none", as.integer(n_released), p$fetch, p$analyze,
+          p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
+}
+
+# The shard receipt's verdict line.
+.verdict_receipt_line <- function(stages, over_cap, n_standing) {
+  by <- .stage_counts(stages)
+  sprintf("shard verdicts: %d failed%s; passed over the cap: %d%s; standing over-cap list: %d\n",
+          length(stages),
+          if (length(by)) sprintf(" (%s)", paste(names(by), unlist(by), collapse = ", ")) else "",
+          length(over_cap),
+          if (length(over_cap)) sprintf(" (%s)", paste(utils::head(over_cap, 20L),
+                                                        collapse = ", ")) else "",
+          as.integer(n_standing))
+}
+
 # Delete a package's failure record (reset after a successful analysis).
 .reset_failure <- function(con, pkg) {
   DBI::dbExecute(con,
@@ -1095,6 +1156,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail,
     length(todo_pkgs) - length(shard_pkgs), ANALYSIS_CORES, WORKER_TIMEOUT),
     file = stdout())
+  cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
+      file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -1281,9 +1344,18 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   }
   new_fp <- db_fingerprint(con)
 
-  # Re-query permanent failures after this run (some may have just hit the limit).
-  n_permanent_failures <- length(.permanent_failures(con, analyzer_version,
-                                                     WORKER_TIMEOUT, universe))
+  # Re-read the verdicts after this shard (some may have just parked).
+  verdicts_after       <- .verdict_state(con, analyzer_version, WORKER_TIMEOUT, universe)
+  n_permanent_failures <- sum(verdicts_after$parked)
+  verdict_counts <- list(
+    parked            = .parked_counts(verdicts_after),
+    failed_this_run   = if (is.na(run_id)) length(shard_failures)
+                        else length(.tried_this_run(con, run_id)),
+    over_cap_ok       = .over_cap_block(con),
+    over_cap_this_run = if (is.na(run_id)) length(shard_over_cap)
+                        else as.integer(DBI::dbGetQuery(con,
+                          "SELECT COUNT(*) n FROM bioc_over_cap WHERE last_run_id = ?",
+                          params = list(run_id))$n))
 
   prev_manifest <- tryCatch({
     prev_path <- file.path(out_dir, "prev-code-manifest.json")
@@ -1336,6 +1408,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     n_analyzed_pkgs, n_universe, length(remaining_after),
     tolower(as.character(bootstrap_complete))),
     file = stdout())
+  cat(.verdict_receipt_line(shard_stages, shard_over_cap,
+                            verdict_counts$over_cap_ok$count), file = stdout())
   flush(stdout())
 
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
@@ -1348,7 +1422,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unmeasured = .n_datasets_unmeasured(data_con),
                     analyzer_version = analyzer_version,
                     output_class = I(output_class),
-                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]])
+                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
+                    parked = verdict_counts$parked,
+                    failed_this_run = verdict_counts$failed_this_run,
+                    over_cap_ok = verdict_counts$over_cap_ok,
+                    over_cap_this_run = verdict_counts$over_cap_this_run)
 
   # When this run moved nothing, the moment the data last moved is whatever the
   # previous manifest recorded. Carrying it forward is what lets last_checked
@@ -1414,7 +1492,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       shard_failures = length(shard_failures),
                       analyzer_version = bootstrap$analyzer_version,
                       output_class = bootstrap$output_class,
-                      n_latest_on_build = bootstrap$n_latest_on_build))
+                      n_latest_on_build = bootstrap$n_latest_on_build,
+                      failed_by_stage = .stage_counts(shard_stages),
+                      parked = verdict_counts$parked,
+                      failed_this_run = verdict_counts$failed_this_run,
+                      over_cap_ok = verdict_counts$over_cap_ok,
+                      over_cap_this_run = verdict_counts$over_cap_this_run,
+                      n_released = n_released,
+                      n_tried_skipped = length(tried_pkgs),
+                      n_recheck_due = length(recheck_pkgs),
+                      latest_by_build = .latest_by_build(con)))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)
