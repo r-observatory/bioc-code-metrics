@@ -1198,13 +1198,39 @@ open_or_init_data_db <- function(path) {
   con
 }
 
+# The columns a failure verdict adds to bioc_metrics_failures, with their types.
+.FAILURE_VERDICT_COLUMNS <- c(
+  stage            = "TEXT",
+  analyzer_version = "TEXT",
+  worker_timeout   = "INTEGER",
+  fetch_failures   = "INTEGER NOT NULL DEFAULT 0",
+  fetch_version    = "TEXT",
+  analyze_failures = "INTEGER NOT NULL DEFAULT 0",
+  timeout_failures = "INTEGER NOT NULL DEFAULT 0",
+  last_run_id      = "TEXT",
+  elapsed_s        = "REAL",
+  reason           = "TEXT",
+  unparked_at      = "TEXT")
+
+# Give a failures table from an older release the verdict columns. Its rows
+# keep stage NULL, which is how the parking query knows to leave them free.
+.migrate_failure_columns <- function(con) {
+  have <- DBI::dbListFields(con, "bioc_metrics_failures")
+  for (col in setdiff(names(.FAILURE_VERDICT_COLUMNS), have)) {
+    DBI::dbExecute(con, sprintf("ALTER TABLE bioc_metrics_failures ADD COLUMN %s %s",
+                                col, .FAILURE_VERDICT_COLUMNS[[col]]))
+  }
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The four non-summary tables
+#' If the file does not yet exist it is created. The five non-summary tables
 #' (bioc_code_churn, bioc_api_history, bioc_metrics_failures,
-#' bioc_analyzer_read_attempts) are created with fixed schemas and indexes on
-#' first open, so a database downloaded from an older release gains the ones it
-#' does not have yet. bioc_code_summary is created lazily by upsert_shard the
+#' bioc_analyzer_read_attempts, bioc_over_cap) are created with fixed schemas
+#' and indexes on first open, so a database downloaded from an older release
+#' gains the ones it does not have yet, and its failures table gains the
+#' verdict columns. bioc_code_summary is created lazily by upsert_shard the
 #' first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
@@ -1237,11 +1263,28 @@ open_or_init_db <- function(path) {
   }
 
   if (!"bioc_metrics_failures" %in% tables) {
-    DBI::dbExecute(con, "
+    DBI::dbExecute(con, sprintf("
       CREATE TABLE bioc_metrics_failures (
         package              TEXT PRIMARY KEY,
         consecutive_failures INTEGER NOT NULL DEFAULT 0,
-        last_attempt         TEXT
+        last_attempt         TEXT,
+        %s
+      )", paste(names(.FAILURE_VERDICT_COLUMNS), .FAILURE_VERDICT_COLUMNS,
+                collapse = ",\n        ")))
+  } else {
+    .migrate_failure_columns(con)
+  }
+
+  # Packages whose last passing analysis ran past WORKER_TIMEOUT: the cap fired
+  # somewhere and the rest ran uncapped, so they wait for a cap that holds.
+  if (!"bioc_over_cap" %in% tables) {
+    DBI::dbExecute(con, "
+      CREATE TABLE bioc_over_cap (
+        package          TEXT PRIMARY KEY,
+        elapsed_s        REAL,
+        analyzer_version TEXT,
+        last_run_id      TEXT,
+        recorded_at      TEXT
       )")
   }
 
