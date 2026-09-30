@@ -79,6 +79,15 @@ Each worker gives rpkg-analyzer a directory of its own for the package it analys
 
 Each shard's log carries an `analyzer:` line (versions analysed, seconds, compiled files and the share taken from the cache, cache errors, verify mismatches, incomplete parses) and a `worker time:` line (clone, extract, analyzer, record parse, metrics, other). `run-status.json` keeps the same figures under `analyzer_stats` and `worker_phases`; the published manifests do not carry them.
 
+## Retention
+
+No dated release or asset is deleted. The update's prune step is set to keep
+all releases, and only a run replacing its own same-day release, drafts, and
+`swap-prev-`/`swap-next-` staging assets are cleaned up. Per-function and
+per-file detail is kept only for the latest version, so an older version's
+detail lives only in the dated release where it was latest. Keeping all
+releases stays until a retention rule for these metrics is approved on its own.
+
 ## Feedback
 
 Found a bug, a wrong number, or a missing package? Report it at [r-observatory/feedback](https://github.com/r-observatory/feedback/issues/new/choose). All feedback about R Observatory, the site, the data, and the pipelines, is tracked in one place.

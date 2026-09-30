@@ -11,11 +11,21 @@ releases_to_prune <- function(tags, keep = 30L) {
   candidates[!grepl("-01$", candidates)]
 }
 
+#' @param x The KEEP setting: a count, or "all" to keep every release.
+#' @return An integer count, or Inf for "all".
+parse_keep <- function(x) {
+  x <- tolower(trimws(x))
+  if (identical(x, "all")) return(Inf)
+  n <- suppressWarnings(as.integer(x))
+  if (is.na(n)) stop("KEEP must be a number or \"all\", got: ", x, call. = FALSE)
+  n
+}
+
 if (identical(sys.nframe(), 0L)) {
   # Reads tags on stdin (one per line), prints tags to delete.
   con <- file("stdin"); on.exit(close(con))
   tags <- readLines(con, warn = FALSE)
   tags <- tags[nzchar(tags)]
-  keep <- as.integer(Sys.getenv("KEEP", "30"))
+  keep <- parse_keep(Sys.getenv("KEEP", "30"))
   cat(releases_to_prune(tags, keep = keep), sep = "\n")
 }
