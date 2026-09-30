@@ -654,6 +654,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
   perm_fail_pkgs <- .permanent_failures(con)
 
+  # Which builds count as this one, and how many latest rows they wrote.
+  output_class <- .analyzer_output_class(analyzer_version)
+  on_class     <- .n_latest_on_class(con, analyzer_version)
+  message(sprintf("analyzer %s, output class %s; latest rows on class: %d of %d",
+                  analyzer_version %||% "none",
+                  if (length(output_class)) paste(output_class, collapse = " ") else "none",
+                  on_class[["on_class"]], on_class[["latest"]]))
+
   # ---- 5. To-do: packages that need analysis --------------------------------
   if (isTRUE(force_full)) {
     todo_pkgs <- sort(as.character(
@@ -681,17 +689,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # those puts them back in the queue below, which drains a shard at a time and
     # settles once every row carries the running build's version.
     n_stale <- .invalidate_stale_dataset_scans(con, analyzer_version)
-    if (n_stale > 0L) {
-      message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
-    }
+    message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
     # The same change gives back the packages the previous build could not read.
     # Their rows carry no marker to invalidate, so this is the only thing that
     # puts them in front of a new reader. Before the queues are read, so this
     # run is the one that asks again.
     n_retry <- .forget_other_builds_read_attempts(con, analyzer_version)
-    if (n_retry > 0L) {
-      message(sprintf("packages to re-read under this analyzer: %d", n_retry))
-    }
+    message(sprintf("packages to re-read under this analyzer: %d", n_retry))
     # The packages this build has already been given MAX_ANALYZER_READ_ATTEMPTS
     # times and did not read. Both backfill queues below wait on fields only the
     # binary produces, so both would hand these back every run for good. They
@@ -967,7 +971,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unreadable = .n_datasets_unreadable(con),
                     # From the dataset database rather than this one: it is a
                     # count of catalog entries, not of packages.
-                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
+                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con),
+                    analyzer_version = analyzer_version,
+                    output_class = I(output_class),
+                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]])
 
   # When this run moved nothing, the moment the data last moved is whatever the
   # previous manifest recorded. Carrying it forward is what lets last_checked
@@ -1030,7 +1037,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_remaining = length(remaining_after), n_fresh = length(fresh_pkgs),
                       n_shard = length(shard_pkgs),
                       n_versions = nrow(fresh_summary),
-                      shard_failures = length(shard_failures)))
+                      shard_failures = length(shard_failures),
+                      analyzer_version = bootstrap$analyzer_version,
+                      output_class = bootstrap$output_class,
+                      n_latest_on_build = bootstrap$n_latest_on_build))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)

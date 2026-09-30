@@ -1553,9 +1553,10 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #' @param stat_table  Table to probe for stat_cols.
 #' @param stat_cols   Character vector of numeric columns to summarise.
 #' @param bootstrap   list(n_analyzed, n_universe, n_remaining,
-#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable).
-#'   n_universe/n_remaining and the two dataset counts may be NULL, in which
-#'   case they are left out.
+#'   bootstrap_complete, n_datasets_unscanned, n_datasets_unreadable,
+#'   n_datasets_unmeasured, analyzer_version, output_class, n_latest_on_build).
+#'   n_universe/n_remaining, the dataset counts and the three analyzer fields
+#'   may be NULL, in which case they are left out.
 #' @return A named list matching the MANIFEST SCHEMA.
 #' @param last_changed ISO-8601 timestamp of the last run that actually moved the
 #'   data, or NULL when this run did. Kept separate from the generation time
@@ -1676,7 +1677,12 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
       # beside it in this same file is its denominator. It is here rather than
       # only in a line the shard prints because that line scrolls away with the
       # run, and a shard where this number jumps is the one worth seeing.
-      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured
+      n_datasets_unmeasured = bootstrap$n_datasets_unmeasured,
+      # The build that ran, the builds counted as it, and how many latest rows
+      # they wrote: a rescan's progress.
+      analyzer_version  = bootstrap$analyzer_version,
+      output_class      = bootstrap$output_class,
+      n_latest_on_build = bootstrap$n_latest_on_build
     )
   )
 
