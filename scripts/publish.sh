@@ -959,8 +959,8 @@ sweep_swap_leftovers() {
   done <<< "$rows"
 }
 
-# Whether the shard loop is done, read from run-status.json. A failed package waits for
-# the next run, so a drained queue ends this run's work; an unreadable file stops it too.
+# Whether the shard loop is done: bootstrap complete, nothing changed, queue
+# drained (a failed package waits for the next run), or status unreadable.
 shard_loop_done() {  # $1=run-status.json
   local vals complete changed remaining shard
   if ! vals=$(jq -r '[.bootstrap_complete, .changed, .n_remaining, .n_shard]
@@ -977,7 +977,7 @@ shard_loop_done() {  # $1=run-status.json
   return 0
 }
 
-# The run's summary for $GITHUB_STEP_SUMMARY, from the last shard's run-status.json.
+# The run's summary for $GITHUB_STEP_SUMMARY, from the last shard's status.
 # The ETA is packages done since the queue held $3, over $2 seconds.
 write_step_summary() {  # $1=run-status.json $2=seconds so far $3=packages queued at the start
   jq -r --argjson secs "${2:-0}" --argjson start "${3:-0}" '
