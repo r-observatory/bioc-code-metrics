@@ -23,7 +23,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # system_requirements_count
   # -------------------------------------------------------------------------
-  system_requirements_count <- tryCatch({
+  system_requirements_count <- .retry_after_time_limit({
     sr <- ctx$desc[["SystemRequirements"]]
     if (is.null(sr) || !nzchar(trimws(sr %||% ""))) {
       NA_integer_
@@ -44,7 +44,7 @@ metrics_portability <- function(ctx) {
   cxx_standard_required <- NA_character_
   found_flags           <- character(0L)
 
-  tryCatch({
+  .retry_after_time_limit({
     for (mf in makevars_files) {
       lns <- ctx$lines(mf)
       for (ln in lns) {
@@ -87,7 +87,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # min_r_version
   # -------------------------------------------------------------------------
-  min_r_version <- tryCatch({
+  min_r_version <- .retry_after_time_limit({
     dep <- ctx$desc[["Depends"]]
     if (is.null(dep) || !nzchar(trimws(dep %||% ""))) {
       NA_character_
@@ -115,7 +115,7 @@ metrics_portability <- function(ctx) {
   # -------------------------------------------------------------------------
   # vignette_dynamic
   # -------------------------------------------------------------------------
-  vignette_dynamic <- tryCatch({
+  vignette_dynamic <- .retry_after_time_limit({
     if (!has_vignettes) {
       NA
     } else {

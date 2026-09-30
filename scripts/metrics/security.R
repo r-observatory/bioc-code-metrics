@@ -17,7 +17,7 @@ metrics_security <- function(ctx) {
   # Helper: count regex matches in a single string; returns 0L on no match or error.
   n_matches <- function(pattern, text, perl = TRUE) {
     if (!nzchar(text %||% "")) return(0L)
-    m <- tryCatch(
+    m <- .retry_after_time_limit(
       gregexpr(pattern, text, perl = perl)[[1L]],
       error = function(e) -1L
     )
@@ -30,7 +30,7 @@ metrics_security <- function(ctx) {
   #    Weights: eval(parse(text=))=3, system(paste())/system2+paste=2,
   #             Sys.setenv with non-literal=2, network in .onLoad/.onAttach=2.
   # ---------------------------------------------------------------------------
-  unsafe_pattern_score <- tryCatch({
+  unsafe_pattern_score <- .retry_after_time_limit({
     r_files <- ctx$find("^R/.*\\.R$")
     score <- 0L
     for (f in r_files) {
@@ -77,7 +77,7 @@ metrics_security <- function(ctx) {
   #    JSON summary: which configure/cleanup scripts exist + their total LOC,
   #    and whether .onLoad/.onAttach perform file writes or network I/O.
   # ---------------------------------------------------------------------------
-  install_time_side_effect_surface <- tryCatch({
+  install_time_side_effect_surface <- .retry_after_time_limit({
     cfg_names   <- c("configure", "configure.win", "cleanup", "cleanup.win")
     cfg_present <- cfg_names[vapply(cfg_names, ctx$exists, logical(1L))]
     cfg_loc     <- sum(vapply(
@@ -121,7 +121,7 @@ metrics_security <- function(ctx) {
   #    Fraction of Imports+Depends entries (excluding R itself) that carry
   #    an explicit >= version bound.  NA when there are no qualifying entries.
   # ---------------------------------------------------------------------------
-  dep_constraint_coverage <- tryCatch({
+  dep_constraint_coverage <- .retry_after_time_limit({
     parse_dep_entries <- function(raw) {
       if (is.null(raw) || !nzchar(trimws(raw))) return(character(0L))
       entries <- strsplit(raw, ",", fixed = TRUE)[[1L]]
@@ -151,7 +151,7 @@ metrics_security <- function(ctx) {
   #    JSON {count, schemes}: count of Remotes entries and the scheme of each
   #    (github/gitlab/bitbucket/git/url/local/...; bare "user/repo" = "github").
   # ---------------------------------------------------------------------------
-  non_registry_remotes <- tryCatch({
+  non_registry_remotes <- .retry_after_time_limit({
     raw <- ctx$desc$Remotes %||% ""
     if (!nzchar(trimws(raw))) {
       as.character(jsonlite::toJSON(
@@ -187,7 +187,7 @@ metrics_security <- function(ctx) {
   #    Binary and non-text files are excluded.  Regex scanners are conservative
   #    (favour precision): these are signals, not verdicts.
   # ---------------------------------------------------------------------------
-  secret_pattern_count <- tryCatch({
+  secret_pattern_count <- .retry_after_time_limit({
     nonbinary_pat <- paste0(
       "\\.(rda|rdata|rds|pdf|png|jpg|jpeg|gif|bmp|svg|ico|",
       "woff|woff2|eot|ttf|otf|",
@@ -246,7 +246,7 @@ metrics_security <- function(ctx) {
   #    JSON array of unique external library names referenced via -l flags
   #    in src/Makevars*, configure, configure.ac, or via AC_CHECK_LIB().
   # ---------------------------------------------------------------------------
-  compiled_external_lib_exposure <- tryCatch({
+  compiled_external_lib_exposure <- .retry_after_time_limit({
     src_cfg_files <- c(
       "src/Makevars", "src/Makevars.win", "src/Makevars.in", "src/Makevars.ucrt",
       "configure", "configure.ac", "configure.in"
@@ -288,7 +288,7 @@ metrics_security <- function(ctx) {
   #    JSON {detected, files}: detects known vendored filenames under src/ or inst/,
   #    or LICENSE/COPYING files inside src/ subdirectories (indicating vendored code).
   # ---------------------------------------------------------------------------
-  bundled_third_party_code <- tryCatch({
+  bundled_third_party_code <- .retry_after_time_limit({
     known_vendored <- c(
       "sqlite3.c", "sqlite3.h",
       "json.hpp",

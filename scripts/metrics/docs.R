@@ -299,7 +299,7 @@ metrics_docs <- function(ctx) {
             gregexpr("\\d+\\.\\d+(?:\\.\\d+)*", hd_lines, perl = TRUE)
           ))
           if (length(ver_strs) >= 2L) {
-            vers <- tryCatch(numeric_version(ver_strs), error = function(e) NULL)
+            vers <- .retry_after_time_limit(numeric_version(ver_strs), error = function(e) NULL)
             if (!is.null(vers)) {
               diffs <- vapply(seq_len(length(vers) - 1L),
                               function(i) vers[i] >= vers[i + 1L],
