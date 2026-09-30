@@ -1428,13 +1428,21 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     over_cap_ok = verdict_counts$over_cap_ok,
                     over_cap_this_run = verdict_counts$over_cap_this_run)
 
-  # When this run moved nothing, the moment the data last moved is whatever the
-  # previous manifest recorded. Carrying it forward is what lets last_checked
-  # advance every run without pretending the data is newer than it is. NULL
+  # When this shard moved nothing, the moment the data last moved is whatever an
+  # earlier shard of this run recorded, or else what the previous manifest
+  # recorded. Carrying it forward is what lets last_checked advance every run
+  # without pretending the data is newer than it is. The workflow fetches the
+  # previous manifest once per run, so a later shard reading only that would
+  # date the data before an earlier shard moved it. run-status.json counts only
+  # when it carries this run's id: out/ can hold one left by another run. NULL
   # (no previous manifest, or one predating these fields) means "now", which is
   # correct for a first run and honest for the changeover.
+  this_run <- tryCatch(jsonlite::fromJSON(file.path(out_dir, "run-status.json")),
+                       error = function(e) NULL)
+  same_run <- !is.na(run_id) && identical(this_run[["run_id"]], run_id)
   last_changed <- if (data_moved) NULL else
-    (prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
+    ((if (same_run) this_run[["last_changed"]]) %||%
+       prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 
@@ -1501,7 +1509,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_released = n_released,
                       n_tried_skipped = length(tried_pkgs),
                       n_recheck_due = length(recheck_pkgs),
-                      latest_by_build = .latest_by_build(con)))
+                      latest_by_build = .latest_by_build(con),
+                      run_id = run_id, last_changed = code_manifest$last_changed))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)

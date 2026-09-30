@@ -24,13 +24,13 @@
 
 # One run_update in a scratch work directory, on one core so the worker runs in
 # this process and its lines can be captured.
-.fv_run <- function(io, out, ...) {
+.fv_run <- function(io, out, ..., shard_size = 10L) {
   .local_global("WORK_DIR", withr::local_tempdir())
   .local_global("ANALYSIS_CORES", 1L)
   # Run under no analyzer build whatever CI installs: a real one would re-queue
   # the fake rows as stale scans and stamp its version on each verdict.
   .local_global("rpkg_analyzer_version", function() NA_character_)
-  suppressWarnings(run_update(io, out, shard_size = 10L, ...))
+  suppressWarnings(run_update(io, out, shard_size = shard_size, ...))
 }
 
 # ---------------------------------------------------------------------------
@@ -580,6 +580,48 @@ test_that("a shard whose only news is a verdict or a release keeps last_changed"
   expect_true(released$changed)
   expect_identical(jsonlite::read_json(file.path(out, "run-status.json"))$n_released, 1L)
   expect_identical(last_changed(), rep("2026-01-05T00:00:00Z", 2L))
+})
+
+# The workflow downloads the prior release's manifest once, so every shard of a
+# run reads the same pre-run last_changed. A later shard that moves no data has
+# to keep the time an earlier shard of the same run moved it.
+test_that("a verdict-only shard keeps the last_changed an earlier shard of its run wrote", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .fv_run(.fv_io(c("pkgA", "pkgZ")), out)
+  # Stand in for the workflow, which moves the prior release's manifest aside.
+  prior <- jsonlite::read_json(file.path(out, "code-manifest.json"))
+  prior$last_changed <- "2026-01-05T00:00:00Z"
+  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
+  file.remove(file.path(out, "code-manifest.json"))
+  last_changed <- function() vapply(c("code-manifest.json", "data-manifest.json"),
+    function(f) jsonlite::read_json(file.path(out, f))$last_changed, character(1L),
+    USE.NAMES = FALSE)
+  io <- .fv_io(c("pkgA", "pkgF", "pkgZ"), fail_clones = c(pkgF = 128L))
+
+  withr::with_envvar(c(PIPELINE_RUN_ID = "r1"), {
+    # Shard 1 analyses pkgA again at the version it already has: the data
+    # moves and the fingerprint does not.
+    first <- .fv_run(io, out, requeue = "pkgA", shard_size = 1L)
+    moved <- last_changed()
+    # A shard that stamped its own time would differ from shard 1's by now.
+    Sys.sleep(1.1)
+    # Shard 2 only records pkgF's failure.
+    second <- .fv_run(io, out, shard_size = 1L)
+  })
+  expect_identical(first$n_fresh, 1L)
+  expect_identical(first$fingerprint, prior$fingerprint)
+  expect_false("2026-01-05T00:00:00Z" %in% moved)
+  expect_identical(second$n_fresh, 0L)
+  expect_identical(second$shard_failures$packages, "pkgF")
+  expect_true(second$changed)
+  expect_identical(last_changed(), moved)
+
+  # A later run reads its own prior release, not the last run's status file.
+  prior$last_changed <- "2026-02-01T00:00:00Z"
+  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
+  withr::with_envvar(c(PIPELINE_RUN_ID = "r2"), .fv_run(io, out, shard_size = 1L))
+  expect_identical(last_changed(), rep("2026-02-01T00:00:00Z", 2L))
 })
 
 test_that("a weekly recheck that fails again at the same stage stays parked and publishes nothing", {
