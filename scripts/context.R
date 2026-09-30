@@ -7,10 +7,24 @@
 #' field value. When a field appears more than once, the LAST occurrence wins.
 #' Returns an empty list for blank or unparseable input.
 #'
+#' Text that is not valid UTF-8 is decoded by its Encoding field (latin1 when
+#' it has none, or names one iconv does not know), bytes that do not convert
+#' kept as <xx>. Valid UTF-8 is left as it is.
+#'
 #' @param text  Character string containing DCF content.
 #' @return Named list; values are character strings (trimmed).
 parse_dcf <- function(text) {
-  if (!nzchar(trimws(text %||% ""))) return(list())
+  text <- text %||% ""
+  if (length(text) == 1L && !validUTF8(text)) {
+    enc <- regmatches(text, regexpr("(?m)^Encoding:[ \t]*[A-Za-z0-9._-]+", text,
+                                    perl = TRUE, useBytes = TRUE))
+    enc <- if (length(enc)) trimws(sub("^Encoding:", "", enc, useBytes = TRUE)) else "latin1"
+    dec <- .retry_after_time_limit(
+      iconv(text, from = enc, to = "UTF-8", sub = "byte"),
+      error = function(e) NA_character_)
+    text <- if (is.na(dec)) iconv(text, from = "latin1", to = "UTF-8", sub = "byte") else dec
+  }
+  if (!nzchar(trimws(text))) return(list())
   lines <- strsplit(text, "\n", fixed = TRUE)[[1L]]
   out   <- list()
   cur_key <- NULL
