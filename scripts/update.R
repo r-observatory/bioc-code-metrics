@@ -206,11 +206,66 @@
   invisible(NULL)
 }
 
-# Return packages with consecutive_failures >= MAX_CLONE_FAILURES.
-.permanent_failures <- function(con) {
-  DBI::dbGetQuery(con,
-    "SELECT package FROM bioc_metrics_failures WHERE consecutive_failures >= ?",
-    params = list(MAX_CLONE_FAILURES))$package
+#' Every failure verdict, and whether it parks its package.
+#'
+#' A verdict parks by build when this build failed the package
+#' MAX_CLONE_FAILURES times at analyze, or MAX_TIMEOUT_FAILURES times at a
+#' timeout under this cap. It parks by fetch when the package failed to fetch
+#' MAX_CLONE_FAILURES times at its current latest_version (the Bioconductor
+#' release), unless it has no stored rows and its last attempt is
+#' FETCH_RECHECK_DAYS old. A row from before stages were kept (stage NULL)
+#' parks nothing.
+#'
+#' @param universe data.frame(package, latest_version).
+#' @return data.frame(package, stage, class, parked, recheck_due); class is
+#'   "fetch", "analyze" or "timeout" for a parked package and NA otherwise.
+.verdict_state <- function(con, build, worker_timeout, universe, now = Sys.time()) {
+  tables <- DBI::dbListTables(con)
+  if (!"bioc_metrics_failures" %in% tables) {
+    return(data.frame(package = character(0L), stage = character(0L),
+                      class = character(0L), parked = logical(0L),
+                      recheck_due = logical(0L), stringsAsFactors = FALSE))
+  }
+  has_rows <- if ("bioc_code_summary" %in% tables) {
+    "EXISTS (SELECT 1 FROM bioc_code_summary s WHERE s.package = f.package)"
+  } else {
+    "0"
+  }
+  df <- DBI::dbGetQuery(con, sprintf("
+    SELECT f.package, f.stage, f.fetch_failures, f.fetch_version, f.last_attempt,
+           %s AS has_rows,
+           (IFNULL(f.analyzer_version, '') = :build
+              AND f.analyze_failures >= :max_fail) AS by_analyze,
+           (IFNULL(f.analyzer_version, '') = :build AND f.worker_timeout = :wt
+              AND f.timeout_failures >= :max_timeouts) AS by_timeout
+      FROM bioc_metrics_failures f
+     ORDER BY f.package", has_rows),
+    params = list(build = .build_key(build), wt = as.integer(worker_timeout),
+                  max_fail = MAX_CLONE_FAILURES, max_timeouts = MAX_TIMEOUT_FAILURES))
+  live <- !is.na(df$stage)
+  lv   <- as.character(universe$latest_version)[
+    match(df$package, as.character(universe$package))]
+  same_release <- ifelse(is.na(df$fetch_version), "", df$fetch_version) ==
+    ifelse(is.na(lv), "", lv)
+  age <- as.numeric(difftime(
+    now, as.POSIXct(df$last_attempt, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    units = "days"))
+  fetch_capped <- live & df$fetch_failures >= MAX_CLONE_FAILURES & same_release
+  recheck_due  <- fetch_capped & df$has_rows %in% 0L & !is.na(age) &
+    age >= FETCH_RECHECK_DAYS
+  class <- ifelse(live & df$by_analyze %in% 1L, "analyze",
+           ifelse(live & df$by_timeout %in% 1L, "timeout",
+           ifelse(fetch_capped & !recheck_due, "fetch", NA_character_)))
+  data.frame(package = df$package, stage = df$stage, class = class,
+             parked = !is.na(class), recheck_due = recheck_due,
+             stringsAsFactors = FALSE)
+}
+
+# Packages whose verdict parks them, left out of every queue.
+.permanent_failures <- function(con, build, worker_timeout, universe,
+                                now = Sys.time()) {
+  st <- .verdict_state(con, build, worker_timeout, universe, now)
+  st$package[st$parked]
 }
 
 # ---------------------------------------------------------------------------
@@ -690,9 +745,11 @@ default_io <- function() {
 #' data-manifest.json, run-status.json, and the changed-packages.txt
 #' accumulator.
 #'
-#' Clone and analyze failures are tracked per-package. Packages that have
-#' failed >= MAX_CLONE_FAILURES consecutive times are permanently excluded from
-#' the to-do list and counted in the manifest permanent_failures field.
+#' Clone and analyze failures are tracked per package with their stage. A
+#' package whose verdict parks it (.permanent_failures) is left out of the
+#' to-do list and counted in the manifest permanent_failures field until the
+#' analyzer build, the Bioconductor release or WORKER_TIMEOUT changes, or an
+#' operator releases it.
 #'
 #' @param io         IO interface: list with $package_list() and $clone().
 #'   Use default_io() for production; inject a fake for tests.
@@ -784,7 +841,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   n_universe <- nrow(universe)
 
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
-  perm_fail_pkgs <- .permanent_failures(con)
+  perm_fail_pkgs <- .permanent_failures(con, analyzer_version, WORKER_TIMEOUT, universe)
   run_id <- .current_run_id()
   lv_of  <- stats::setNames(as.character(universe$latest_version),
                             as.character(universe$package))
@@ -1062,7 +1119,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   new_fp <- db_fingerprint(con)
 
   # Re-query permanent failures after this run (some may have just hit the limit).
-  n_permanent_failures <- length(.permanent_failures(con))
+  n_permanent_failures <- length(.permanent_failures(con, analyzer_version,
+                                                     WORKER_TIMEOUT, universe))
 
   prev_manifest <- tryCatch({
     prev_path <- file.path(out_dir, "prev-code-manifest.json")

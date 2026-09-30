@@ -363,3 +363,120 @@ test_that("a fork that dies without a result is stored as a crash with no elapse
 test_that("no test sees a run id it did not set", {
   expect_identical(Sys.getenv("PIPELINE_RUN_ID", "unset"), "unset")
 })
+
+# ---------------------------------------------------------------------------
+# When a verdict parks its package
+# ---------------------------------------------------------------------------
+
+.fv_universe <- function(pkgs, versions = rep("1.0", length(pkgs))) {
+  data.frame(package = pkgs, latest_version = versions, stringsAsFactors = FALSE)
+}
+
+# Move a verdict's last attempt `days` into the past.
+.fv_age <- function(con, pkg, days) {
+  DBI::dbExecute(con, "UPDATE bioc_metrics_failures SET last_attempt = ? WHERE package = ?",
+                 params = list(format(Sys.time() - days * 86400, "%Y-%m-%dT%H:%M:%SZ",
+                                      tz = "UTC"), pkg))
+}
+
+test_that("rows written before stages were kept park nothing", {
+  con <- .fv_con()
+  DBI::dbExecute(con, "INSERT INTO bioc_metrics_failures
+    (package, consecutive_failures, last_attempt) VALUES
+    ('pkgA', 5, '2026-08-01T00:00:00Z'), ('pkgB', 9, '2026-09-28T00:00:00Z')")
+  st <- .verdict_state(con, "0.4.0", 600L, .fv_universe(c("pkgA", "pkgB")))
+  expect_identical(st$package, c("pkgA", "pkgB"))
+  expect_identical(st$parked, c(FALSE, FALSE))
+  expect_true(all(is.na(st$stage)))
+  expect_identical(.permanent_failures(con, "0.4.0", 600L, .fv_universe(c("pkgA", "pkgB"))),
+                   character(0L))
+})
+
+test_that("one build parks a package at five analyze failures or three timeouts", {
+  con <- .fv_con()
+  u <- .fv_universe(c("pkgA", "pkgT"))
+  for (i in seq_len(MAX_CLONE_FAILURES - 1L)) .fv_fail(con, "pkgA", "analyze")
+  for (i in seq_len(MAX_TIMEOUT_FAILURES - 1L)) .fv_fail(con, "pkgT", "timeout")
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), character(0L))
+  .fv_fail(con, "pkgA", "analyze")
+  .fv_fail(con, "pkgT", "crash")
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), c("pkgA", "pkgT"))
+  st <- .verdict_state(con, "0.5.0", 600L, u)
+  expect_identical(st$class, c("analyze", "timeout"))
+  # Another build asks again, and another cap asks again about the timeouts.
+  expect_identical(.permanent_failures(con, "0.5.1", 600L, u), character(0L))
+  expect_identical(.permanent_failures(con, "0.5.0", 900L, u), "pkgA")
+})
+
+test_that("five fetch failures park a package across builds until its release changes", {
+  con <- .fv_con()
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_fail(con, "pkgF", "clone", build = "0.4.0")
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, .fv_universe("pkgF")), "pkgF")
+  expect_identical(.verdict_state(con, "0.5.0", 600L, .fv_universe("pkgF"))$class, "fetch")
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, .fv_universe("pkgF", "1.1")),
+                   character(0L))
+})
+
+test_that("an archived package stays fetch-parked with no latest_version", {
+  con <- .fv_con()
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_fail(con, "pkgF", "clone", lv = NA_character_)
+  expect_identical(.permanent_failures(con, "0.5.0", 600L,
+                                       .fv_universe("pkgF", NA_character_)), "pkgF")
+})
+
+test_that("a fetch-parked package with no stored rows is due a recheck after a week", {
+  con <- .fv_con()
+  DBI::dbExecute(con, "CREATE TABLE bioc_code_summary (package TEXT, version TEXT)")
+  DBI::dbExecute(con, "INSERT INTO bioc_code_summary VALUES ('pkgRows', '1.0')")
+  u <- .fv_universe(c("pkgNone", "pkgRows"))
+  for (p in c("pkgNone", "pkgRows")) {
+    for (i in seq_len(MAX_CLONE_FAILURES)) .fv_fail(con, p, "clone")
+  }
+  .fv_age(con, "pkgNone", FETCH_RECHECK_DAYS - 1L)
+  .fv_age(con, "pkgRows", FETCH_RECHECK_DAYS + 1L)
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), c("pkgNone", "pkgRows"))
+
+  .fv_age(con, "pkgNone", FETCH_RECHECK_DAYS + 1L)
+  st <- .verdict_state(con, "0.5.0", 600L, u)
+  expect_identical(st$recheck_due, c(TRUE, FALSE))
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), "pkgRows")
+})
+
+test_that("a clone failure parks after five runs and is released by the next Bioconductor release", {
+  out <- withr::local_tempdir()
+  io  <- .fv_io("pkgF", "3.23", fail_clones = c(pkgF = 128L))
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_run(io, out)
+  parked <- .fv_run(io, out)
+  expect_identical(parked$n_shard, 0L)
+  expect_identical(parked$permanent_failures, 1L)
+
+  released <- .fv_run(.fv_io("pkgF", "3.24", fail_clones = c(pkgF = 128L)), out)
+  expect_identical(released$n_shard, 1L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  row <- .fv_row(con, "pkgF")
+  expect_identical(row$fetch_failures, 1L)
+  expect_identical(row$fetch_version, "3.24")
+})
+
+test_that("a run without the analyzer parks under no build, and a run with one asks again", {
+  con <- .fv_con()
+  u <- .fv_universe(c("pkgA", "pkgF"))
+  for (i in seq_len(MAX_CLONE_FAILURES)) {
+    .fv_fail(con, "pkgA", "analyze", build = NA_character_)
+    .fv_fail(con, "pkgF", "clone", build = NA_character_)
+  }
+  expect_identical(.permanent_failures(con, NA_character_, 600L, u), c("pkgA", "pkgF"))
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), "pkgF")
+})
+
+test_that("the weekly recheck reads its age in UTC whatever the runner's time zone", {
+  withr::local_timezone("Pacific/Auckland")
+  con <- .fv_con()
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_fail(con, "pkgF", "clone")
+  u <- .fv_universe("pkgF")
+  .fv_age(con, "pkgF", FETCH_RECHECK_DAYS - 0.5)
+  expect_identical(.verdict_state(con, "0.5.0", 600L, u)$recheck_due, FALSE)
+  .fv_age(con, "pkgF", FETCH_RECHECK_DAYS + 0.5)
+  expect_identical(.verdict_state(con, "0.5.0", 600L, u)$recheck_due, TRUE)
+})
