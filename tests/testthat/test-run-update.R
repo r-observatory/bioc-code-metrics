@@ -528,7 +528,7 @@ test_that("a release that cannot be extracted leaves the package's stored rows a
                out_dir, shard_size = 10L)))
 
   expect_identical(m$shard_failures$packages, "pkgA")
-  expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
+  expect_true(any(grepl("FAIL pkgA: extract after", logged, fixed = TRUE)))
   expect_identical(.package_rows(out_dir, "pkgA"), before)
 })
 

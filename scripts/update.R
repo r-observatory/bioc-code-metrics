@@ -45,6 +45,92 @@
   )
 }
 
+# Collapse a message to one line and cut it to a byte budget, on a whole
+# character, so the line a worker prints stays one write.
+.clip_bytes <- function(s, max_bytes) {
+  s <- gsub("[[:space:]]+", " ", trimws(as.character(s)))
+  if (max_bytes <= 0L) return("")
+  if (nchar(s, type = "bytes") <= max_bytes) return(s)
+  chars <- strsplit(s, "")[[1L]]
+  keep  <- cumsum(nchar(chars, type = "bytes")) <= (max_bytes - 3L)
+  paste0(paste(chars[keep], collapse = ""), "...")
+}
+
+#' The one line a worker prints when it finishes a package.
+#'
+#' @param elapsed Seconds the worker took; NA for a fork that returned nothing.
+#' @param reason Why it failed, appended after a colon and clipped so the whole
+#'   line fits in one pipe write. NULL or "" leaves it off.
+#' @return A single string ending in one newline.
+.worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL,
+                         worker_timeout = WORKER_TIMEOUT) {
+  stem <- if (isTRUE(ok)) {
+    sprintf("[%d/%d] ok %s: %d versions in %.1fs%s", idx, n, pkg, nver, elapsed,
+            if (isTRUE(elapsed >= worker_timeout))
+              sprintf(" (past the %ds cap)", as.integer(worker_timeout)) else "")
+  } else if (is.na(elapsed)) {
+    sprintf("[%d/%d] FAIL %s: %s", idx, n, pkg, stage)
+  } else {
+    sprintf("[%d/%d] FAIL %s: %s after %.1fs", idx, n, pkg, stage, elapsed)
+  }
+  if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
+    return(paste0(stem, "\n"))
+  }
+  # Two bytes for the ": " and one for the newline.
+  room <- WORKER_LINE_MAX_BYTES - nchar(stem, type = "bytes") - 3L
+  if (room <= 3L) return(paste0(stem, "\n"))
+  paste0(stem, ": ", .clip_bytes(reason, room), "\n")
+}
+
+# The stage of an error analyze_package raised. An elapsed time at the cap also
+# catches a cap swallowed earlier and a later failure.
+.classify_failure <- function(e, elapsed, worker_timeout = WORKER_TIMEOUT) {
+  if (inherits(e, "extract_failure")) {
+    return(if (isTRUE(e$status == 124L)) "git_timeout" else "extract")
+  }
+  if (inherits(e, "analyzer_parse_incomplete")) return("analyze")
+  if ((inherits(e, "condition") && .is_time_limit(e)) ||
+      isTRUE(elapsed >= worker_timeout)) {
+    return("timeout")
+  }
+  "analyze"
+}
+
+# The stage of a clone that did not succeed: 124 is system2's kill at GIT_TIMEOUT.
+.clone_stage <- function(ok) {
+  if (isTRUE(as.integer(attr(ok, "status")) == 124L)) "git_timeout" else "clone"
+}
+
+# What a clone that did not succeed says: the error it raised, or its exit status.
+.clone_reason <- function(ok) {
+  if (!is.null(attr(ok, "reason"))) return(attr(ok, "reason"))
+  st <- attr(ok, "status")
+  if (is.null(st)) "clone failed" else sprintf("git clone exited %d", as.integer(st))
+}
+
+# One worker result as the parent records it. A fork that returned nothing, or
+# raised outside the worker's handlers, printed no line, so from_parent says
+# the parent prints it; its time-limit message makes it a timeout.
+.classify_result <- function(r) {
+  if (is.null(r)) {
+    return(list(ok = FALSE, stage = "crash", elapsed = NA_real_,
+                reason = "worker returned no result", from_parent = TRUE))
+  }
+  if (inherits(r, "try-error")) {
+    cond <- attr(r, "condition")
+    msg  <- if (inherits(cond, "condition")) conditionMessage(cond) else as.character(r)
+    return(list(ok = FALSE,
+                stage = if (grepl(.time_limit_msg(), msg, fixed = TRUE)) "timeout" else "crash",
+                elapsed = NA_real_, reason = .redact_reason(msg), from_parent = TRUE))
+  }
+  if (isTRUE(r$ok)) {
+    return(list(ok = TRUE, stage = NA_character_, elapsed = r$elapsed %||% NA_real_,
+                reason = "", from_parent = FALSE))
+  }
+  list(ok = FALSE, stage = r$stage %||% "analyze", elapsed = r$elapsed %||% NA_real_,
+       reason = r$reason %||% "", from_parent = FALSE)
+}
+
 # Increment consecutive_failures for a package in bioc_metrics_failures.
 .record_failure <- function(con, pkg) {
   now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
@@ -768,60 +854,65 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
   # Worker: clone + analyze one package. No database access.
-  # Returns list(package, ok, [summary, churn, api]).
+  # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
+  # package failed, list(package, ok = FALSE, stage, elapsed, reason).
   .pkg_worker <- function(pkg) {
     .t0  <- Sys.time()
     .idx <- match(pkg, shard_pkgs)          # queue position; shard_pkgs is unique
     .n   <- length(shard_pkgs)
+    .elapsed <- function() as.numeric(difftime(Sys.time(), .t0, units = "secs"))
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
-    # position, every failure, every slow (>=30s) package, and the last position.
-    # One fully-formed cat() to stdout (< PIPE_BUF): forks reorder whole lines but
-    # never byte-interleave, and fd 1 is disjoint from mclapply's result pipe. The
-    # emit is wrapped in try() so a broken-stream write can never turn an ok
-    # package into a recorded failure.
-    .done <- function(ok, stage, nver) {
-      el <- as.numeric(difftime(Sys.time(), .t0, units = "secs"))
-      if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && !identical(.idx, .n)) {
+    # position, every failure, every slow (>=30s) package, every package past
+    # the cap, and the last position.
+    # One fully-formed cat() to stdout, kept under PIPE_BUF by .worker_line:
+    # forks reorder whole lines but never byte-interleave, and fd 1 is disjoint
+    # from mclapply's result pipe. The emit is wrapped in try() so a
+    # broken-stream write can never turn an ok package into a recorded failure.
+    .done <- function(ok, stage, nver, el, reason = NULL) {
+      if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && el < WORKER_TIMEOUT &&
+          !identical(.idx, .n)) {
         return(invisible())
       }
       try({
-        cat(sprintf("[%d/%d] %s %s: %s in %.1fs\n",
-                    .idx, .n,
-                    if (isTRUE(ok)) "ok" else "FAIL", pkg,
-                    if (isTRUE(ok)) sprintf("%d versions", nver)
-                    else paste0(stage, " failed"),
-                    el),
+        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason),
             file = stdout())
         flush(stdout())
       }, silent = TRUE)
       invisible()
     }
+    # A warning() inside the fork reaches nobody, so the reason rides out on the
+    # line the failure prints and in the result, redacted first, since the
+    # clone URL holds a token.
+    .fail <- function(stage, reason) {
+      el     <- .elapsed()
+      reason <- .redact_reason(reason)
+      .done(FALSE, stage, 0L, el, reason)
+      list(package = pkg, ok = FALSE, stage = stage, elapsed = el, reason = reason)
+    }
     dest <- file.path(WORK_DIR, pkg)
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     on.exit(setTimeLimit(), add = TRUE)
     setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
-    ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
-    if (!isTRUE(ok)) {
-      .done(FALSE, "clone", 0L)
-      return(list(package = pkg, ok = FALSE))
-    }
-    stage <- "analyze"
+    ok <- tryCatch(io$clone(pkg, dest),
+                   error = function(e) structure(FALSE, reason = conditionMessage(e)))
+    if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
+    err <- NULL
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
-        if (inherits(e, "extract_failure")) stage <<- "extract"
-        warning(sprintf("analyze_package failed for '%s': %s",
-                        pkg, conditionMessage(e)))
+        err <<- e
         NULL
       }
     )
     if (is.null(res)) {
-      .done(FALSE, stage, 0L)
-      return(list(package = pkg, ok = FALSE))
+      return(.fail(.classify_failure(err, .elapsed()),
+                   if (is.null(err)) "analyze_package returned nothing"
+                   else conditionMessage(err)))
     }
-    .done(TRUE, "ok", nrow(res$summary))
-    list(package = pkg, ok = TRUE,
+    el <- .elapsed()
+    .done(TRUE, "ok", nrow(res$summary), el)
+    list(package = pkg, ok = TRUE, elapsed = el,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
          text = res$text, binary_versions = res$binary_versions)
@@ -836,8 +927,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   for (i in seq_along(results)) {
     r   <- results[[i]]
     pkg <- shard_pkgs[[i]]
-    # Guard: mclapply may return a try-error on worker crash.
-    if (inherits(r, "try-error") || is.null(r[["ok"]]) || !isTRUE(r$ok)) {
+    # mclapply returns NULL for a fork that died and a try-error for one that
+    # raised outside the worker's handlers; neither printed its line.
+    v <- .classify_result(r)
+    if (!isTRUE(v$ok)) {
+      if (isTRUE(v$from_parent)) {
+        cat(.worker_line(i, length(shard_pkgs), FALSE, pkg, v$stage, 0L,
+                         v$elapsed, v$reason), file = stdout())
+        flush(stdout())
+      }
       shard_failures <- c(shard_failures, pkg)
       .record_failure(con, pkg)
     } else {

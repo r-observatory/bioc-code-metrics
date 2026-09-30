@@ -73,6 +73,11 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
 
+# The most one worker's progress line may be, in bytes. The forks share fd 1,
+# and a write within PIPE_BUF (at least 512 bytes by POSIX) arrives whole, so
+# a line that now carries a failure's reason cannot be split by another fork's.
+WORKER_LINE_MAX_BYTES <- 512L
+
 # The largest column profile a single dataset row may carry, in bytes.
 #
 # Nothing bounded this. The profile is a JSON array with one entry per column,
