@@ -480,3 +480,62 @@ test_that("the weekly recheck reads its age in UTC whatever the runner's time zo
   .fv_age(con, "pkgF", FETCH_RECHECK_DAYS + 0.5)
   expect_identical(.verdict_state(con, "0.5.0", 600L, u)$recheck_due, TRUE)
 })
+
+# ---------------------------------------------------------------------------
+# One failed attempt per run
+# ---------------------------------------------------------------------------
+
+test_that("the packages tried this run are the ones whose verdict names it", {
+  con <- .fv_con()
+  .fv_fail(con, "pkgA", "clone", run_id = "r1")
+  .fv_fail(con, "pkgB", "analyze", run_id = "r0")
+  expect_identical(.tried_this_run(con, "r1"), "pkgA")
+  expect_identical(.tried_this_run(con, NA_character_), character(0L))
+})
+
+test_that("a package that failed is attempted once per run", {
+  out <- withr::local_tempdir()
+  io  <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  attempts <- function() {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+    on.exit(DBI::dbDisconnect(con))
+    .fv_row(con, "pkgF")$consecutive_failures
+  }
+
+  withr::with_envvar(c(PIPELINE_RUN_ID = "r1"), {
+    .fv_run(io, out)
+    second <- .fv_run(io, out)
+  })
+  expect_identical(attempts(), 1L)
+  expect_identical(second$n_shard, 0L)
+
+  withr::with_envvar(c(PIPELINE_RUN_ID = "r2"), .fv_run(io, out))
+  expect_identical(attempts(), 2L)
+})
+
+test_that("GITHUB_RUN_ID alone does not make a run, so every call attempts again", {
+  out <- withr::local_tempdir()
+  io  <- .fv_io("pkgF", fail_clones = c(pkgF = 128L))
+  withr::local_envvar(c(GITHUB_RUN_ID = "g1", PIPELINE_RUN_ID = NA))
+  .fv_run(io, out)
+  .fv_run(io, out)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.fv_row(con, "pkgF")$consecutive_failures, 2L)
+})
+
+test_that("a package tried this run is left out of every queue, a backfill included", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) {
+    r <- .fv_result(pkg)
+    r$summary$datasets_scanned <- NA_integer_
+    r
+  })
+  .fv_run(.fv_io("pkgB"), out)
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
+  .local_global("analyze_package", function(dest, pkg) stop("broke"))
+  first  <- .fv_run(.fv_io("pkgB"), out)
+  second <- .fv_run(.fv_io("pkgB"), out)
+  expect_identical(c(first$n_shard, second$n_shard), c(1L, 0L))
+})

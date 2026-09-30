@@ -139,6 +139,17 @@
   if (nzchar(v)) v else NA_character_
 }
 
+# Packages that already failed in this run. Nothing outside a run, so tests and
+# local runs keep today's one attempt per shard.
+.tried_this_run <- function(con, run_id) {
+  if (is.na(run_id) || !"bioc_metrics_failures" %in% DBI::dbListTables(con)) {
+    return(character(0L))
+  }
+  as.character(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_metrics_failures WHERE last_run_id = ?",
+    params = list(run_id))$package)
+}
+
 # The build a verdict names: "" when no binary ran.
 .build_key <- function(build) {
   if (is.null(build) || length(build) != 1L || is.na(build)) "" else as.character(build)
@@ -845,6 +856,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   run_id <- .current_run_id()
   lv_of  <- stats::setNames(as.character(universe$latest_version),
                             as.character(universe$package))
+  # A package that failed earlier in this run waits for the next one, at every
+  # stage, so a failing package costs one attempt and one publish per run.
+  tried_pkgs <- setdiff(.tried_this_run(con, run_id), perm_fail_pkgs)
+  skip_pkgs  <- c(perm_fail_pkgs, tried_pkgs)
 
   # Which builds count as this one, and how many latest rows they wrote.
   output_class <- .analyzer_output_class(analyzer_version)
@@ -857,16 +872,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # ---- 5. To-do: packages that need analysis --------------------------------
   if (isTRUE(force_full)) {
     todo_pkgs <- sort(as.character(
-      universe$package[!universe$package %in% perm_fail_pkgs]
+      universe$package[!universe$package %in% skip_pkgs]
     ))
   } else if (isTRUE(recollect)) {
     # Backfill: only packages whose rows predate the binary metrics. No wipe;
     # upsert_shard replaces each package's rows in place.
-    todo_pkgs <- .recollect_todo(con, universe$package, perm_fail_pkgs)
+    todo_pkgs <- .recollect_todo(con, universe$package, skip_pkgs)
   } else {
     is_todo <- vapply(seq_len(n_universe), function(i) {
       pkg <- as.character(universe$package[i])
-      if (pkg %in% perm_fail_pkgs) return(FALSE)  # permanently excluded
+      if (pkg %in% skip_pkgs) return(FALSE)  # parked, or failed this run
       lv  <- universe$latest_version[i]
       if (!pkg %in% names(analyzed)) return(TRUE)   # never analyzed
       stored_v <- analyzed[[pkg]]
@@ -901,21 +916,21 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # scheduled run finishes the one-time backfill and then reverts to just the
     # changed packages once none remain.
     backfill <- .recollect_todo(con, universe$package,
-                                c(perm_fail_pkgs, unread_pkgs))
+                                c(skip_pkgs, unread_pkgs))
     # And drain any package with a version row that predates all-versions detail
     # (detail_scanned IS NULL on ANY row). Re-analyzing fills per-version detail
     # and marks every row, so it converges; a package re-analyzed once is never
     # re-flagged, even if some versions produced zero functions. Not filtered by
     # the read attempts: this marker is written by the run itself under either
     # producer, so the queue drains without the analyzer.
-    detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+    detail_backfill <- .recollect_todo(con, universe$package, skip_pkgs,
                                         sentinel = "detail_scanned",
                                         latest_only = FALSE)
     # And drain any package whose latest-version row predates the dataset reader
     # (datasets_scanned IS NULL), so bioc_datasets fills in without a manual
     # recollect. Also latest-row-scoped, so it converges once re-analyzed.
     dataset_backfill <- .recollect_todo(
-      con, universe$package, c(perm_fail_pkgs, unread_pkgs),
+      con, universe$package, c(skip_pkgs, unread_pkgs),
       sentinel = "datasets_scanned", latest_only = TRUE)
     todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
   }

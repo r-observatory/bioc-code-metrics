@@ -199,6 +199,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_TITLE_PREFIX: Bioconductor
+          # One failed attempt per package per run. Set in this step alone, so
+          # the unit tests never run with it.
+          PIPELINE_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
