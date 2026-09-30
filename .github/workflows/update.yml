@@ -16,6 +16,12 @@ on:
       time_budget_seconds:
         description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
         default: "18000"
+      unpark:
+        description: "Release parked failure verdicts: all, fetch, analyze, timeout, or package names separated by commas."
+        default: ""
+      requeue:
+        description: "Analyse packages again from scratch: package names separated by commas, and over_cap for the standing over-cap list."
+        default: ""
 
 permissions:
   contents: write
@@ -199,11 +205,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_TITLE_PREFIX: Bioconductor
+          # One failed attempt per package per run. Set in this step alone, so
+          # the unit tests never run with it.
+          PIPELINE_RUN_ID: ${{ github.run_id }}
+          UNPARK: ${{ inputs.unpark }}
+          REQUEUE: ${{ inputs.requeue }}
         run: |
           set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
+          # Operator releases go to the first shard only, as --bootstrap does,
+          # and arrive through env, so their text is never read as shell.
+          RELEASE=()
+          [ -n "${UNPARK:-}" ] && RELEASE+=("--unpark=${UNPARK}")
+          [ -n "${REQUEUE:-}" ] && RELEASE+=("--requeue=${REQUEUE}")
           TODAY="$(date -u +%Y-%m-%d)"
           METRICS_TAG="metrics-${TODAY}"
           MAX_BYTES=2040109465
@@ -240,12 +256,16 @@ jobs:
 
           shard=0
           published=0
+          START_QUEUE=""
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
-            Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT}
+            Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}
             FORCE=""
+            RELEASE=()
 
+            [ -n "$START_QUEUE" ] ||
+              START_QUEUE=$(jq -r '(.n_remaining // 0) + (.n_shard // 0)' out/run-status.json || echo 0)
             CHANGED=$(jq -r '.changed' out/run-status.json)
             COMPLETE=$(jq -r '.bootstrap_complete' out/run-status.json)
             echo "shard ${shard}: changed=${CHANGED} complete=${COMPLETE} analyzed=$(jq -r .n_analyzed out/run-status.json)/$(jq -r .n_universe out/run-status.json)"
@@ -256,12 +276,15 @@ jobs:
               published=1
             fi
 
-            if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
-              echo "Nothing left to do (complete=${COMPLETE}, changed=${CHANGED})."
+            # scripts/publish.sh says when the loop is done, and why a drained
+            # queue ends it.
+            if shard_loop_done out/run-status.json; then
               break
             fi
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }
           done
+          write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" ||
+            echo "::warning::could not write the step summary"
 
           # A run that never reached Bioconductor comes back with an empty
           # universe, and from there it is shaped exactly like a healthy

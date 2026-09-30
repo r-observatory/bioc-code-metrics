@@ -45,25 +45,351 @@
   )
 }
 
-# Increment consecutive_failures for a package in bioc_metrics_failures.
-.record_failure <- function(con, pkg) {
-  now_str  <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
-  existing <- DBI::dbGetQuery(con,
-    "SELECT consecutive_failures FROM bioc_metrics_failures WHERE package = ?",
-    params = list(pkg))
-  if (nrow(existing) == 0L) {
-    DBI::dbExecute(con,
-      "INSERT INTO bioc_metrics_failures (package, consecutive_failures, last_attempt)
-       VALUES (?, 1, ?)",
-      params = list(pkg, now_str))
+# Collapse a message to one line and cut it to a byte budget, on a whole
+# character, so the line a worker prints stays one write.
+.clip_bytes <- function(s, max_bytes) {
+  s <- gsub("[[:space:]]+", " ", trimws(as.character(s)))
+  if (max_bytes <= 0L) return("")
+  if (nchar(s, type = "bytes") <= max_bytes) return(s)
+  chars <- strsplit(s, "")[[1L]]
+  keep  <- cumsum(nchar(chars, type = "bytes")) <= (max_bytes - 3L)
+  paste0(paste(chars[keep], collapse = ""), "...")
+}
+
+#' The one line a worker prints when it finishes a package.
+#'
+#' @param elapsed Seconds the worker took; NA for a fork that returned nothing.
+#' @param reason Why it failed, appended after a colon and clipped so the whole
+#'   line fits in one pipe write. NULL or "" leaves it off.
+#' @return A single string ending in one newline.
+.worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL,
+                         worker_timeout = WORKER_TIMEOUT) {
+  stem <- if (isTRUE(ok)) {
+    sprintf("[%d/%d] ok %s: %d versions in %.1fs%s", idx, n, pkg, nver, elapsed,
+            if (isTRUE(elapsed >= worker_timeout))
+              sprintf(" (past the %ds cap)", as.integer(worker_timeout)) else "")
+  } else if (is.na(elapsed)) {
+    sprintf("[%d/%d] FAIL %s: %s", idx, n, pkg, stage)
   } else {
-    DBI::dbExecute(con,
-      "UPDATE bioc_metrics_failures
-       SET consecutive_failures = consecutive_failures + 1, last_attempt = ?
-       WHERE package = ?",
-      params = list(now_str, pkg))
+    sprintf("[%d/%d] FAIL %s: %s after %.1fs", idx, n, pkg, stage, elapsed)
   }
+  if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
+    return(paste0(stem, "\n"))
+  }
+  # Two bytes for the ": " and one for the newline.
+  room <- WORKER_LINE_MAX_BYTES - nchar(stem, type = "bytes") - 3L
+  if (room <= 3L) return(paste0(stem, "\n"))
+  paste0(stem, ": ", .clip_bytes(reason, room), "\n")
+}
+
+# The stage of an error analyze_package raised. An elapsed time at the cap also
+# catches a cap swallowed earlier and a later failure.
+.classify_failure <- function(e, elapsed, worker_timeout = WORKER_TIMEOUT) {
+  if (inherits(e, "extract_failure")) {
+    return(if (isTRUE(e$status == 124L)) "git_timeout" else "extract")
+  }
+  if (inherits(e, "analyzer_parse_incomplete")) return("analyze")
+  if ((inherits(e, "condition") && .is_time_limit(e)) ||
+      isTRUE(elapsed >= worker_timeout)) {
+    return("timeout")
+  }
+  "analyze"
+}
+
+# The stage of a clone that did not succeed: 124 is system2's kill at GIT_TIMEOUT.
+.clone_stage <- function(ok) {
+  if (isTRUE(as.integer(attr(ok, "status")) == 124L)) "git_timeout" else "clone"
+}
+
+# What a clone that did not succeed says: the error it raised, or its exit status.
+.clone_reason <- function(ok) {
+  if (!is.null(attr(ok, "reason"))) return(attr(ok, "reason"))
+  st <- attr(ok, "status")
+  if (is.null(st)) "clone failed" else sprintf("git clone exited %d", as.integer(st))
+}
+
+# One worker result as the parent records it. A fork that returned nothing, or
+# raised outside the worker's handlers, printed no line, so from_parent says
+# the parent prints it; its time-limit message makes it a timeout.
+.classify_result <- function(r) {
+  if (is.null(r)) {
+    return(list(ok = FALSE, stage = "crash", elapsed = NA_real_,
+                reason = "worker returned no result", from_parent = TRUE))
+  }
+  if (inherits(r, "try-error")) {
+    cond <- attr(r, "condition")
+    msg  <- if (inherits(cond, "condition")) conditionMessage(cond) else as.character(r)
+    return(list(ok = FALSE,
+                stage = if (grepl(.time_limit_msg(), msg, fixed = TRUE)) "timeout" else "crash",
+                elapsed = NA_real_, reason = .redact_reason(msg), from_parent = TRUE))
+  }
+  if (isTRUE(r$ok)) {
+    return(list(ok = TRUE, stage = NA_character_, elapsed = r$elapsed %||% NA_real_,
+                reason = "", from_parent = FALSE))
+  }
+  list(ok = FALSE, stage = r$stage %||% "analyze", elapsed = r$elapsed %||% NA_real_,
+       reason = r$reason %||% "", from_parent = FALSE)
+}
+
+# The run a verdict belongs to: PIPELINE_RUN_ID, which the workflow sets in the
+# shard step alone. GITHUB_RUN_ID is never read, since Actions sets it in the
+# test steps too. NA outside a run, which keeps one attempt per shard.
+.current_run_id <- function() {
+  v <- Sys.getenv("PIPELINE_RUN_ID", "")
+  if (nzchar(v)) v else NA_character_
+}
+
+# Packages that already failed in this run. Nothing outside a run, so tests and
+# local runs keep today's one attempt per shard.
+.tried_this_run <- function(con, run_id) {
+  if (is.na(run_id) || !"bioc_metrics_failures" %in% DBI::dbListTables(con)) {
+    return(character(0L))
+  }
+  as.character(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_metrics_failures WHERE last_run_id = ?",
+    params = list(run_id))$package)
+}
+
+# The build a verdict names: "" when no binary ran.
+.build_key <- function(build) {
+  if (is.null(build) || length(build) != 1L || is.na(build)) "" else as.character(build)
+}
+
+# The counter a stage counts in. A fetch never reached the analyzer, so its
+# count carries across builds; the other two are verdicts on one build.
+.failure_class <- function(stage) {
+  if (stage %in% c("clone", "extract")) "fetch"
+  else if (stage %in% c("timeout", "crash", "git_timeout")) "timeout"
+  else "analyze"
+}
+
+# Record one failed attempt. fetch_failures restarts on a new latest_version and
+# any other verdict zeroes it; analyze_failures and timeout_failures restart on a
+# new build or a row from before stages were kept, and timeouts on a new cap.
+.record_failure <- function(con, pkg, stage, build, worker_timeout, run_id,
+                            elapsed, reason, latest_version) {
+  cls <- .failure_class(stage)
+  DBI::dbExecute(con, "
+    INSERT INTO bioc_metrics_failures
+      (package, consecutive_failures, last_attempt, stage, analyzer_version,
+       worker_timeout, fetch_failures, fetch_version, analyze_failures,
+       timeout_failures, last_run_id, elapsed_s, reason)
+    VALUES (:pkg, 1, :now, :stage, :build, :wt, :fetch,
+            CASE WHEN :fetch = 1 THEN :lv END, :analyze, :timeout,
+            :run_id, :elapsed, :reason)
+    ON CONFLICT(package) DO UPDATE SET
+      consecutive_failures = consecutive_failures + 1,
+      fetch_failures   = CASE WHEN :fetch = 1
+                              THEN (CASE WHEN IFNULL(fetch_version, '') = IFNULL(:lv, '')
+                                         THEN fetch_failures ELSE 0 END) + 1
+                              ELSE 0 END,
+      fetch_version    = CASE WHEN :fetch = 1 THEN :lv ELSE fetch_version END,
+      analyze_failures = (CASE WHEN stage IS NOT NULL
+                                AND IFNULL(analyzer_version, '') = :build
+                               THEN analyze_failures ELSE 0 END) + :analyze,
+      timeout_failures = (CASE WHEN stage IS NOT NULL
+                                AND IFNULL(analyzer_version, '') = :build
+                                AND worker_timeout = :wt
+                               THEN timeout_failures ELSE 0 END) + :timeout,
+      last_attempt     = excluded.last_attempt,
+      stage            = excluded.stage,
+      analyzer_version = excluded.analyzer_version,
+      worker_timeout   = excluded.worker_timeout,
+      last_run_id      = excluded.last_run_id,
+      elapsed_s        = excluded.elapsed_s,
+      reason           = excluded.reason",
+    params = list(
+      pkg = pkg, now = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      stage = stage, build = .build_key(build), wt = as.integer(worker_timeout),
+      fetch = as.integer(cls == "fetch"), analyze = as.integer(cls == "analyze"),
+      timeout = as.integer(cls == "timeout"),
+      lv = as.character(latest_version %||% NA_character_),
+      run_id = as.character(run_id %||% NA_character_),
+      elapsed = as.numeric(elapsed %||% NA_real_), reason = .redact_reason(reason)))
   invisible(NULL)
+}
+
+# Keep the standing over-cap list. A pass past the cap ran uncapped after the cap
+# fired somewhere, so it goes on the list; a pass under the cap rewrote every
+# stored row without crossing, so it comes off. TRUE when the package is on it.
+.note_over_cap <- function(con, pkg, elapsed, build, run_id,
+                           worker_timeout = WORKER_TIMEOUT) {
+  if (!isTRUE(elapsed >= worker_timeout)) {
+    DBI::dbExecute(con, "DELETE FROM bioc_over_cap WHERE package = ?", params = list(pkg))
+    return(FALSE)
+  }
+  DBI::dbExecute(con, "
+    INSERT INTO bioc_over_cap (package, elapsed_s, analyzer_version, last_run_id, recorded_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(package) DO UPDATE SET
+      elapsed_s = excluded.elapsed_s, analyzer_version = excluded.analyzer_version,
+      last_run_id = excluded.last_run_id, recorded_at = excluded.recorded_at",
+    params = list(pkg, as.numeric(elapsed), .build_key(build),
+                  as.character(run_id %||% NA_character_),
+                  format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")))
+  TRUE
+}
+
+# The standing over-cap list, longest analysis first.
+.over_cap_packages <- function(con) {
+  if (!"bioc_over_cap" %in% DBI::dbListTables(con)) return(character(0L))
+  as.character(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_over_cap ORDER BY elapsed_s DESC, package")$package)
+}
+
+# The comma-separated words of an --unpark or --requeue value.
+.split_spec <- function(spec) {
+  if (is.null(spec) || length(spec) != 1L || is.na(spec)) return(character(0L))
+  w <- trimws(strsplit(spec, ",", fixed = TRUE)[[1L]])
+  unique(w[nzchar(w)])
+}
+
+# The words that name a package this pipeline has rows or a verdict for. Any
+# other word is warned about and ignored.
+.operator_packages <- function(con, words) {
+  tables <- intersect(c("bioc_code_summary", "bioc_metrics_failures"),
+                      DBI::dbListTables(con))
+  known <- vapply(words, function(p) {
+    grepl("^[A-Za-z][A-Za-z0-9.]*$", p) && any(vapply(tables, function(t) {
+      nrow(DBI::dbGetQuery(con, sprintf("SELECT 1 FROM %s WHERE package = ? LIMIT 1", t),
+                           params = list(p))) > 0L
+    }, logical(1L)))
+  }, logical(1L), USE.NAMES = FALSE)
+  if (any(!known)) {
+    warning(sprintf("ignoring %s: not a package with rows or a verdict here",
+                    paste(words[!known], collapse = ", ")),
+            call. = FALSE, immediate. = TRUE)
+  }
+  words[known]
+}
+
+# Zero the three counters and the run id on the rows `where` selects, and stamp
+# unparked_at. A row is never deleted.
+.release_verdicts <- function(con, where, params = list()) {
+  DBI::dbExecute(con, sprintf(
+    "UPDATE bioc_metrics_failures
+        SET fetch_failures = 0, analyze_failures = 0, timeout_failures = 0,
+            last_run_id = NULL, unparked_at = ?
+      WHERE %s", where),
+    params = c(list(format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")), params))
+}
+
+#' Release parked verdicts, for --unpark.
+#'
+#' @param spec "all", "fetch", "analyze" or "timeout" (the class of a row's last
+#'   stage), or package names separated by commas.
+#' @return The number of rows released.
+.unpark <- function(con, spec) {
+  words <- .split_spec(spec)
+  if (length(words) == 0L) return(0L)
+  stages <- list(fetch = c("clone", "extract"), analyze = "analyze",
+                 timeout = c("timeout", "crash", "git_timeout"))
+  if (identical(words, "all")) return(.release_verdicts(con, "1 = 1"))
+  if (length(words) == 1L && words %in% names(stages)) {
+    st <- stages[[words]]
+    return(.release_verdicts(con, sprintf("stage IN (%s)",
+                                          paste(rep("?", length(st)), collapse = ", ")),
+                             as.list(st)))
+  }
+  pkgs <- .operator_packages(con, words)
+  if (length(pkgs) == 0L) return(0L)
+  .release_verdicts(con, sprintf("package IN (%s)",
+                                 paste(rep("?", length(pkgs)), collapse = ", ")),
+                    as.list(pkgs))
+}
+
+#' Analyse packages again from scratch, for --requeue.
+#'
+#' Releases their verdicts, forgets their read attempts and clears
+#' datasets_scanned on their latest row, so this run's dataset backfill takes
+#' them and keeps them until they pass. Their stored rows stay as they are.
+#'
+#' @param spec Package names separated by commas; over_cap names the standing
+#'   over-cap list.
+#' @return The packages requeued.
+.requeue <- function(con, spec) {
+  words <- .split_spec(spec)
+  pkgs  <- unique(c(if ("over_cap" %in% words) .over_cap_packages(con),
+                    .operator_packages(con, setdiff(words, "over_cap"))))
+  if (length(pkgs) == 0L) return(character(0L))
+  ph <- paste(rep("?", length(pkgs)), collapse = ", ")
+  .release_verdicts(con, sprintf("package IN (%s)", ph), as.list(pkgs))
+  tables <- DBI::dbListTables(con)
+  if ("bioc_analyzer_read_attempts" %in% tables) {
+    DBI::dbExecute(con, sprintf(
+      "DELETE FROM bioc_analyzer_read_attempts WHERE package IN (%s)", ph),
+      params = as.list(pkgs))
+  }
+  if ("bioc_code_summary" %in% tables &&
+      all(c("datasets_scanned", "latest_release_date") %in%
+          DBI::dbListFields(con, "bioc_code_summary"))) {
+    DBI::dbExecute(con, sprintf(
+      "UPDATE bioc_code_summary SET datasets_scanned = NULL
+        WHERE latest_release_date IS NOT NULL AND package IN (%s)", ph),
+      params = as.list(pkgs))
+  }
+  pkgs
+}
+
+# Parked verdicts by class, and the rows from before stages were kept.
+.parked_counts <- function(st) {
+  list(fetch   = sum(st$class %in% "fetch"),
+       analyze = sum(st$class %in% "analyze"),
+       timeout = sum(st$class %in% "timeout"),
+       legacy  = sum(is.na(st$stage)))
+}
+
+# Failures by stage, in the order a package meets the stages; absent ones left out.
+.stage_counts <- function(stages) {
+  order <- c("clone", "extract", "git_timeout", "analyze", "timeout", "crash")
+  n <- vapply(order, function(x) sum(stages == x), integer(1L))
+  as.list(n[n > 0L])
+}
+
+# The standing over-cap list for a manifest: its size and the first 20 names.
+.over_cap_block <- function(con) {
+  p <- .over_cap_packages(con)
+  list(count = length(p), packages = I(utils::head(p, 20L)))
+}
+
+# How many latest rows each analyzer build wrote; "none" for the R fallback.
+.latest_by_build <- function(con) {
+  empty <- stats::setNames(list(), character(0L))
+  if (!"bioc_code_summary" %in% DBI::dbListTables(con)) return(empty)
+  fields <- DBI::dbListFields(con, "bioc_code_summary")
+  if (!"latest_release_date" %in% fields) return(empty)
+  build <- if ("analyzer_version" %in% fields) {
+    "IFNULL(NULLIF(analyzer_version, ''), 'none')"
+  } else {
+    "'none'"
+  }
+  df <- DBI::dbGetQuery(con, sprintf(
+    "SELECT %s AS build, COUNT(DISTINCT package) AS n FROM bioc_code_summary
+      WHERE latest_release_date IS NOT NULL GROUP BY 1 ORDER BY 1", build))
+  stats::setNames(as.list(as.integer(df$n)), df$build)
+}
+
+# The shard plan's verdict line.
+.verdict_plan_line <- function(build, n_released, st, n_tried) {
+  p <- .parked_counts(st)
+  b <- .build_key(build)
+  sprintf(paste0("analyzer %s; verdicts released: %d; parked: fetch %d, analyze %d, ",
+                 "timeout %d, legacy %d; skipped as tried this run: %d; ",
+                 "fetch rechecks due: %d\n"),
+          if (nzchar(b)) b else "none", as.integer(n_released), p$fetch, p$analyze,
+          p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
+}
+
+# The shard receipt's verdict line.
+.verdict_receipt_line <- function(stages, over_cap, n_standing) {
+  by <- .stage_counts(stages)
+  sprintf("shard verdicts: %d failed%s; passed over the cap: %d%s; standing over-cap list: %d\n",
+          length(stages),
+          if (length(by)) sprintf(" (%s)", paste(names(by), unlist(by), collapse = ", ")) else "",
+          length(over_cap),
+          if (length(over_cap)) sprintf(" (%s)", paste(utils::head(over_cap, 20L),
+                                                        collapse = ", ")) else "",
+          as.integer(n_standing))
 }
 
 # Delete a package's failure record (reset after a successful analysis).
@@ -74,11 +400,66 @@
   invisible(NULL)
 }
 
-# Return packages with consecutive_failures >= MAX_CLONE_FAILURES.
-.permanent_failures <- function(con) {
-  DBI::dbGetQuery(con,
-    "SELECT package FROM bioc_metrics_failures WHERE consecutive_failures >= ?",
-    params = list(MAX_CLONE_FAILURES))$package
+#' Every failure verdict, and whether it parks its package.
+#'
+#' A verdict parks by build when this build failed the package
+#' MAX_CLONE_FAILURES times at analyze, or MAX_TIMEOUT_FAILURES times at a
+#' timeout under this cap. It parks by fetch when the package failed to fetch
+#' MAX_CLONE_FAILURES times at its current latest_version (the Bioconductor
+#' release), unless it has no stored rows and its last attempt is
+#' FETCH_RECHECK_DAYS old. A row from before stages were kept (stage NULL)
+#' parks nothing.
+#'
+#' @param universe data.frame(package, latest_version).
+#' @return data.frame(package, stage, class, parked, recheck_due); class is
+#'   "fetch", "analyze" or "timeout" for a parked package and NA otherwise.
+.verdict_state <- function(con, build, worker_timeout, universe, now = Sys.time()) {
+  tables <- DBI::dbListTables(con)
+  if (!"bioc_metrics_failures" %in% tables) {
+    return(data.frame(package = character(0L), stage = character(0L),
+                      class = character(0L), parked = logical(0L),
+                      recheck_due = logical(0L), stringsAsFactors = FALSE))
+  }
+  has_rows <- if ("bioc_code_summary" %in% tables) {
+    "EXISTS (SELECT 1 FROM bioc_code_summary s WHERE s.package = f.package)"
+  } else {
+    "0"
+  }
+  df <- DBI::dbGetQuery(con, sprintf("
+    SELECT f.package, f.stage, f.fetch_failures, f.fetch_version, f.last_attempt,
+           %s AS has_rows,
+           (IFNULL(f.analyzer_version, '') = :build
+              AND f.analyze_failures >= :max_fail) AS by_analyze,
+           (IFNULL(f.analyzer_version, '') = :build AND f.worker_timeout = :wt
+              AND f.timeout_failures >= :max_timeouts) AS by_timeout
+      FROM bioc_metrics_failures f
+     ORDER BY f.package", has_rows),
+    params = list(build = .build_key(build), wt = as.integer(worker_timeout),
+                  max_fail = MAX_CLONE_FAILURES, max_timeouts = MAX_TIMEOUT_FAILURES))
+  live <- !is.na(df$stage)
+  lv   <- as.character(universe$latest_version)[
+    match(df$package, as.character(universe$package))]
+  same_release <- ifelse(is.na(df$fetch_version), "", df$fetch_version) ==
+    ifelse(is.na(lv), "", lv)
+  age <- as.numeric(difftime(
+    now, as.POSIXct(df$last_attempt, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    units = "days"))
+  fetch_capped <- live & df$fetch_failures >= MAX_CLONE_FAILURES & same_release
+  recheck_due  <- fetch_capped & df$has_rows %in% 0L & !is.na(age) &
+    age >= FETCH_RECHECK_DAYS
+  class <- ifelse(live & df$by_analyze %in% 1L, "analyze",
+           ifelse(live & df$by_timeout %in% 1L, "timeout",
+           ifelse(fetch_capped & !recheck_due, "fetch", NA_character_)))
+  data.frame(package = df$package, stage = df$stage, class = class,
+             parked = !is.na(class), recheck_due = recheck_due,
+             stringsAsFactors = FALSE)
+}
+
+# Packages whose verdict parks them, left out of every queue.
+.permanent_failures <- function(con, build, worker_timeout, universe,
+                                now = Sys.time()) {
+  st <- .verdict_state(con, build, worker_timeout, universe, now)
+  st$package[st$parked]
 }
 
 # ---------------------------------------------------------------------------
@@ -558,9 +939,11 @@ default_io <- function() {
 #' data-manifest.json, run-status.json, and the changed-packages.txt
 #' accumulator.
 #'
-#' Clone and analyze failures are tracked per-package. Packages that have
-#' failed >= MAX_CLONE_FAILURES consecutive times are permanently excluded from
-#' the to-do list and counted in the manifest permanent_failures field.
+#' Clone and analyze failures are tracked per package with their stage. A
+#' package whose verdict parks it (.permanent_failures) is left out of the
+#' to-do list and counted in the manifest permanent_failures field until the
+#' analyzer build, the Bioconductor release or WORKER_TIMEOUT changes, or an
+#' operator releases it.
 #'
 #' @param io         IO interface: list with $package_list() and $clone().
 #'   Use default_io() for production; inject a fake for tests.
@@ -575,9 +958,13 @@ default_io <- function() {
 #'   Not filtered by the analyzer read attempts, unlike the scheduled path: an
 #'   operator asking for a backfill by name is asking for the packages the
 #'   scheduled run has given up on as well.
+#' @param unpark  --unpark: verdicts to release before any queue is read (see
+#'   .unpark). NULL releases nothing.
+#' @param requeue --requeue: packages to analyse again from scratch (see
+#'   .requeue). NULL requeues nothing.
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
-                       recollect = FALSE) {
+                       recollect = FALSE, unpark = NULL, requeue = NULL) {
   # Without the analyzer binary the run still completes and still writes rows,
   # and it makes no progress: the per-package metrics, the per-function detail
   # and every dataset row come from the binary alone, so each package analysed
@@ -623,6 +1010,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                                            con = if (shared_text) con else NULL)
   if (!shared_text) on.exit(DBI::dbDisconnect(text_con), add = TRUE)
 
+  # ---- 1b. Operator releases, before any queue is read -----------------------
+  n_released <- .unpark(con, unpark)
+  if (n_released > 0L) message(sprintf("verdicts released by --unpark: %d", n_released))
+  requeued <- .requeue(con, requeue)
+  if (length(requeued) > 0L) {
+    message(sprintf("requeued %d packages: %s", length(requeued),
+                    paste(requeued, collapse = ", ")))
+  }
+  n_released <- n_released + length(requeued)
+
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
     # Wipe all metric rows so everything is treated as unseen.
@@ -652,7 +1049,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   n_universe <- nrow(universe)
 
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
-  perm_fail_pkgs <- .permanent_failures(con)
+  verdicts       <- .verdict_state(con, analyzer_version, WORKER_TIMEOUT, universe)
+  perm_fail_pkgs <- verdicts$package[verdicts$parked]
+  recheck_pkgs   <- verdicts$package[verdicts$recheck_due]
+  run_id <- .current_run_id()
+  lv_of  <- stats::setNames(as.character(universe$latest_version),
+                            as.character(universe$package))
+  # A package that failed earlier in this run waits for the next one, at every
+  # stage, so a failing package costs one attempt and one publish per run.
+  tried_pkgs <- setdiff(.tried_this_run(con, run_id), perm_fail_pkgs)
+  skip_pkgs  <- c(perm_fail_pkgs, tried_pkgs)
 
   # Which builds count as this one, and how many latest rows they wrote.
   output_class <- .analyzer_output_class(analyzer_version)
@@ -665,16 +1071,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # ---- 5. To-do: packages that need analysis --------------------------------
   if (isTRUE(force_full)) {
     todo_pkgs <- sort(as.character(
-      universe$package[!universe$package %in% perm_fail_pkgs]
+      universe$package[!universe$package %in% skip_pkgs]
     ))
   } else if (isTRUE(recollect)) {
     # Backfill: only packages whose rows predate the binary metrics. No wipe;
     # upsert_shard replaces each package's rows in place.
-    todo_pkgs <- .recollect_todo(con, universe$package, perm_fail_pkgs)
+    todo_pkgs <- .recollect_todo(con, universe$package, skip_pkgs)
   } else {
     is_todo <- vapply(seq_len(n_universe), function(i) {
       pkg <- as.character(universe$package[i])
-      if (pkg %in% perm_fail_pkgs) return(FALSE)  # permanently excluded
+      if (pkg %in% skip_pkgs) return(FALSE)  # parked, or failed this run
       lv  <- universe$latest_version[i]
       if (!pkg %in% names(analyzed)) return(TRUE)   # never analyzed
       stored_v <- analyzed[[pkg]]
@@ -709,21 +1115,21 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # scheduled run finishes the one-time backfill and then reverts to just the
     # changed packages once none remain.
     backfill <- .recollect_todo(con, universe$package,
-                                c(perm_fail_pkgs, unread_pkgs))
+                                c(skip_pkgs, unread_pkgs))
     # And drain any package with a version row that predates all-versions detail
     # (detail_scanned IS NULL on ANY row). Re-analyzing fills per-version detail
     # and marks every row, so it converges; a package re-analyzed once is never
     # re-flagged, even if some versions produced zero functions. Not filtered by
     # the read attempts: this marker is written by the run itself under either
     # producer, so the queue drains without the analyzer.
-    detail_backfill <- .recollect_todo(con, universe$package, perm_fail_pkgs,
+    detail_backfill <- .recollect_todo(con, universe$package, skip_pkgs,
                                         sentinel = "detail_scanned",
                                         latest_only = FALSE)
     # And drain any package whose latest-version row predates the dataset reader
     # (datasets_scanned IS NULL), so bioc_datasets fills in without a manual
     # recollect. Also latest-row-scoped, so it converges once re-analyzed.
     dataset_backfill <- .recollect_todo(
-      con, universe$package, c(perm_fail_pkgs, unread_pkgs),
+      con, universe$package, c(skip_pkgs, unread_pkgs),
       sentinel = "datasets_scanned", latest_only = TRUE)
     todo_pkgs <- sort(unique(c(changed, backfill, detail_backfill, dataset_backfill)))
   }
@@ -750,6 +1156,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     length(shard_pkgs), length(todo_pkgs), n_changed, n_backfill, n_detail,
     length(todo_pkgs) - length(shard_pkgs), ANALYSIS_CORES, WORKER_TIMEOUT),
     file = stdout())
+  cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
+      file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -761,6 +1169,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_datasets_list  <- list()
   shard_text_list      <- list()
   shard_failures       <- character(0L)
+  shard_stages         <- character(0L)
+  # Verdicts this shard wrote. Each is news the next run needs, so the shard
+  # publishes; a weekly recheck that failed where it failed before is not.
+  n_verdicts_written   <- 0L
+  shard_over_cap       <- character(0L)
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
   shard_binary_keys    <- character(0L)
@@ -768,60 +1181,65 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
   # Worker: clone + analyze one package. No database access.
-  # Returns list(package, ok, [summary, churn, api]).
+  # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
+  # package failed, list(package, ok = FALSE, stage, elapsed, reason).
   .pkg_worker <- function(pkg) {
     .t0  <- Sys.time()
     .idx <- match(pkg, shard_pkgs)          # queue position; shard_pkgs is unique
     .n   <- length(shard_pkgs)
+    .elapsed <- function() as.numeric(difftime(Sys.time(), .t0, units = "secs"))
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
-    # position, every failure, every slow (>=30s) package, and the last position.
-    # One fully-formed cat() to stdout (< PIPE_BUF): forks reorder whole lines but
-    # never byte-interleave, and fd 1 is disjoint from mclapply's result pipe. The
-    # emit is wrapped in try() so a broken-stream write can never turn an ok
-    # package into a recorded failure.
-    .done <- function(ok, stage, nver) {
-      el <- as.numeric(difftime(Sys.time(), .t0, units = "secs"))
-      if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && !identical(.idx, .n)) {
+    # position, every failure, every slow (>=30s) package, every package past
+    # the cap, and the last position.
+    # One fully-formed cat() to stdout, kept under PIPE_BUF by .worker_line:
+    # forks reorder whole lines but never byte-interleave, and fd 1 is disjoint
+    # from mclapply's result pipe. The emit is wrapped in try() so a
+    # broken-stream write can never turn an ok package into a recorded failure.
+    .done <- function(ok, stage, nver, el, reason = NULL) {
+      if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && el < WORKER_TIMEOUT &&
+          !identical(.idx, .n)) {
         return(invisible())
       }
       try({
-        cat(sprintf("[%d/%d] %s %s: %s in %.1fs\n",
-                    .idx, .n,
-                    if (isTRUE(ok)) "ok" else "FAIL", pkg,
-                    if (isTRUE(ok)) sprintf("%d versions", nver)
-                    else paste0(stage, " failed"),
-                    el),
+        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason),
             file = stdout())
         flush(stdout())
       }, silent = TRUE)
       invisible()
     }
+    # A warning() inside the fork reaches nobody, so the reason rides out on the
+    # line the failure prints and in the result, redacted first, since the
+    # clone URL holds a token.
+    .fail <- function(stage, reason) {
+      el     <- .elapsed()
+      reason <- .redact_reason(reason)
+      .done(FALSE, stage, 0L, el, reason)
+      list(package = pkg, ok = FALSE, stage = stage, elapsed = el, reason = reason)
+    }
     dest <- file.path(WORK_DIR, pkg)
     on.exit(unlink(dest, recursive = TRUE, force = TRUE), add = TRUE)
     on.exit(setTimeLimit(), add = TRUE)
     setTimeLimit(elapsed = WORKER_TIMEOUT, transient = TRUE)
-    ok <- tryCatch(io$clone(pkg, dest), error = function(e) FALSE)
-    if (!isTRUE(ok)) {
-      .done(FALSE, "clone", 0L)
-      return(list(package = pkg, ok = FALSE))
-    }
-    stage <- "analyze"
+    ok <- tryCatch(io$clone(pkg, dest),
+                   error = function(e) structure(FALSE, reason = conditionMessage(e)))
+    if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
+    err <- NULL
     res <- tryCatch(
       analyze_package(dest, pkg),
       error = function(e) {
-        if (inherits(e, "extract_failure")) stage <<- "extract"
-        warning(sprintf("analyze_package failed for '%s': %s",
-                        pkg, conditionMessage(e)))
+        err <<- e
         NULL
       }
     )
     if (is.null(res)) {
-      .done(FALSE, stage, 0L)
-      return(list(package = pkg, ok = FALSE))
+      return(.fail(.classify_failure(err, .elapsed()),
+                   if (is.null(err)) "analyze_package returned nothing"
+                   else conditionMessage(err)))
     }
-    .done(TRUE, "ok", nrow(res$summary))
-    list(package = pkg, ok = TRUE,
+    el <- .elapsed()
+    .done(TRUE, "ok", nrow(res$summary), el)
+    list(package = pkg, ok = TRUE, elapsed = el,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
          text = res$text, binary_versions = res$binary_versions)
@@ -836,10 +1254,22 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   for (i in seq_along(results)) {
     r   <- results[[i]]
     pkg <- shard_pkgs[[i]]
-    # Guard: mclapply may return a try-error on worker crash.
-    if (inherits(r, "try-error") || is.null(r[["ok"]]) || !isTRUE(r$ok)) {
+    # mclapply returns NULL for a fork that died and a try-error for one that
+    # raised outside the worker's handlers; neither printed its line.
+    v <- .classify_result(r)
+    if (!isTRUE(v$ok)) {
+      if (isTRUE(v$from_parent)) {
+        cat(.worker_line(i, length(shard_pkgs), FALSE, pkg, v$stage, 0L,
+                         v$elapsed, v$reason), file = stdout())
+        flush(stdout())
+      }
       shard_failures <- c(shard_failures, pkg)
-      .record_failure(con, pkg)
+      shard_stages   <- c(shard_stages, v$stage)
+      same_recheck <- pkg %in% recheck_pkgs &&
+        identical(verdicts$stage[match(pkg, verdicts$package)], v$stage)
+      if (!same_recheck) n_verdicts_written <- n_verdicts_written + 1L
+      .record_failure(con, pkg, v$stage, analyzer_version, WORKER_TIMEOUT, run_id,
+                      v$elapsed, v$reason, unname(lv_of[pkg]))
     } else {
       shard_summary_list[[pkg]]   <- r$summary
       shard_churn_list[[pkg]]     <- r$churn
@@ -851,6 +1281,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
+      if (.note_over_cap(con, pkg, v$elapsed, analyzer_version, run_id)) {
+        shard_over_cap <- c(shard_over_cap, pkg)
+      }
       # Analysed, but was it read? A package the analyzer did not read carries
       # none of the fields the backfill queues wait on, and that attempt is
       # what eventually takes it out of them. A package that was read starts
@@ -911,8 +1344,18 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   }
   new_fp <- db_fingerprint(con)
 
-  # Re-query permanent failures after this run (some may have just hit the limit).
-  n_permanent_failures <- length(.permanent_failures(con))
+  # Re-read the verdicts after this shard (some may have just parked).
+  verdicts_after       <- .verdict_state(con, analyzer_version, WORKER_TIMEOUT, universe)
+  n_permanent_failures <- sum(verdicts_after$parked)
+  verdict_counts <- list(
+    parked            = .parked_counts(verdicts_after),
+    failed_this_run   = if (is.na(run_id)) length(shard_failures)
+                        else length(.tried_this_run(con, run_id)),
+    over_cap_ok       = .over_cap_block(con),
+    over_cap_this_run = if (is.na(run_id)) length(shard_over_cap)
+                        else as.integer(DBI::dbGetQuery(con,
+                          "SELECT COUNT(*) n FROM bioc_over_cap WHERE last_run_id = ?",
+                          params = list(run_id))$n))
 
   prev_manifest <- tryCatch({
     prev_path <- file.path(out_dir, "prev-code-manifest.json")
@@ -928,10 +1371,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   bootstrap_complete <- length(remaining_after) == 0L &&
     n_analyzed_pkgs >= (n_universe - n_permanent_failures)
 
-  # changed: something substantive happened OR the content hash shifted.
-  changed <- isTRUE(force_full) ||
+  # data_moved: something substantive happened OR the content hash shifted.
+  # changed adds a verdict written or released, which only persists if the
+  # shard publishes, but moves no data, so last_changed keys on data_moved.
+  data_moved <- isTRUE(force_full) ||
     length(fresh_pkgs) > 0L ||
     !identical(prior_fp, new_fp)
+  changed <- data_moved || n_verdicts_written > 0L || n_released > 0L
 
   manifest <- list(
     generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
@@ -962,6 +1408,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     n_analyzed_pkgs, n_universe, length(remaining_after),
     tolower(as.character(bootstrap_complete))),
     file = stdout())
+  cat(.verdict_receipt_line(shard_stages, shard_over_cap,
+                            verdict_counts$over_cap_ok$count), file = stdout())
   flush(stdout())
 
   bootstrap <- list(n_analyzed = n_analyzed_pkgs, n_universe = n_universe,
@@ -974,15 +1422,27 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unmeasured = .n_datasets_unmeasured(data_con),
                     analyzer_version = analyzer_version,
                     output_class = I(output_class),
-                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]])
+                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]],
+                    parked = verdict_counts$parked,
+                    failed_this_run = verdict_counts$failed_this_run,
+                    over_cap_ok = verdict_counts$over_cap_ok,
+                    over_cap_this_run = verdict_counts$over_cap_this_run)
 
-  # When this run moved nothing, the moment the data last moved is whatever the
-  # previous manifest recorded. Carrying it forward is what lets last_checked
-  # advance every run without pretending the data is newer than it is. NULL
+  # When this shard moved nothing, the moment the data last moved is whatever an
+  # earlier shard of this run recorded, or else what the previous manifest
+  # recorded. Carrying it forward is what lets last_checked advance every run
+  # without pretending the data is newer than it is. The workflow fetches the
+  # previous manifest once per run, so a later shard reading only that would
+  # date the data before an earlier shard moved it. run-status.json counts only
+  # when it carries this run's id: out/ can hold one left by another run. NULL
   # (no previous manifest, or one predating these fields) means "now", which is
   # correct for a first run and honest for the changeover.
-  last_changed <- if (changed) NULL else
-    (prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
+  this_run <- tryCatch(jsonlite::fromJSON(file.path(out_dir, "run-status.json")),
+                       error = function(e) NULL)
+  same_run <- !is.na(run_id) && identical(this_run[["run_id"]], run_id)
+  last_changed <- if (data_moved) NULL else
+    ((if (same_run) this_run[["last_changed"]]) %||%
+       prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 
@@ -1040,13 +1500,44 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       shard_failures = length(shard_failures),
                       analyzer_version = bootstrap$analyzer_version,
                       output_class = bootstrap$output_class,
-                      n_latest_on_build = bootstrap$n_latest_on_build))
+                      n_latest_on_build = bootstrap$n_latest_on_build,
+                      failed_by_stage = .stage_counts(shard_stages),
+                      parked = verdict_counts$parked,
+                      failed_this_run = verdict_counts$failed_this_run,
+                      over_cap_ok = verdict_counts$over_cap_ok,
+                      over_cap_this_run = verdict_counts$over_cap_this_run,
+                      n_released = n_released,
+                      n_tried_skipped = length(tried_pkgs),
+                      n_recheck_due = length(recheck_pkgs),
+                      latest_by_build = .latest_by_build(con),
+                      run_id = run_id, last_changed = code_manifest$last_changed))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)
   }
 
   invisible(manifest)
+}
+
+# The flags update.R takes after <out_dir>.
+.parse_cli_flags <- function(args) {
+  out <- list(shard = SHARD_SIZE, force_full = FALSE, recollect = FALSE,
+              unpark = NULL, requeue = NULL)
+  for (arg in args[startsWith(args, "--")]) {
+    if (startsWith(arg, "--shard=")) {
+      n <- suppressWarnings(as.integer(sub("^--shard=", "", arg, perl = TRUE)))
+      if (!is.na(n) && n > 0L) out$shard <- n
+    } else if (identical(arg, "--bootstrap")) {
+      out$force_full <- TRUE
+    } else if (identical(arg, "--recollect")) {
+      out$recollect <- TRUE
+    } else if (startsWith(arg, "--unpark=")) {
+      out$unpark <- sub("^--unpark=", "", arg)
+    } else if (startsWith(arg, "--requeue=")) {
+      out$requeue <- sub("^--requeue=", "", arg)
+    }
+  }
+  out
 }
 
 # ---------------------------------------------------------------------------
@@ -1077,30 +1568,16 @@ if (identical(sys.nframe(), 0L)) {
     positional[1L]
   } else {
     stop(
-      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap]",
+      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap] [--recollect] [--unpark=all|fetch|analyze|timeout|<pkg,...>] [--requeue=<pkg,...>|over_cap]",
       call. = FALSE
     )
   }
 
-  shard_override <- SHARD_SIZE
-  force_full     <- FALSE
-  recollect      <- FALSE
-
-  for (arg in args[startsWith(args, "--")]) {
-    if (startsWith(arg, "--shard=")) {
-      n <- suppressWarnings(
-        as.integer(sub("^--shard=", "", arg, perl = TRUE))
-      )
-      if (!is.na(n) && n > 0L) shard_override <- n
-    } else if (identical(arg, "--bootstrap")) {
-      force_full <- TRUE
-    } else if (identical(arg, "--recollect")) {
-      recollect <- TRUE
-    }
-  }
+  flags <- .parse_cli_flags(args)
 
   io <- default_io()
-  run_update(io, out_dir, shard_size = shard_override, force_full = force_full,
-             recollect = recollect)
+  run_update(io, out_dir, shard_size = flags$shard, force_full = flags$force_full,
+             recollect = flags$recollect, unpark = flags$unpark,
+             requeue = flags$requeue)
   message("Done.")
 }

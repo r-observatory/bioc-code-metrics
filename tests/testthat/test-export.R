@@ -541,3 +541,81 @@ test_that("repository-only zeros stay zeros on the git input", {
   expect_identical(got$ci_present, 0L)
   expect_identical(got$has_pkgdown, 0L)
 })
+
+# ---------------------------------------------------------------------------
+# Failure verdict columns and the standing over-cap list
+# ---------------------------------------------------------------------------
+
+test_that("a new database has the verdict columns and the over-cap table", {
+  con <- open_or_init_db(withr::local_tempfile(fileext = ".db"))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  expect_identical(DBI::dbListFields(con, "bioc_metrics_failures"),
+                   c("package", "consecutive_failures", "last_attempt",
+                     names(.FAILURE_VERDICT_COLUMNS)))
+  expect_identical(DBI::dbListFields(con, "bioc_over_cap"),
+                   c("package", "elapsed_s", "analyzer_version", "last_run_id",
+                     "recorded_at"))
+})
+
+test_that("a failures table from an older release gains the verdict columns and keeps its rows", {
+  path <- withr::local_tempfile(fileext = ".db")
+  old <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(old, "
+    CREATE TABLE bioc_metrics_failures (
+      package              TEXT PRIMARY KEY,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_attempt         TEXT
+    )")
+  DBI::dbExecute(old, "INSERT INTO bioc_metrics_failures VALUES
+    ('pkgOld', 5, '2026-09-01T00:00:00Z'), ('pkgNew', 1, '2026-09-28T00:00:00Z')")
+  DBI::dbDisconnect(old)
+
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  rows <- DBI::dbGetQuery(con, "SELECT * FROM bioc_metrics_failures ORDER BY package")
+
+  expect_identical(names(rows), c("package", "consecutive_failures", "last_attempt",
+                                  names(.FAILURE_VERDICT_COLUMNS)))
+  expect_identical(rows$package, c("pkgNew", "pkgOld"))
+  expect_identical(rows$consecutive_failures, c(1L, 5L))
+  expect_true(all(is.na(rows$stage)))
+  expect_identical(rows$fetch_failures, c(0L, 0L))
+  expect_identical(rows$analyze_failures, c(0L, 0L))
+  expect_identical(rows$timeout_failures, c(0L, 0L))
+})
+
+test_that("opening a migrated database again changes nothing", {
+  path <- withr::local_tempfile(fileext = ".db")
+  DBI::dbDisconnect(open_or_init_db(path))
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(length(DBI::dbListFields(con, "bioc_metrics_failures")),
+                   3L + length(.FAILURE_VERDICT_COLUMNS))
+})
+
+test_that("a failures table that gained only some verdict columns gains the rest", {
+  # A run killed between two ALTERs leaves the table half migrated.
+  path <- withr::local_tempfile(fileext = ".db")
+  old <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(old, "
+    CREATE TABLE bioc_metrics_failures (
+      package              TEXT PRIMARY KEY,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_attempt         TEXT,
+      stage                TEXT,
+      analyzer_version     TEXT
+    )")
+  DBI::dbExecute(old, "INSERT INTO bioc_metrics_failures VALUES
+    ('pkgHalf', 2, '2026-09-28T00:00:00Z', 'clone', '0.4.0')")
+  DBI::dbDisconnect(old)
+
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(DBI::dbListFields(con, "bioc_metrics_failures"),
+                   c("package", "consecutive_failures", "last_attempt",
+                     names(.FAILURE_VERDICT_COLUMNS)))
+  row <- DBI::dbGetQuery(con, "SELECT * FROM bioc_metrics_failures")
+  expect_identical(c(row$stage, row$analyzer_version), c("clone", "0.4.0"))
+  expect_identical(row$fetch_failures, 0L)
+})

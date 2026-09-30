@@ -958,3 +958,42 @@ sweep_swap_leftovers() {
     done <<< "$names"
   done <<< "$rows"
 }
+
+# Whether the shard loop is done: bootstrap complete, nothing changed, queue
+# drained (a failed package waits for the next run), or status unreadable.
+shard_loop_done() {  # $1=run-status.json
+  local vals complete changed remaining shard
+  if ! vals=$(jq -r '[.bootstrap_complete, .changed, .n_remaining, .n_shard]
+                     | map(tostring) | join(" ")' "$1" 2>/dev/null) || [ -z "$vals" ]; then
+    echo "::warning::could not read $1; stopping the shard loop."
+    return 0
+  fi
+  read -r complete changed remaining shard <<< "$vals"
+  if [ "$complete" = "false" ] && [ "$changed" = "true" ] &&
+     [[ "$remaining" =~ ^[1-9][0-9]*$ ]] && [[ "$shard" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  echo "Nothing left to do (complete=${complete}, changed=${changed}, remaining=${remaining}, shard=${shard})."
+  return 0
+}
+
+# The run's summary for $GITHUB_STEP_SUMMARY, from the last shard's status.
+# The ETA is packages done since the queue held $3, over $2 seconds.
+write_step_summary() {  # $1=run-status.json $2=seconds so far $3=packages queued at the start
+  jq -r --argjson secs "${2:-0}" --argjson start "${3:-0}" '
+    def kv: to_entries | map("\(.key) \(.value)") | join(", ") | if . == "" then "none" else . end;
+    (.n_remaining // 0) as $left
+    | ($start - $left) as $done
+    | "### Shard loop",
+      "",
+      "| | |",
+      "|---|---|",
+      "| Packages still queued | \($left) |",
+      "| Failed this run | \(.failed_this_run // 0) |",
+      "| Failed in the last shard, by stage | \((.failed_by_stage // {}) | kv) |",
+      "| Parked | \((.parked // {}) | kv) |",
+      "| Standing over-cap list | \(.over_cap_ok.count // 0)\((.over_cap_ok.packages // []) | if length > 0 then " (" + join(", ") + ")" else "" end) |",
+      "| Latest rows by build | \((.latest_by_build // {}) | kv) |",
+      "| ETA at this run'"'"'s rate | \(if $left == 0 then "done" elif $done > 0 and $secs > 0 then "about \(($left * $secs / $done / 360 | round) / 10) h" else "n/a" end) |"
+  ' "$1"
+}

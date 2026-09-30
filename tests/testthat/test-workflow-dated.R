@@ -11,3 +11,52 @@ test_that("update.yml publishes dated code and data releases, not rolling curren
   expect_true(grepl("prune.R", yml, fixed = TRUE))
   expect_true(grepl("render_notes.R", yml, fixed = TRUE))
 })
+
+# The steps of a workflow, one element per step; element 1 is what comes before
+# the first step.
+.workflow_steps <- function(name) {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", name))
+  split(yml, findInterval(seq_along(yml), grep("^      - ", yml)))
+}
+
+test_that("PIPELINE_RUN_ID is set in the shard step's env and in no other step", {
+  # Actions sets GITHUB_RUN_ID in every step, the unit tests included, so the
+  # run id the pipeline reads must reach the shard step alone.
+  hits <- Filter(function(s) any(grepl("PIPELINE_RUN_ID", s, fixed = TRUE)),
+                 c(.workflow_steps("update.yml"), .workflow_steps("test.yml")))
+  expect_length(hits, 1L)
+  step <- unname(unlist(hits))
+  expect_true(any(grepl("name: Analyze shards and publish after each", step, fixed = TRUE)))
+  expect_identical(grep("PIPELINE_RUN_ID", step, value = TRUE, fixed = TRUE),
+                   "          PIPELINE_RUN_ID: ${{ github.run_id }}")
+})
+
+test_that("the shard loop stops where shard_loop_done says, and nowhere else", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl("if shard_loop_done out/run-status.json; then", yml, fixed = TRUE)))
+  expect_false(any(grepl('[ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]', yml,
+                         fixed = TRUE)))
+  expect_true(any(grepl("Time budget reached", yml, fixed = TRUE)))
+  sh <- readLines(file.path("..", "..", "scripts", "publish.sh"))
+  expect_length(grep("^shard_loop_done\\(\\) \\{", sh), 1L)
+})
+
+test_that("unpark and requeue reach the first shard only, through env", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl("^      unpark:$", yml)))
+  expect_true(any(grepl("^      requeue:$", yml)))
+  # Read through env, never pasted into the script, so their text cannot run.
+  uses <- trimws(grep("inputs\\.(unpark|requeue)", yml, value = TRUE))
+  expect_setequal(uses, c("UNPARK: ${{ inputs.unpark }}", "REQUEUE: ${{ inputs.requeue }}"))
+  expect_true(any(grepl(
+    'Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}',
+    yml, fixed = TRUE)))
+  expect_true(any(grepl("^            RELEASE=\\(\\)$", yml)))
+})
+
+test_that("the shard step leaves a summary of the run on the Actions page", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl(
+    'write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"',
+    yml, fixed = TRUE)))
+})

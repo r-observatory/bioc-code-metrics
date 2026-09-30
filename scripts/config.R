@@ -43,6 +43,15 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 # alone, so leaving one out costs a rescan and never skips one.
 ANALYZER_SAME_OUTPUT <- c("0.5.0")
 
+# Timeouts, crashes and git timeouts a package may take under one analyzer
+# build and one WORKER_TIMEOUT before it is parked. Each costs a worker at
+# least WORKER_TIMEOUT, and three in three runs is not one slow runner.
+MAX_TIMEOUT_FAILURES <- 3L
+
+# Days after which a fetch-parked package with no stored rows is tried once
+# more, for a repository that appears on github.com/bioc later.
+FETCH_RECHECK_DAYS <- 7L
+
 SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
@@ -63,6 +72,11 @@ ANALYSIS_CORES <- {
 # file in a metric group (e.g. a catastrophic regex) cannot stall a shard.
 # Overridable via WORKER_TIMEOUT env var.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
+
+# The most one worker's progress line may be, in bytes. The forks share fd 1,
+# and a write within PIPE_BUF (at least 512 bytes by POSIX) arrives whole, so
+# a line that now carries a failure's reason cannot be split by another fork's.
+WORKER_LINE_MAX_BYTES <- 512L
 
 # The largest column profile a single dataset row may carry, in bytes.
 #

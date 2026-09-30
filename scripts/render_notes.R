@@ -36,6 +36,11 @@ render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
 
   code_manifest <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"))
   data_manifest <- jsonlite::fromJSON(file.path(out_dir, "data-manifest.json"))
+  # The shard's failures; a caller that wrote no run status loses only that line.
+  status_path <- file.path(out_dir, "run-status.json")
+  run_status  <- if (file.exists(status_path)) {
+    tryCatch(jsonlite::fromJSON(status_path), error = function(e) NULL)
+  }
 
   code_path <- file.path(out_dir, DB_FILENAME)
   data_path <- file.path(out_dir, DATA_DB_FILENAME)
@@ -54,7 +59,7 @@ render_notes <- function(out_dir, prev_code_tag = NULL, prev_data_tag = NULL,
   }, add = TRUE)
 
   notes <- build_release_notes(code_manifest, data_manifest, changed, seed,
-                               code_con, data_con)
+                               code_con, data_con, run_status = run_status)
 
   writeLines(notes, file.path(out_dir, "release-notes-code.md"))
   writeLines(notes, file.path(out_dir, "release-notes-data.md"))
