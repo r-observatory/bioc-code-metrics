@@ -20,7 +20,7 @@ differs (Bioconductor uses release branches rather than per-version tags).
 
 `bioc-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
 release is immutable once a later day's release exists, and old releases are
-pruned on a retention schedule):
+kept; see Retention):
 
 - `bioc_code_summary` - one row per package release, with the metric columns and
   the release date.
@@ -85,7 +85,8 @@ No dated release or asset is deleted. The update's prune step is set to keep
 all releases, and only a run replacing its own same-day release, drafts, and
 `swap-prev-`/`swap-next-` staging assets are cleaned up. Per-function and
 per-file detail is kept only for the latest version, so an older version's
-detail lives only in the dated release where it was latest. Keeping all
+detail lives only in the dated release where it was latest. The per-version
+summaries are in the newest release. Keeping all
 releases stays until a retention rule for these metrics is approved on its own.
 
 ## Feedback
