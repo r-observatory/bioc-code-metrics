@@ -237,6 +237,100 @@
     "SELECT package FROM bioc_over_cap ORDER BY elapsed_s DESC, package")$package)
 }
 
+# The comma-separated words of an --unpark or --requeue value.
+.split_spec <- function(spec) {
+  if (is.null(spec) || length(spec) != 1L || is.na(spec)) return(character(0L))
+  w <- trimws(strsplit(spec, ",", fixed = TRUE)[[1L]])
+  unique(w[nzchar(w)])
+}
+
+# The words that name a package this pipeline has rows or a verdict for. Any
+# other word is warned about and ignored.
+.operator_packages <- function(con, words) {
+  tables <- intersect(c("bioc_code_summary", "bioc_metrics_failures"),
+                      DBI::dbListTables(con))
+  known <- vapply(words, function(p) {
+    grepl("^[A-Za-z][A-Za-z0-9.]*$", p) && any(vapply(tables, function(t) {
+      nrow(DBI::dbGetQuery(con, sprintf("SELECT 1 FROM %s WHERE package = ? LIMIT 1", t),
+                           params = list(p))) > 0L
+    }, logical(1L)))
+  }, logical(1L), USE.NAMES = FALSE)
+  if (any(!known)) {
+    warning(sprintf("ignoring %s: not a package with rows or a verdict here",
+                    paste(words[!known], collapse = ", ")),
+            call. = FALSE, immediate. = TRUE)
+  }
+  words[known]
+}
+
+# Zero the three counters and the run id on the rows `where` selects, and stamp
+# unparked_at. A row is never deleted.
+.release_verdicts <- function(con, where, params = list()) {
+  DBI::dbExecute(con, sprintf(
+    "UPDATE bioc_metrics_failures
+        SET fetch_failures = 0, analyze_failures = 0, timeout_failures = 0,
+            last_run_id = NULL, unparked_at = ?
+      WHERE %s", where),
+    params = c(list(format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")), params))
+}
+
+#' Release parked verdicts, for --unpark.
+#'
+#' @param spec "all", "fetch", "analyze" or "timeout" (the class of a row's last
+#'   stage), or package names separated by commas.
+#' @return The number of rows released.
+.unpark <- function(con, spec) {
+  words <- .split_spec(spec)
+  if (length(words) == 0L) return(0L)
+  stages <- list(fetch = c("clone", "extract"), analyze = "analyze",
+                 timeout = c("timeout", "crash", "git_timeout"))
+  if (identical(words, "all")) return(.release_verdicts(con, "1 = 1"))
+  if (length(words) == 1L && words %in% names(stages)) {
+    st <- stages[[words]]
+    return(.release_verdicts(con, sprintf("stage IN (%s)",
+                                          paste(rep("?", length(st)), collapse = ", ")),
+                             as.list(st)))
+  }
+  pkgs <- .operator_packages(con, words)
+  if (length(pkgs) == 0L) return(0L)
+  .release_verdicts(con, sprintf("package IN (%s)",
+                                 paste(rep("?", length(pkgs)), collapse = ", ")),
+                    as.list(pkgs))
+}
+
+#' Analyse packages again from scratch, for --requeue.
+#'
+#' Releases their verdicts, forgets their read attempts and clears
+#' datasets_scanned on their latest row, so this run's dataset backfill takes
+#' them and keeps them until they pass. Their stored rows stay as they are.
+#'
+#' @param spec Package names separated by commas; over_cap names the standing
+#'   over-cap list.
+#' @return The packages requeued.
+.requeue <- function(con, spec) {
+  words <- .split_spec(spec)
+  pkgs  <- unique(c(if ("over_cap" %in% words) .over_cap_packages(con),
+                    .operator_packages(con, setdiff(words, "over_cap"))))
+  if (length(pkgs) == 0L) return(character(0L))
+  ph <- paste(rep("?", length(pkgs)), collapse = ", ")
+  .release_verdicts(con, sprintf("package IN (%s)", ph), as.list(pkgs))
+  tables <- DBI::dbListTables(con)
+  if ("bioc_analyzer_read_attempts" %in% tables) {
+    DBI::dbExecute(con, sprintf(
+      "DELETE FROM bioc_analyzer_read_attempts WHERE package IN (%s)", ph),
+      params = as.list(pkgs))
+  }
+  if ("bioc_code_summary" %in% tables &&
+      all(c("datasets_scanned", "latest_release_date") %in%
+          DBI::dbListFields(con, "bioc_code_summary"))) {
+    DBI::dbExecute(con, sprintf(
+      "UPDATE bioc_code_summary SET datasets_scanned = NULL
+        WHERE latest_release_date IS NOT NULL AND package IN (%s)", ph),
+      params = as.list(pkgs))
+  }
+  pkgs
+}
+
 # Delete a package's failure record (reset after a successful analysis).
 .reset_failure <- function(con, pkg) {
   DBI::dbExecute(con,
@@ -803,9 +897,13 @@ default_io <- function() {
 #'   Not filtered by the analyzer read attempts, unlike the scheduled path: an
 #'   operator asking for a backfill by name is asking for the packages the
 #'   scheduled run has given up on as well.
+#' @param unpark  --unpark: verdicts to release before any queue is read (see
+#'   .unpark). NULL releases nothing.
+#' @param requeue --requeue: packages to analyse again from scratch (see
+#'   .requeue). NULL requeues nothing.
 #' @return Manifest list (invisibly).
 run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
-                       recollect = FALSE) {
+                       recollect = FALSE, unpark = NULL, requeue = NULL) {
   # Without the analyzer binary the run still completes and still writes rows,
   # and it makes no progress: the per-package metrics, the per-function detail
   # and every dataset row come from the binary alone, so each package analysed
@@ -850,6 +948,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   text_con <- open_or_init_release_text_db(text_db_path,
                                            con = if (shared_text) con else NULL)
   if (!shared_text) on.exit(DBI::dbDisconnect(text_con), add = TRUE)
+
+  # ---- 1b. Operator releases, before any queue is read -----------------------
+  n_released <- .unpark(con, unpark)
+  if (n_released > 0L) message(sprintf("verdicts released by --unpark: %d", n_released))
+  requeued <- .requeue(con, requeue)
+  if (length(requeued) > 0L) {
+    message(sprintf("requeued %d packages: %s", length(requeued),
+                    paste(requeued, collapse = ", ")))
+  }
+  n_released <- n_released + length(requeued)
 
   # ---- 2. Analyzed state (O(n_packages) query, not full table read) ---------
   if (isTRUE(force_full)) {
@@ -1196,7 +1304,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   changed <- isTRUE(force_full) ||
     length(fresh_pkgs) > 0L ||
     !identical(prior_fp, new_fp) ||
-    n_verdicts_written > 0L
+    n_verdicts_written > 0L ||
+    n_released > 0L
 
   manifest <- list(
     generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
@@ -1314,6 +1423,27 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   invisible(manifest)
 }
 
+# The flags update.R takes after <out_dir>.
+.parse_cli_flags <- function(args) {
+  out <- list(shard = SHARD_SIZE, force_full = FALSE, recollect = FALSE,
+              unpark = NULL, requeue = NULL)
+  for (arg in args[startsWith(args, "--")]) {
+    if (startsWith(arg, "--shard=")) {
+      n <- suppressWarnings(as.integer(sub("^--shard=", "", arg, perl = TRUE)))
+      if (!is.na(n) && n > 0L) out$shard <- n
+    } else if (identical(arg, "--bootstrap")) {
+      out$force_full <- TRUE
+    } else if (identical(arg, "--recollect")) {
+      out$recollect <- TRUE
+    } else if (startsWith(arg, "--unpark=")) {
+      out$unpark <- sub("^--unpark=", "", arg)
+    } else if (startsWith(arg, "--requeue=")) {
+      out$requeue <- sub("^--requeue=", "", arg)
+    }
+  }
+  out
+}
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -1342,30 +1472,16 @@ if (identical(sys.nframe(), 0L)) {
     positional[1L]
   } else {
     stop(
-      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap]",
+      "Usage: Rscript scripts/update.R <out_dir> [--shard=N] [--bootstrap] [--recollect] [--unpark=all|fetch|analyze|timeout|<pkg,...>] [--requeue=<pkg,...>|over_cap]",
       call. = FALSE
     )
   }
 
-  shard_override <- SHARD_SIZE
-  force_full     <- FALSE
-  recollect      <- FALSE
-
-  for (arg in args[startsWith(args, "--")]) {
-    if (startsWith(arg, "--shard=")) {
-      n <- suppressWarnings(
-        as.integer(sub("^--shard=", "", arg, perl = TRUE))
-      )
-      if (!is.na(n) && n > 0L) shard_override <- n
-    } else if (identical(arg, "--bootstrap")) {
-      force_full <- TRUE
-    } else if (identical(arg, "--recollect")) {
-      recollect <- TRUE
-    }
-  }
+  flags <- .parse_cli_flags(args)
 
   io <- default_io()
-  run_update(io, out_dir, shard_size = shard_override, force_full = force_full,
-             recollect = recollect)
+  run_update(io, out_dir, shard_size = flags$shard, force_full = flags$force_full,
+             recollect = flags$recollect, unpark = flags$unpark,
+             requeue = flags$requeue)
   message("Done.")
 }

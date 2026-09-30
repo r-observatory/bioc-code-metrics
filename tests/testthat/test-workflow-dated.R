@@ -40,3 +40,16 @@ test_that("the shard loop stops where shard_loop_done says, and nowhere else", {
   sh <- readLines(file.path("..", "..", "scripts", "publish.sh"))
   expect_length(grep("^shard_loop_done\\(\\) \\{", sh), 1L)
 })
+
+test_that("unpark and requeue reach the first shard only, through env", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl("^      unpark:$", yml)))
+  expect_true(any(grepl("^      requeue:$", yml)))
+  # Read through env, never pasted into the script, so their text cannot run.
+  uses <- trimws(grep("inputs\\.(unpark|requeue)", yml, value = TRUE))
+  expect_setequal(uses, c("UNPARK: ${{ inputs.unpark }}", "REQUEUE: ${{ inputs.requeue }}"))
+  expect_true(any(grepl(
+    'Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}',
+    yml, fixed = TRUE)))
+  expect_true(any(grepl("^            RELEASE=\\(\\)$", yml)))
+})

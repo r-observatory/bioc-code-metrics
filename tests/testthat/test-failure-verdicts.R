@@ -645,3 +645,140 @@ test_that("a package on the standing list that then fails stays on it", {
   expect_identical(.over_cap_packages(con), "pkgBig")
   expect_identical(.fv_row(con, "pkgBig")$stage, "analyze")
 })
+
+# ---------------------------------------------------------------------------
+# Operator releases: --unpark and --requeue
+# ---------------------------------------------------------------------------
+
+# A database with one parked package per class and a legacy row.
+.fv_parked_con <- function(frame = parent.frame()) {
+  con <- .fv_con(frame)
+  for (i in seq_len(MAX_CLONE_FAILURES)) {
+    .fv_fail(con, "pkgFetch", "clone", run_id = "r1")
+    .fv_fail(con, "pkgAnalyze", "analyze", run_id = "r1")
+  }
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) .fv_fail(con, "pkgTimeout", "timeout", run_id = "r1")
+  DBI::dbExecute(con, "INSERT INTO bioc_metrics_failures (package, consecutive_failures,
+    last_attempt) VALUES ('pkgLegacy', 5, '2026-08-01T00:00:00Z')")
+  con
+}
+
+.fv_counts <- function(con) {
+  DBI::dbGetQuery(con, "SELECT package, fetch_failures + analyze_failures +
+    timeout_failures AS n, last_run_id, unparked_at IS NOT NULL AS unparked
+    FROM bioc_metrics_failures ORDER BY package")
+}
+
+test_that("--unpark by class zeroes that class's rows and deletes nothing", {
+  con <- .fv_parked_con()
+  u <- .fv_universe(c("pkgAnalyze", "pkgFetch", "pkgLegacy", "pkgTimeout"))
+  expect_identical(.unpark(con, "timeout"), 1L)
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), c("pkgAnalyze", "pkgFetch"))
+  counts <- .fv_counts(con)
+  expect_identical(counts$package, c("pkgAnalyze", "pkgFetch", "pkgLegacy", "pkgTimeout"))
+  expect_identical(counts$unparked, c(0L, 0L, 0L, 1L))
+  expect_true(is.na(counts$last_run_id[counts$package == "pkgTimeout"]))
+  expect_identical(.fv_row(con, "pkgTimeout")$consecutive_failures, MAX_TIMEOUT_FAILURES)
+
+  expect_identical(.unpark(con, "fetch"), 1L)
+  expect_identical(.unpark(con, "analyze"), 1L)
+  expect_identical(.permanent_failures(con, "0.5.0", 600L, u), character(0L))
+})
+
+test_that("--unpark=all releases every row and --unpark names packages", {
+  con <- .fv_parked_con()
+  expect_identical(.unpark(con, "pkgFetch, pkgAnalyze"), 2L)
+  expect_identical(.fv_counts(con)$n, c(0L, 0L, 0L, MAX_TIMEOUT_FAILURES))
+  expect_identical(.unpark(con, "all"), 4L)
+  expect_identical(.fv_counts(con)$n, c(0L, 0L, 0L, 0L))
+})
+
+test_that("a malformed or unknown package name is warned about and ignored", {
+  con <- .fv_parked_con()
+  expect_warning(n <- .unpark(con, "pkgFetch,x'; DROP TABLE bioc_metrics_failures,notHere"),
+                 "x'; DROP TABLE bioc_metrics_failures, notHere")
+  expect_identical(n, 1L)
+  expect_identical(nrow(.fv_counts(con)), 4L)
+  expect_identical(.unpark(con, ""), 0L)
+})
+
+test_that("--requeue releases the verdict, forgets read attempts and clears the latest scan marker", {
+  con <- .fv_parked_con()
+  DBI::dbExecute(con, "CREATE TABLE bioc_code_summary (package TEXT, version TEXT,
+    latest_release_date TEXT, datasets_scanned INTEGER)")
+  DBI::dbExecute(con, "INSERT INTO bioc_code_summary VALUES
+    ('pkgAnalyze', '1.0', NULL, 1), ('pkgAnalyze', '1.1', '2026-09-01', 1),
+    ('pkgOther', '2.0', '2026-09-01', 1)")
+  .record_analyzer_read_attempt(con, "pkgAnalyze", "0.5.0")
+  .record_analyzer_read_attempt(con, "pkgOther", "0.5.0")
+
+  expect_identical(.requeue(con, "pkgAnalyze"), "pkgAnalyze")
+  expect_identical(.fv_row(con, "pkgAnalyze")$analyze_failures, 0L)
+  expect_false(is.na(.fv_row(con, "pkgAnalyze")$unparked_at))
+  expect_identical(DBI::dbGetQuery(con,
+    "SELECT package FROM bioc_analyzer_read_attempts")$package, "pkgOther")
+  expect_identical(DBI::dbGetQuery(con,
+    "SELECT datasets_scanned FROM bioc_code_summary ORDER BY package, version")$datasets_scanned,
+    c(1L, NA, 1L))
+})
+
+test_that("--requeue=over_cap names the standing list, alongside named packages", {
+  con <- .fv_parked_con()
+  DBI::dbExecute(con, "INSERT INTO bioc_over_cap (package, elapsed_s) VALUES
+    ('pkgBig', 900), ('pkgHuge', 1500)")
+  expect_identical(.requeue(con, "pkgFetch,over_cap"), c("pkgHuge", "pkgBig", "pkgFetch"))
+})
+
+test_that("an unpark followed by a new failure adds no row", {
+  out <- withr::local_tempdir()
+  io  <- .fv_io("pkgF", fail_clones = c(pkgF = 128L))
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_run(io, out)
+  expect_identical(.fv_run(io, out)$n_shard, 0L)
+  released <- .fv_run(io, out, unpark = "pkgF")
+  expect_identical(released$n_shard, 1L)
+  expect_true(released$changed)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(DBI::dbGetQuery(con, "SELECT COUNT(*) n FROM bioc_metrics_failures")$n, 1L)
+  expect_identical(.fv_row(con, "pkgF")$fetch_failures, 1L)
+})
+
+test_that("a requeue is analysed again in the same run, and over_cap reaches the standing list", {
+  out <- withr::local_tempdir()
+  .local_global("WORKER_TIMEOUT", 1L)
+  slow <- TRUE
+  .local_global("analyze_package", function(dest, pkg) {
+    if (slow) tryCatch(.busy(1.5), error = function(e) NULL)
+    .fv_result(pkg)
+  })
+  .fv_run(.fv_io("pkgBig"), out)
+  expect_identical(.fv_run(.fv_io("pkgBig"), out)$n_shard, 0L)
+  slow <- FALSE
+  again <- .fv_run(.fv_io("pkgBig"), out, requeue = "over_cap")
+  expect_identical(again$n_shard, 1L)
+  expect_true(again$changed)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.over_cap_packages(con), character(0L))
+})
+
+test_that("update.R reads --unpark and --requeue from its command line", {
+  flags <- .parse_cli_flags(c("out/", "--unpark=timeout", "--requeue=a,b,over_cap",
+                              "--shard=7", "--recollect"))
+  expect_identical(flags[c("unpark", "requeue", "shard", "recollect", "force_full")],
+                   list(unpark = "timeout", requeue = "a,b,over_cap", shard = 7L,
+                        recollect = TRUE, force_full = FALSE))
+  none <- .parse_cli_flags("out/")
+  expect_null(none$unpark)
+  expect_null(none$requeue)
+  expect_identical(none$shard, SHARD_SIZE)
+})
+
+test_that("a re-run under the same run id skips what failed, unless the operator unparks it", {
+  out <- withr::local_tempdir()
+  io  <- .fv_io("pkgF", fail_clones = c(pkgF = 128L))
+  withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
+  .fv_run(io, out)
+  expect_identical(.fv_run(io, out)$n_shard, 0L)
+  expect_identical(.fv_run(io, out, unpark = "pkgF")$n_shard, 1L)
+})
