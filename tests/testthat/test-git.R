@@ -485,3 +485,60 @@ test_that("a token git prints on stderr never reaches the condition", {
   expect_identical(err$stderr,
                    "fatal: unable to access https://***github.com/bioc/p.git/")
 })
+
+# ---------------------------------------------------------------------------
+# clone_package keeps LFS pointers and says how the clone ended
+# ---------------------------------------------------------------------------
+
+test_that("clone_package checks out a branch whose LFS objects cannot be fetched", {
+  .local_fake_lfs()
+  base <- withr::local_tempdir()
+  .lfs_repo(file.path(base, "lfspkg.git"))
+  # A plain clone fails at checkout, as it would with git-lfs and no object.
+  plain <- suppressWarnings(system2(
+    "git", c("clone", "--quiet", file.path(base, "lfspkg.git"), file.path(base, "plain")),
+    stdout = FALSE, stderr = FALSE))
+  expect_false(identical(plain, 0L))
+  dest <- file.path(base, "clone")
+  ok <- clone_package("lfspkg", dest, base = base)
+  expect_true(ok)
+  expect_identical(attr(ok, "status"), 0L)
+  expect_true(file.exists(file.path(dest, "data", "x.RData")))
+})
+
+test_that("a clone keeps its checkout, so churn still honours .gitattributes", {
+  base <- withr::local_tempdir()
+  src <- file.path(base, "diffpkg.git")
+  dir.create(src)
+  system2("git", c("init", "-q", src), stdout = FALSE, stderr = FALSE)
+  writeLines("*.txt -diff", file.path(src, ".gitattributes"))
+  writeLines(c("a", "b"), file.path(src, "a.txt"))
+  .git(src, "add", "-A")
+  .gitc(src, "commit", "-q", "-m", "release-1.0")
+  .git(src, "branch", "RELEASE_1_0")
+  dest <- file.path(base, "clone")
+  expect_true(clone_package("diffpkg", dest, base = base))
+  ch  <- package_churn(dest)
+  row <- ch[ch$file == "a.txt", , drop = FALSE]
+  expect_identical(nrow(row), 1L)
+  expect_true(is.na(row$added))
+  expect_true(is.na(row$deleted))
+})
+
+test_that("clone_package of a missing repo returns FALSE with its exit status", {
+  dest <- file.path(withr::local_tempdir(), "clone")
+  ok <- clone_package("this_package_definitely_does_not_exist_9999", dest,
+                      base = withr::local_tempdir())
+  expect_false(ok)
+  expect_true(is.integer(attr(ok, "status")))
+  expect_false(identical(attr(ok, "status"), 0L))
+})
+
+test_that("a clone killed at GIT_TIMEOUT returns FALSE with status 124", {
+  .local_global("GIT_TIMEOUT", 1L)
+  .local_shim("git", "sleep 5")
+  ok <- clone_package("slowpkg", file.path(withr::local_tempdir(), "clone"),
+                      base = withr::local_tempdir())
+  expect_false(ok)
+  expect_identical(attr(ok, "status"), 124L)
+})

@@ -16,7 +16,10 @@
 #' @param token Optional GitHub personal access token. When supplied the clone
 #'   URL is rewritten to inject the token so the request authenticates without
 #'   a credential helper or .netrc.
-#' @return TRUE on success, FALSE on any failure (404, network, etc.).
+#' @return TRUE on success, FALSE on any failure (404, network, etc.), with the
+#'   exit status as attribute "status" (124 when GIT_TIMEOUT killed the clone).
+#'   The checkout keeps LFS pointers (GIT_LFS_SKIP_SMUDGE=1), so a missing LFS
+#'   object cannot fail it, and churn still reads the checked-out .gitattributes.
 clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
   if (!is.null(token) && nzchar(token)) {
     # Convert "https://github.com/bioc" -> "https://x-access-token:<tok>@github.com/bioc"
@@ -27,9 +30,10 @@ clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
   }
   rc <- suppressWarnings(
     system2("git", c("clone", "--quiet", url, dest),
-            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT)
+            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT,
+            env = "GIT_LFS_SKIP_SMUDGE=1")
   )
-  identical(rc, 0L)
+  structure(identical(rc, 0L), status = as.integer(rc))
 }
 
 #' List Bioconductor RELEASE_X_Y branches, ordered by release version ascending.
