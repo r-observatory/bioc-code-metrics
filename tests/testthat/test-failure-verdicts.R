@@ -539,3 +539,55 @@ test_that("a package tried this run is left out of every queue, a backfill inclu
   second <- .fv_run(.fv_io("pkgB"), out)
   expect_identical(c(first$n_shard, second$n_shard), c(1L, 0L))
 })
+
+# ---------------------------------------------------------------------------
+# A verdict is news, and a shard that records one publishes
+# ---------------------------------------------------------------------------
+
+test_that("a shard whose only news is a failure reports changed", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
+  .fv_run(io, out)
+  second <- .fv_run(io, out)
+  expect_identical(second$n_fresh, 0L)
+  expect_identical(second$shard_failures$packages, "pkgF")
+  expect_true(second$changed)
+})
+
+test_that("a weekly recheck that fails again at the same stage stays parked and publishes nothing", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
+  for (i in seq_len(MAX_CLONE_FAILURES)) .fv_run(io, out)
+  settled <- .fv_run(io, out)
+  expect_identical(settled$n_shard, 0L)
+  expect_false(settled$changed)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  .fv_age(con, "pkgF", FETCH_RECHECK_DAYS + 1L)
+  DBI::dbDisconnect(con)
+  recheck <- .fv_run(io, out)
+  expect_identical(recheck$n_shard, 1L)
+  expect_identical(recheck$shard_failures$packages, "pkgF")
+  expect_false(recheck$changed)
+  expect_identical(recheck$permanent_failures, 1L)
+})
+
+test_that("a weekly recheck that fails at a new stage publishes", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  for (i in seq_len(MAX_CLONE_FAILURES)) {
+    .fv_run(.fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L)), out)
+  }
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  .fv_age(con, "pkgF", FETCH_RECHECK_DAYS + 1L)
+  DBI::dbDisconnect(con)
+  .local_global("analyze_package", function(dest, pkg) {
+    if (identical(pkg, "pkgF")) stop(.extract_failure("archive", "1.0", 128L, "bad"))
+    .fv_result(pkg)
+  })
+  recheck <- .fv_run(.fv_io(c("pkgF", "pkgOk")), out)
+  expect_identical(recheck$shard_failures$packages, "pkgF")
+  expect_true(recheck$changed)
+})

@@ -852,7 +852,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   n_universe <- nrow(universe)
 
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
-  perm_fail_pkgs <- .permanent_failures(con, analyzer_version, WORKER_TIMEOUT, universe)
+  verdicts       <- .verdict_state(con, analyzer_version, WORKER_TIMEOUT, universe)
+  perm_fail_pkgs <- verdicts$package[verdicts$parked]
+  recheck_pkgs   <- verdicts$package[verdicts$recheck_due]
   run_id <- .current_run_id()
   lv_of  <- stats::setNames(as.character(universe$latest_version),
                             as.character(universe$package))
@@ -969,6 +971,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_text_list      <- list()
   shard_failures       <- character(0L)
   shard_stages         <- character(0L)
+  # Verdicts this shard wrote. Each is news the next run needs, so the shard
+  # publishes; a weekly recheck that failed where it failed before is not.
+  n_verdicts_written   <- 0L
   # Which of the rows about to be written the analyzer binary produced, keyed
   # by package and version. Only those get the running build stamped on them.
   shard_binary_keys    <- character(0L)
@@ -1060,6 +1065,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       }
       shard_failures <- c(shard_failures, pkg)
       shard_stages   <- c(shard_stages, v$stage)
+      same_recheck <- pkg %in% recheck_pkgs &&
+        identical(verdicts$stage[match(pkg, verdicts$package)], v$stage)
+      if (!same_recheck) n_verdicts_written <- n_verdicts_written + 1L
       .record_failure(con, pkg, v$stage, analyzer_version, WORKER_TIMEOUT, run_id,
                       v$elapsed, v$reason, unname(lv_of[pkg]))
     } else {
@@ -1151,10 +1159,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   bootstrap_complete <- length(remaining_after) == 0L &&
     n_analyzed_pkgs >= (n_universe - n_permanent_failures)
 
-  # changed: something substantive happened OR the content hash shifted.
+  # changed: something substantive happened OR the content hash shifted OR a
+  # verdict was written, which only persists if the shard publishes.
   changed <- isTRUE(force_full) ||
     length(fresh_pkgs) > 0L ||
-    !identical(prior_fp, new_fp)
+    !identical(prior_fp, new_fp) ||
+    n_verdicts_written > 0L
 
   manifest <- list(
     generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
