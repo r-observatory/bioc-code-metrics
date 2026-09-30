@@ -140,7 +140,7 @@ metrics_tests <- function(ctx) {
 
   # ---- testthat_edition ------------------------------------------------------
 
-  testthat_edition <- tryCatch({
+  testthat_edition <- .retry_after_time_limit({
     ed_raw <- ctx$desc[["Config/testthat/edition"]]
     if (is.null(ed_raw) || !nzchar(trimws(ed_raw %||% ""))) {
       NA_integer_

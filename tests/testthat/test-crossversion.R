@@ -576,3 +576,67 @@ test_that("a caller that cannot say whether the reader ran does not claim it did
   res <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
   expect_true(all(is.na(res$datasets_scanned)))
 })
+
+# ---------------------------------------------------------------------------
+# A cap swallowed in the cross-version step is evaluated again
+# ---------------------------------------------------------------------------
+
+test_that("a cap while parsing a version string still classifies the bump", {
+  want <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  .local_global(".xv_parse_ver", .fires_cap_once(.xv_parse_ver,
+    when = function(v) identical(v, "2.0.0")))
+  got <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  expect_identical(got, want)
+  expect_identical(got$bump_type[[4L]], "major")
+})
+
+test_that("a cap while counting exports keeps the removal and so the breaking flag", {
+  want <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  real <- jsonlite::fromJSON
+  local_mocked_bindings(
+    fromJSON = .fires_cap_once(real, when = function(txt, ...) identical(txt, '["baz"]')),
+    .package = "jsonlite")
+  got <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  expect_identical(got, want)
+  expect_true(got$is_breaking[[2L]])
+})
+
+test_that("a cap while reading a dependency list keeps dependency_drift", {
+  want <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  real <- jsonlite::fromJSON
+  # The first version's list, read as the previous side of the first transition.
+  local_mocked_bindings(
+    fromJSON = .fires_cap_once(real, when = function(txt, ...) identical(txt, '["rlang"]')),
+    .package = "jsonlite")
+  got <- add_cross_version_metrics(.make_summary(), .make_api(), .make_dep_series())
+  expect_identical(got, want)
+  expect_identical(got$dependency_drift[[4L]], 2L)
+})
+
+test_that("a cap while reading an author list keeps authors_added_later", {
+  # Bob appears in the third version alone, so losing that list loses him.
+  s <- .make_summary()
+  s$authors[[4L]] <- s$authors[[2L]]
+  want <- add_cross_version_metrics(s, .make_api(), .make_dep_series())
+  real <- jsonlite::fromJSON
+  local_mocked_bindings(
+    fromJSON = .fires_cap_once(real, when = function(txt, ...) identical(txt, s$authors[[3L]])),
+    .package = "jsonlite")
+  got <- add_cross_version_metrics(s, .make_api(), .make_dep_series())
+  expect_identical(got, want)
+  expect_identical(got$authors_added_later[[4L]], 1L)
+})
+
+test_that("in a fork, the real cap inside .xv_json_to_chr still returns the vector", {
+  skip_on_os("windows")
+  real <- jsonlite::fromJSON
+  job <- parallel::mcparallel({
+    local_mocked_bindings(fromJSON = function(...) {
+      .busy(0.6)
+      real(...)
+    }, .package = "jsonlite")
+    setTimeLimit(elapsed = 0.2, transient = TRUE)
+    .xv_json_to_chr('["a","b"]')
+  })
+  expect_identical(parallel::mccollect(job, wait = TRUE)[[1L]], c("a", "b"))
+})

@@ -16,7 +16,10 @@
 #' @param token Optional GitHub personal access token. When supplied the clone
 #'   URL is rewritten to inject the token so the request authenticates without
 #'   a credential helper or .netrc.
-#' @return TRUE on success, FALSE on any failure (404, network, etc.).
+#' @return TRUE on success, FALSE on any failure (404, network, etc.), with the
+#'   exit status as attribute "status" (124 when GIT_TIMEOUT killed the clone).
+#'   The checkout keeps LFS pointers (GIT_LFS_SKIP_SMUDGE=1), so a missing LFS
+#'   object cannot fail it, and churn still reads the checked-out .gitattributes.
 clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
   if (!is.null(token) && nzchar(token)) {
     # Convert "https://github.com/bioc" -> "https://x-access-token:<tok>@github.com/bioc"
@@ -27,9 +30,10 @@ clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
   }
   rc <- suppressWarnings(
     system2("git", c("clone", "--quiet", url, dest),
-            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT)
+            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT,
+            env = "GIT_LFS_SKIP_SMUDGE=1")
   )
-  identical(rc, 0L)
+  structure(identical(rc, 0L), status = as.integer(rc))
 }
 
 #' List Bioconductor RELEASE_X_Y branches, ordered by release version ascending.
@@ -143,34 +147,64 @@ list_versions <- function(repo) {
   )
 }
 
+#' The condition extract_version raises when git archive or tar exits non-zero.
+#'
+#' @param step   "archive" or "tar".
+#' @param ref    The ref being extracted.
+#' @param status The exit status; 124 is system2's kill at GIT_TIMEOUT.
+#' @param stderr The first line the step wrote to stderr; redacted here.
+#' @return A condition of class c("extract_failure", "error", "condition").
+.extract_failure <- function(step, ref, status, stderr = "") {
+  status <- as.integer(status %||% NA_integer_)
+  stderr <- .redact_reason(stderr)
+  what   <- if (identical(step, "archive")) "git archive" else "tar"
+  msg    <- sprintf("%s of %s exited %d", what, ref, status)
+  if (nzchar(stderr)) msg <- paste0(msg, ": ", stderr)
+  structure(
+    class = c("extract_failure", "error", "condition"),
+    list(message = msg, call = NULL, step = step, ref = ref,
+         status = status, stderr = stderr))
+}
+
 #' Extract a version tree from a git archive into a directory.
 #'
 #' Runs `git archive <ref> | tar -x -C <dest>` so <dest> holds that version's
-#' file tree exactly.  Creates <dest> if it does not exist.
+#' file tree exactly.  Creates <dest> if it does not exist.  LFS filters are
+#' switched off, so an LFS-tracked file extracts as its pointer, as a checkout
+#' without git-lfs holds it.
 #'
 #' @param repo  Path to a local git repository.
 #' @param ref   Tag name, branch, or commit SHA to archive.
 #'   For Bioconductor RELEASE branches, use the ref from list_versions()
 #'   (e.g. "origin/RELEASE_3_18" or a commit SHA).
 #' @param dest  Destination directory for the extracted tree.
-#' @return Character vector of extracted file paths, relative to dest.
-#'   Returns character(0) when the archive or extraction fails.
+#' @return Character vector of extracted file paths, relative to dest, and
+#'   character(0) for a tree that is empty. A non-zero exit of git archive or
+#'   tar raises an `extract_failure` (see .extract_failure).
 extract_version <- function(repo, ref, dest) {
   if (!dir.exists(dest)) dir.create(dest, recursive = TRUE)
   # Write the archive to a temp file so each stage gets its own timeout.
   archive_file <- tempfile("git_archive_", fileext = ".tar")
-  on.exit(unlink(archive_file), add = TRUE)
+  err_file     <- tempfile("git_archive_", fileext = ".err")
+  on.exit(unlink(c(archive_file, err_file)), add = TRUE)
+  first_err <- function() {
+    l <- if (file.exists(err_file)) readLines(err_file, warn = FALSE) else character(0L)
+    l <- l[grepl("[^[:space:]]", l, useBytes = TRUE)]
+    if (length(l)) l[[1L]] else ""
+  }
   rc1 <- suppressWarnings(
-    system2("git", c("-C", repo, "archive", ref),
-            stdout = archive_file, stderr = FALSE, timeout = GIT_TIMEOUT)
+    system2("git", c("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
+                     "-c", "filter.lfs.required=false",
+                     "-C", repo, "archive", ref),
+            stdout = archive_file, stderr = err_file, timeout = GIT_TIMEOUT)
   )
-  if (!identical(rc1, 0L)) return(character(0L))
+  if (!identical(rc1, 0L)) stop(.extract_failure("archive", ref, rc1, first_err()))
   rc2 <- suppressWarnings(
     system2("tar", c("-x", "-C", dest),
-            stdin = archive_file, stdout = FALSE, stderr = FALSE,
+            stdin = archive_file, stdout = FALSE, stderr = err_file,
             timeout = GIT_TIMEOUT)
   )
-  if (!identical(rc2, 0L)) return(character(0L))
+  if (!identical(rc2, 0L)) stop(.extract_failure("tar", ref, rc2, first_err()))
   list.files(dest, recursive = TRUE, all.files = TRUE,
              include.dirs = FALSE, no.. = TRUE)
 }

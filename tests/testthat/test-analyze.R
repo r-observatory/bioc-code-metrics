@@ -134,3 +134,65 @@ test_that("analyze_package produces summary/churn/api data.frames from a local r
   expect_s3_class(result$churn, "data.frame")
   expect_true("package" %in% colnames(result$churn))
 })
+
+test_that("a cap inside one R-fallback group runs the group again rather than NA", {
+  file_map <- list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\nImports: stats\n",
+    "NAMESPACE"   = "export(f)\n",
+    "R/f.R"       = "f <- function(x) x + 1\n"
+  )
+  mk  <- function() build_context("p", "1.0", "1.0", "2024-01-01",
+                                  names(file_map), function(p) file_map[[p]] %||% "")
+  want <- analyze_version(mk())
+  groups <- METRIC_GROUPS
+  groups$meta <- .fires_cap_once(groups$meta)
+  .local_global("METRIC_GROUPS", groups)
+  expect_identical(analyze_version(mk()), want)
+})
+
+# ---------------------------------------------------------------------------
+# A cap on the first file a group reads, for every R-fallback group
+# ---------------------------------------------------------------------------
+
+.sweep_map <- list(
+  "DESCRIPTION" = paste0(
+    "Package: p\nVersion: 1.0\nTitle: P\nDescription: A package.\n",
+    "Depends: R (>= 4.1)\nImports: stats\nSuggests: testthat\n",
+    "Config/testthat/edition: 3\nLicense: MIT\nSystemRequirements: zlib\n"),
+  "NAMESPACE"   = "export(f)\nexportPattern(\"^g\")\n",
+  "R/f.R"       = paste0("#' F\n#' @export\nf <- function(x) {\n  eval(substitute(x))\n}\n",
+                         "g1 <- function() stats:::median.default(1)\n"),
+  "tests/testthat/test-f.R" = "test_that('f', expect_equal(f(1), 1))\n",
+  "README.md"   = "# p\n\nInstall with `install.packages('p')`.\n",
+  "NEWS.md"     = "# p 1.0\n\n* First.\n",
+  "src/Makevars" = "PKG_CFLAGS = -O3\n",
+  "vignettes/intro.Rmd" = paste0("---\ntitle: Intro\nvignette: >\n",
+                                 "  %\\VignetteEngine{knitr::rmarkdown}\n---\n```{r}\n1\n```\n"))
+
+.sweep_ctx <- function() {
+  build_context("p", "1.0", "1.0", "2024-01-01", names(.sweep_map),
+                function(p) .sweep_map[[p]] %||% "")
+}
+
+for (nm in c("structure", "functions", "docs", "tests", "security", "health", "portability")) {
+  test_that(sprintf("a cap on the first file the %s group reads leaves its metrics unchanged", nm), {
+    .local_global("METRIC_GROUPS", METRIC_GROUPS[nm])
+    want <- analyze_version(.sweep_ctx())
+    ctx <- .sweep_ctx()
+    fired <- FALSE
+    cap_first <- function(f) {
+      force(f)
+      function(p) {
+        if (!fired) {
+          fired <<- TRUE
+          stop(.cap_error())
+        }
+        f(p)
+      }
+    }
+    ctx$read  <- cap_first(ctx$read)
+    ctx$lines <- cap_first(ctx$lines)
+    expect_identical(analyze_version(ctx), want)
+    expect_true(fired)
+  })
+}

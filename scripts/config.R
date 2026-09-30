@@ -88,6 +88,40 @@ MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
   if (is.null(a) || length(a) == 0L || (length(a) == 1L && is.na(a))) b else a
 }
 
+# The message R raises when the elapsed limit set by setTimeLimit fires.
+.time_limit_msg <- function() gettext("reached elapsed time limit", domain = "R")
+
+.is_time_limit <- function(e) {
+  grepl(.time_limit_msg(), conditionMessage(e), fixed = TRUE)
+}
+
+# tryCatch(expr, error = error), except that the elapsed limit firing inside
+# expr evaluates expr once more. R clears the limit when it fires, so a handler
+# that swallowed it would store its fallback as data. expr runs in the caller's
+# frame, as it does under tryCatch.
+.retry_after_time_limit <- function(expr, error) {
+  ex  <- substitute(expr)
+  env <- parent.frame()
+  tryCatch(eval(ex, env), error = function(e) {
+    if (.is_time_limit(e)) tryCatch(eval(ex, env), error = error) else error(e)
+  })
+}
+
+# A failure reason safe to print or store: tokens replaced by ***, bytes that
+# are not UTF-8 written as <xx>, one line, at most max_bytes.
+.redact_reason <- function(x, max_bytes = 512L) {
+  s <- paste(as.character(x[!is.na(x)]), collapse = "\n")
+  s <- iconv(s, from = "UTF-8", to = "UTF-8", sub = "byte")
+  s <- gsub("x-access-token:[^@]*@", "***", s, perl = TRUE)
+  s <- gsub("gh[pousr]_[A-Za-z0-9]+", "***", s, perl = TRUE)
+  s <- gsub("github_pat_[A-Za-z0-9_]+", "***", s, perl = TRUE)
+  s <- gsub("[[:space:]]+", " ", trimws(s))
+  if (nchar(s, type = "bytes") <= max_bytes) return(s)
+  chars <- strsplit(s, "")[[1L]]
+  keep  <- cumsum(nchar(chars, type = "bytes")) <= max_bytes - 3L
+  paste0(paste(chars[keep], collapse = ""), "...")
+}
+
 # Bioconductor rows describe the release branch as git holds it, before R CMD build.
 ANALYZER_INPUT_KIND <- "git"
 

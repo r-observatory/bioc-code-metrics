@@ -350,3 +350,195 @@ test_that("clone_package returns FALSE for a non-existent repo (offline-safe)", 
   )
   expect_false(result)
 })
+
+# ---------------------------------------------------------------------------
+# Extraction that cannot be done is an error, not an empty release
+# ---------------------------------------------------------------------------
+
+# A stand-in for git-lfs that needs no git-lfs: its smudge passes a pointer
+# through only when GIT_LFS_SKIP_SMUDGE=1, as git-lfs does, and otherwise fails
+# the way a missing LFS object does. The global config is replaced for the
+# test, since a real git-lfs filter.lfs.process there would take precedence.
+.local_fake_lfs <- function(frame = parent.frame()) {
+  dir <- withr::local_tempdir(.local_envir = frame)
+  smudge <- file.path(dir, "fake-lfs-smudge.sh")
+  writeLines(c("#!/bin/sh",
+               'if [ "$GIT_LFS_SKIP_SMUDGE" = "1" ]; then exec cat; fi',
+               'echo "fake-lfs: object not available" >&2',
+               "exit 1"), smudge)
+  Sys.chmod(smudge, mode = "0755")
+  cfg <- file.path(dir, "gitconfig")
+  writeLines(c('[filter "lfs"]', "\tclean = cat", paste0("\tsmudge = ", smudge),
+               "\trequired = true", "[user]", "\tname = T", "\temail = t@t.test"), cfg)
+  withr::local_envvar(GIT_CONFIG_GLOBAL = cfg, GIT_CONFIG_NOSYSTEM = "1",
+                      .local_envir = frame)
+  invisible(cfg)
+}
+
+# A repo whose data/x.RData is tracked by LFS, on its default branch and on
+# RELEASE_3_12, as BioTIP's was.
+.lfs_repo <- function(path) {
+  dir.create(file.path(path, "data"), recursive = TRUE, showWarnings = FALSE)
+  system2("git", c("init", "-q", path), stdout = FALSE, stderr = FALSE)
+  writeLines("*.RData filter=lfs diff=lfs merge=lfs -text", file.path(path, ".gitattributes"))
+  writeLines(c("version https://git-lfs.github.com/spec/v1",
+               paste0("oid sha256:", strrep("0", 64L)), "size 3"),
+             file.path(path, "data", "x.RData"))
+  writeLines(c("Package: lfspkg", "Version: 1.0"), file.path(path, "DESCRIPTION"))
+  .git(path, "add", "-A")
+  .git(path, "commit", "-q", "-m", "release-3.12")
+  .git(path, "branch", "RELEASE_3_12")
+  path
+}
+
+# Put an executable named `name` in front of PATH until the calling test ends.
+.local_shim <- function(name, body, frame = parent.frame()) {
+  dir <- withr::local_tempdir(.local_envir = frame)
+  path <- file.path(dir, name)
+  writeLines(c("#!/bin/sh", body), path)
+  Sys.chmod(path, mode = "0755")
+  withr::local_envvar(PATH = paste(dir, Sys.getenv("PATH"), sep = .Platform$path.sep),
+                      .local_envir = frame)
+  path
+}
+
+.one_release_repo <- function(path) {
+  system2("git", c("init", "-q", path), stdout = FALSE, stderr = FALSE)
+  writeLines("Package: p\nVersion: 1.0", file.path(path, "DESCRIPTION"))
+  .git(path, "add", ".")
+  .gitc(path, "commit", "-q", "-m", "release-3.18")
+  .git(path, "branch", "RELEASE_3_18")
+  path
+}
+
+test_that("an LFS-tracked file that cannot be smudged extracts as its pointer", {
+  .local_fake_lfs()
+  repo <- .lfs_repo(withr::local_tempdir())
+  # Plain git archive fails on this repo, as it did on BioTIP 3.12.
+  plain <- suppressWarnings(system2("git", c("-C", repo, "archive", "RELEASE_3_12"),
+                                    stdout = FALSE, stderr = FALSE))
+  expect_false(identical(plain, 0L))
+  dest <- withr::local_tempdir()
+  files <- extract_version(repo, "RELEASE_3_12", dest)
+  expect_setequal(files, c(".gitattributes", "DESCRIPTION", "data/x.RData"))
+  expect_identical(readBin(file.path(dest, "data", "x.RData"), "raw", 1000L),
+                   readBin(file.path(repo, "data", "x.RData"), "raw", 1000L))
+})
+
+test_that("a tree that is really empty extracts to character(0) without an error", {
+  # liftOver RELEASE_3_0 is such a tree, and its empty row is a true one.
+  repo <- withr::local_tempdir()
+  system2("git", c("init", "-q", repo), stdout = FALSE, stderr = FALSE)
+  .gitc(repo, "commit", "-q", "--allow-empty", "-m", "empty")
+  .git(repo, "branch", "RELEASE_3_0")
+  expect_identical(extract_version(repo, "RELEASE_3_0", withr::local_tempdir()),
+                   character(0L))
+})
+
+test_that("a ref git cannot archive raises extract_failure at the archive step", {
+  repo <- .one_release_repo(withr::local_tempdir())
+  err <- tryCatch(extract_version(repo, "RELEASE_9_99", withr::local_tempdir()),
+                  error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$step, "archive")
+  expect_identical(err$ref, "RELEASE_9_99")
+  expect_false(identical(err$status, 0L))
+  expect_match(err$stderr, "RELEASE_9_99", fixed = TRUE)
+  expect_match(conditionMessage(err), "git archive of RELEASE_9_99 exited", fixed = TRUE)
+})
+
+test_that("a tar that fails raises extract_failure at the tar step", {
+  repo <- .one_release_repo(withr::local_tempdir())
+  .local_shim("tar", c('echo "tar: shimmed failure" >&2', "exit 2"))
+  err <- tryCatch(extract_version(repo, "RELEASE_3_18", withr::local_tempdir()),
+                  error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$step, "tar")
+  expect_identical(err$status, 2L)
+  expect_identical(err$stderr, "tar: shimmed failure")
+})
+
+test_that("git archive killed at GIT_TIMEOUT carries status 124", {
+  repo <- .one_release_repo(withr::local_tempdir())
+  real_git <- unname(Sys.which("git"))
+  .local_shim("git", c(
+    'for a in "$@"; do',
+    '  if [ "$a" = archive ]; then echo "fatal: shimmed timeout" >&2; exit 124; fi',
+    "done",
+    sprintf('exec %s "$@"', shQuote(real_git))))
+  err <- tryCatch(extract_version(repo, "RELEASE_3_18", withr::local_tempdir()),
+                  error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_identical(err$step, "archive")
+  expect_identical(err$status, 124L)
+})
+
+test_that("a token git prints on stderr never reaches the condition", {
+  .local_shim("git", c(
+    'echo "fatal: unable to access https://x-access-token:ghs_abcDEF123@github.com/bioc/p.git/" >&2',
+    "exit 128"))
+  err <- tryCatch(extract_version(withr::local_tempdir(), "RELEASE_3_18",
+                                  withr::local_tempdir()),
+                  error = function(e) e)
+  expect_s3_class(err, "extract_failure")
+  expect_false(grepl("ghs_abcDEF123", conditionMessage(err), fixed = TRUE))
+  expect_identical(err$stderr,
+                   "fatal: unable to access https://***github.com/bioc/p.git/")
+})
+
+# ---------------------------------------------------------------------------
+# clone_package keeps LFS pointers and says how the clone ended
+# ---------------------------------------------------------------------------
+
+test_that("clone_package checks out a branch whose LFS objects cannot be fetched", {
+  .local_fake_lfs()
+  base <- withr::local_tempdir()
+  .lfs_repo(file.path(base, "lfspkg.git"))
+  # A plain clone fails at checkout, as it would with git-lfs and no object.
+  plain <- suppressWarnings(system2(
+    "git", c("clone", "--quiet", file.path(base, "lfspkg.git"), file.path(base, "plain")),
+    stdout = FALSE, stderr = FALSE))
+  expect_false(identical(plain, 0L))
+  dest <- file.path(base, "clone")
+  ok <- clone_package("lfspkg", dest, base = base)
+  expect_true(ok)
+  expect_identical(attr(ok, "status"), 0L)
+  expect_true(file.exists(file.path(dest, "data", "x.RData")))
+})
+
+test_that("a clone keeps its checkout, so churn still honours .gitattributes", {
+  base <- withr::local_tempdir()
+  src <- file.path(base, "diffpkg.git")
+  dir.create(src)
+  system2("git", c("init", "-q", src), stdout = FALSE, stderr = FALSE)
+  writeLines("*.txt -diff", file.path(src, ".gitattributes"))
+  writeLines(c("a", "b"), file.path(src, "a.txt"))
+  .git(src, "add", "-A")
+  .gitc(src, "commit", "-q", "-m", "release-1.0")
+  .git(src, "branch", "RELEASE_1_0")
+  dest <- file.path(base, "clone")
+  expect_true(clone_package("diffpkg", dest, base = base))
+  ch  <- package_churn(dest)
+  row <- ch[ch$file == "a.txt", , drop = FALSE]
+  expect_identical(nrow(row), 1L)
+  expect_true(is.na(row$added))
+  expect_true(is.na(row$deleted))
+})
+
+test_that("clone_package of a missing repo returns FALSE with its exit status", {
+  dest <- file.path(withr::local_tempdir(), "clone")
+  ok <- clone_package("this_package_definitely_does_not_exist_9999", dest,
+                      base = withr::local_tempdir())
+  expect_false(ok)
+  expect_true(is.integer(attr(ok, "status")))
+  expect_false(identical(attr(ok, "status"), 0L))
+})
+
+test_that("a clone killed at GIT_TIMEOUT returns FALSE with status 124", {
+  .local_global("GIT_TIMEOUT", 1L)
+  .local_shim("git", "sleep 5")
+  ok <- clone_package("slowpkg", file.path(withr::local_tempdir(), "clone"),
+                      base = withr::local_tempdir())
+  expect_false(ok)
+  expect_identical(attr(ok, "status"), 124L)
+})

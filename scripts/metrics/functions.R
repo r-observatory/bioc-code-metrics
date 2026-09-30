@@ -81,7 +81,7 @@ metrics_functions <- function(ctx) {
   # ── parse NAMESPACE ─────────────────────────────────────────────────────────
 
   has_ns   <- ctx$exists("NAMESPACE")
-  ns       <- tryCatch(ctx$namespace, error = function(e) NULL)
+  ns       <- .retry_after_time_limit(ctx$namespace, error = function(e) NULL)
   ns_exps  <- if (is.null(ns)) character(0L) else ns$exports %||% character(0L)
 
   is_pat   <- startsWith(ns_exps, "pattern:")
@@ -93,18 +93,18 @@ metrics_functions <- function(ctx) {
     if (nm %in% explicit) return(TRUE)
     if (length(patterns) == 0L) return(FALSE)
     any(vapply(patterns, function(p)
-      tryCatch(isTRUE(grepl(p, nm, perl = TRUE)), error = function(e) FALSE),
+      .retry_after_time_limit(isTRUE(grepl(p, nm, perl = TRUE)), error = function(e) FALSE),
       logical(1L)))
   }
 
   # ── collect R/ function definitions ─────────────────────────────────────────
 
-  fn_lookup  <- tryCatch(build_fn_lookup(), error = function(e) list())
+  fn_lookup  <- .retry_after_time_limit(build_fn_lookup(), error = function(e) list())
   r_fn_names <- names(fn_lookup)
 
   # ── n_exports ────────────────────────────────────────────────────────────────
 
-  n_exports <- tryCatch({
+  n_exports <- .retry_after_time_limit({
     if (!has_ns) {
       NA_integer_
     } else if (length(ns_exps) == 0L) {
@@ -127,7 +127,7 @@ metrics_functions <- function(ctx) {
 
   # ── n_internal ───────────────────────────────────────────────────────────────
 
-  n_internal <- tryCatch({
+  n_internal <- .retry_after_time_limit({
     if (length(r_fn_names) == 0L) {
       0L
     } else {
@@ -140,7 +140,7 @@ metrics_functions <- function(ctx) {
 
   nse_pat <- "\\b(eval|substitute|quote|bquote|match\\.call|sys\\.call)\\s*\\("
 
-  nse_result <- tryCatch({
+  nse_result <- .retry_after_time_limit({
     if (!has_ns) {
       list(n = NA_integer_, frac = NA_real_)
     } else {
@@ -168,7 +168,7 @@ metrics_functions <- function(ctx) {
 
   # ── triple_colon ─────────────────────────────────────────────────────────────
 
-  triple_result <- tryCatch({
+  triple_result <- .retry_after_time_limit({
     if (length(r_files) == 0L) {
       list(count = 0L, pkgs = 0L)
     } else {

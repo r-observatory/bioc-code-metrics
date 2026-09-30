@@ -191,3 +191,125 @@ test_that("build_context null churn_df becomes empty data.frame", {
   expect_equal(nrow(ctx$churn), 0L)
   expect_true(all(c("file", "added", "deleted") %in% colnames(ctx$churn)))
 })
+
+# ---------------------------------------------------------------------------
+# DESCRIPTION encoding
+# ---------------------------------------------------------------------------
+
+# parse_dcf as it was before it decoded by the Encoding field, to show valid
+# UTF-8 still parses to exactly what it did.
+.parse_dcf_before_decoding <- function(text) {
+  if (!nzchar(trimws(text %||% ""))) return(list())
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1L]]
+  out   <- list()
+  cur_key <- NULL
+  for (line in lines) {
+    if (!nzchar(trimws(line))) {
+      cur_key <- NULL
+      next
+    }
+    if (grepl("^[ \t]", line) && !is.null(cur_key)) {
+      out[[cur_key]] <- paste0(out[[cur_key]], "\n", trimws(line))
+      next
+    }
+    colon <- regexpr(":", line, fixed = TRUE)
+    if (colon == -1L) next
+    cur_key       <- trimws(substring(line, 1L, colon - 1L))
+    val           <- trimws(substring(line, colon + 1L))
+    out[[cur_key]] <- val
+  }
+  out
+}
+
+# DESCRIPTION bytes as the pipeline reads them: written with writeBin, read
+# back with readLines and joined, the way analyze_package's read_fn does.
+.dcf_as_read <- function(...) {
+  path <- withr::local_tempfile(fileext = ".dcf")
+  writeBin(c(...), path)
+  paste(readLines(path, warn = FALSE), collapse = "\n")
+}
+
+.latin1_author <- function() {
+  c(charToRaw("Author: S"), as.raw(0xf8), charToRaw("ren H"), as.raw(0xf8),
+    charToRaw("jsgaard\n"))
+}
+
+test_that("a latin1 DESCRIPTION decodes by its Encoding field", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: geepack\n"), .latin1_author(),
+                       charToRaw("Encoding: latin1\n"))
+  d <- parse_dcf(text)
+  expect_identical(d[["Author"]], "Søren Højsgaard")
+  expect_identical(d[["Encoding"]], "latin1")
+  expect_true(validUTF8(d[["Author"]]))
+})
+
+test_that("the same bytes with no Encoding field decode as latin1", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: geepack\n"), .latin1_author())
+  expect_identical(parse_dcf(text)[["Author"]], "Søren Højsgaard")
+})
+
+test_that("a CP1252 DESCRIPTION decodes 0x80 as the euro sign", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: p\nTitle: Costs in "), as.raw(0x80),
+                       charToRaw("\nEncoding: CP1252\n"))
+  expect_identical(parse_dcf(text)[["Title"]], "Costs in €")
+})
+
+test_that("an Encoding iconv does not know falls back to latin1 without an error", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: p\n"), .latin1_author(),
+                       charToRaw("Encoding: foo-bar\n"))
+  d <- expect_silent(parse_dcf(text))
+  expect_identical(d[["Author"]], "Søren Højsgaard")
+  expect_identical(d[["Encoding"]], "foo-bar")
+})
+
+test_that("bytes declared UTF-8 that are not keep <xx> escapes", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: p\nAuthor: S"), as.raw(0xf8),
+                       charToRaw("ren\nEncoding: UTF-8\n"))
+  expect_identical(parse_dcf(text)[["Author"]], "S<f8>ren")
+})
+
+test_that("a latin1 DESCRIPTION with CRLF line ends decodes and loses the CR", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  text <- .dcf_as_read(charToRaw("Package: p\r\nAuthor: S"), as.raw(0xf8),
+                       charToRaw("ren\r\nEncoding: latin1\r\n"))
+  d <- parse_dcf(text)
+  expect_identical(d[["Author"]], "Søren")
+  expect_identical(d[["Encoding"]], "latin1")
+})
+
+test_that("a cap during the conversion converts again rather than reading latin1", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  .local_global("iconv", .fires_cap_once(base::iconv,
+    when = function(x, from = "", ...) identical(from, "CP1252")))
+  text <- .dcf_as_read(charToRaw("Package: p\nTitle: Costs in "), as.raw(0x80),
+                       charToRaw("\nEncoding: CP1252\n"))
+  expect_identical(parse_dcf(text)[["Title"]], "Costs in €")
+})
+
+test_that("valid UTF-8 parses exactly as it did before decoding existed", {
+  withr::local_locale(c(LC_CTYPE = "C.UTF-8"))
+  texts <- list(
+    "Package: p\nVersion: 1.0\nAuthor: Søren Højsgaard\nEncoding: UTF-8\n",
+    "Package: p\nDescription: one\n    two\n\nKey: a\nKey: b\n",
+    "Package: p\nEncoding: latin1\nTitle: plain ASCII despite the field\n",
+    "", "   \n")
+  for (t in texts) {
+    expect_identical(parse_dcf(t), .parse_dcf_before_decoding(t), info = t)
+  }
+  expect_identical(parse_dcf(NULL), .parse_dcf_before_decoding(NULL))
+})
+
+test_that("a cap while reading a file reads it again rather than as empty", {
+  map <- list(DESCRIPTION = "Package: p\nVersion: 1.0\n",
+              NAMESPACE   = "export(foo)\nexport(bar)\n")
+  read_fn <- .fires_cap_once(function(p) map[[p]] %||% "",
+                             when = function(p) identical(p, "NAMESPACE"))
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01", names(map), read_fn)
+  # An empty NAMESPACE here would read as every export removed.
+  expect_identical(ctx$namespace$exports, c("foo", "bar"))
+})
