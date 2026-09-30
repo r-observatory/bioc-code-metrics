@@ -1965,6 +1965,32 @@ format_bytes <- function(n) {
   format(round(as.numeric(x)), big.mark = ",", trim = TRUE, scientific = FALSE)
 }
 
+# " (clone 1, timeout 2)" from a stage-to-count list, or "" without one.
+.stage_clause <- function(by_stage) {
+  if (!is.list(by_stage) || length(by_stage) == 0L) return("")
+  sprintf(" (%s)", paste(names(by_stage), unlist(by_stage), collapse = ", "))
+}
+
+# "; 30 are parked until ..." from the manifest's parked counts, or "" without them.
+.parked_clause <- function(parked) {
+  if (!is.list(parked)) return("")
+  n <- sum(vapply(c("fetch", "analyze", "timeout"),
+                  function(k) as.numeric(parked[[k]] %||% 0), numeric(1L)))
+  sprintf("; %s %s parked until the analyzer build or the release changes, or an operator releases them",
+          .fmt_n(n), if (n == 1) "is" else "are")
+}
+
+# The shard's failures for the notes: how many, by stage, and how many packages
+# are parked. Nothing when the shard had none or there is no run status.
+.failure_line <- function(run_status, code_manifest) {
+  n_fail <- suppressWarnings(as.numeric(run_status$shard_failures %||% 0))
+  if (length(n_fail) != 1L || is.na(n_fail) || n_fail <= 0) return(character(0L))
+  sprintf("%s of the %s packages in the most recent shard failed to analyze%s%s.",
+          .fmt_n(n_fail), .fmt_n(run_status$n_shard),
+          .stage_clause(run_status$failed_by_stage),
+          .parked_clause(code_manifest$bootstrap$parked))
+}
+
 #' Build the one-paragraph headline: new/updated counts, catalog size, and
 #' the bootstrap clause.
 #'
@@ -1972,8 +1998,10 @@ format_bytes <- function(n) {
 #' @param changed_pkgs  Character vector, this run's changed packages.
 #' @param seed_pkgs     Character vector, the prior release's package set
 #'   ("new to the catalog" = not present here).
-#' @return A single-line string.
-.build_headline <- function(code_manifest, changed_pkgs, seed_pkgs) {
+#' @param run_status    Parsed run-status.json (list), or NULL; supplies the
+#'   shard's failures.
+#' @return One or two lines (one markdown paragraph).
+.build_headline <- function(code_manifest, changed_pkgs, seed_pkgs, run_status = NULL) {
   n_changed <- length(changed_pkgs)
   n_new     <- sum(!changed_pkgs %in% seed_pkgs)
   n_updated <- n_changed - n_new
@@ -2007,12 +2035,13 @@ format_bytes <- function(n) {
   new_word <- if (isTRUE(n_new == 1L)) "package" else "packages"
   pkg_word <- if (isTRUE(as.numeric(code_manifest$n_packages) == 1)) "package" else "packages"
   ver_word <- if (isTRUE(as.numeric(code_manifest$n_versions) == 1)) "version" else "versions"
-  sprintf(
+  headline <- sprintf(
     "%s %s new to the catalog, %s updated. Now tracking %s %s across %s %s.%s",
     .fmt_n(n_new), new_word, .fmt_n(n_updated),
     .fmt_n(code_manifest$n_packages), pkg_word,
     .fmt_n(code_manifest$n_versions), ver_word,
     bootstrap_clause)
+  c(headline, .failure_line(run_status, code_manifest))
 }
 
 #' Build the "Updated this release" table's rows: one row per changed
@@ -2130,10 +2159,12 @@ format_bytes <- function(n) {
 #' @param code_con      Open DBI connection to the code database, or NULL.
 #' @param data_con      Open DBI connection to the dataset database, or NULL.
 #' @param cap           Max table rows before collapsing into a summary row.
+#' @param run_status    Parsed run-status.json (list), or NULL.
 #' @return Character vector of markdown lines.
 build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
-                                seed_pkgs, code_con, data_con, cap = 40L) {
-  headline        <- .build_headline(code_manifest, changed_pkgs, seed_pkgs)
+                                seed_pkgs, code_con, data_con, cap = 40L,
+                                run_status = NULL) {
+  headline        <- .build_headline(code_manifest, changed_pkgs, seed_pkgs, run_status)
   rows            <- .build_package_rows(code_con, data_con, changed_pkgs, seed_pkgs)
   table_section   <- .build_table_section(rows, length(changed_pkgs), cap = cap)
   catalog_section <- .build_catalog_section(code_manifest, data_manifest)

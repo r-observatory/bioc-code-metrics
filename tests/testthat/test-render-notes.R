@@ -133,3 +133,53 @@ test_that("render_notes treats an absent seed-packages.txt as an empty seed set"
   expect_true(any(grepl("^2 packages new to the catalog, 0 updated\\.", code_md)))
   expect_true(any(grepl("limma \\| 3\\.62\\.0 \\(new\\)", code_md)))
 })
+
+# ---------------------------------------------------------------------------
+# The shard's failures
+# ---------------------------------------------------------------------------
+
+.write_run_status <- function(out, ...) {
+  write_manifest(file.path(out, "run-status.json"), list(
+    changed = TRUE, bootstrap_complete = FALSE, n_analyzed = 1000L,
+    n_universe = 2000L, n_remaining = 0L, n_fresh = 0L, ...))
+}
+
+test_that("a shard that only failed says how many by stage and how many are parked", {
+  out <- withr::local_tempdir()
+  .setup_notes_fixture(out)
+  .write_run_status(out, n_shard = 3L, shard_failures = 3L,
+                    failed_by_stage = list(clone = 1L, timeout = 2L))
+  cm <- jsonlite::read_json(file.path(out, "code-manifest.json"))
+  cm$bootstrap$parked <- list(fetch = 34L, analyze = 0L, timeout = 2L, legacy = 0L)
+  write_manifest(file.path(out, "code-manifest.json"), cm)
+  # A shard that analysed nothing never writes the changed-package file.
+  unlink(file.path(out, "changed-packages.txt"))
+  render_notes(out)
+
+  md <- readLines(file.path(out, "release-notes-code.md"))
+  expect_true(any(md == paste0(
+    "3 of the 3 packages in the most recent shard failed to analyze (clone 1, ",
+    "timeout 2); 36 are parked until the analyzer build or the release changes, ",
+    "or an operator releases them.")))
+  expect_true(any(grepl("^0 packages new to the catalog, 0 updated\\.", md)))
+  expect_true(any(grepl("^No package changes in this release\\.$", md)))
+})
+
+test_that("a failure line from a run status without stages still reads whole", {
+  out <- withr::local_tempdir()
+  .setup_notes_fixture(out)
+  .write_run_status(out, n_shard = 100L, shard_failures = 2L)
+  render_notes(out)
+  md <- readLines(file.path(out, "release-notes-code.md"))
+  expect_true(any(md == "2 of the 100 packages in the most recent shard failed to analyze."))
+})
+
+test_that("a shard with no failures, or no run status, says nothing about failures", {
+  out <- withr::local_tempdir()
+  .setup_notes_fixture(out)
+  render_notes(out)
+  expect_false(any(grepl("failed to analyze", readLines(file.path(out, "release-notes-code.md")))))
+  .write_run_status(out, n_shard = 100L, shard_failures = 0L)
+  render_notes(out)
+  expect_false(any(grepl("failed to analyze", readLines(file.path(out, "release-notes-code.md")))))
+})
