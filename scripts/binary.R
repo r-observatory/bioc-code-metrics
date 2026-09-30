@@ -286,8 +286,25 @@ analyzer_at_least <- function(v, min) {
   )
 }
 
-# Lines this long or longer are parsed one at a time; shorter ones together.
+# Lines this long or longer are parsed one at a time, and dataset records among
+# them memoised; shorter ones are parsed together.
 .RECORD_LONG_BYTES <- 4096L
+
+# Flattened dataset records of one package, keyed by the sha256 of their line,
+# for this version and the previous one only: about two versions of dataset text.
+.record_memo <- function() {
+  memo <- new.env(parent = emptyenv())
+  memo$cur  <- new.env(hash = TRUE, parent = emptyenv())
+  memo$prev <- new.env(hash = TRUE, parent = emptyenv())
+  memo
+}
+
+# A new version: this version's entries become the previous version's.
+.record_memo_rotate <- function(memo) {
+  memo$prev <- memo$cur
+  memo$cur  <- new.env(hash = TRUE, parent = emptyenv())
+  invisible(memo)
+}
 
 # A parsed record's "rec" string, or NA. A value that is not a list errors here
 # exactly where the per-line parser's parsed[["rec"]] does.
@@ -373,9 +390,19 @@ analyzer_at_least <- function(v, min) {
   df
 }
 
-# One long line, parsed on its own; a dataset record comes back flattened.
-# Returns list(ok, value), with ok FALSE when the line does not parse.
-.parse_long_record <- function(line) {
+# One long line. A dataset record the memo holds comes back without a parse (a
+# hit from the previous version is kept for the next); otherwise the line is
+# parsed, and a dataset record flattened and kept. Returns list(ok, value).
+.parse_long_record <- function(line, memo) {
+  key <- if (!is.null(memo)) digest::digest(line, algo = "sha256", serialize = FALSE)
+  if (!is.null(key)) {
+    hit <- get0(key, envir = memo$cur, inherits = FALSE)
+    if (is.null(hit)) hit <- get0(key, envir = memo$prev, inherits = FALSE)
+    if (!is.null(hit)) {
+      assign(key, hit, envir = memo$cur)
+      return(list(ok = TRUE, value = hit))
+    }
+  }
   failed <- FALSE
   p <- .retry_after_time_limit(
     jsonlite::fromJSON(line, simplifyVector = FALSE),
@@ -385,7 +412,10 @@ analyzer_at_least <- function(v, min) {
     }
   )
   if (failed) return(list(ok = FALSE, value = NULL))
-  if (identical(.record_kind(p), "dataset")) p <- .dataset_flat(p)
+  if (identical(.record_kind(p), "dataset")) {
+    p <- .dataset_flat(p)
+    if (!is.null(key)) assign(key, p, envir = memo$cur)
+  }
   list(ok = TRUE, value = p)
 }
 
@@ -406,11 +436,14 @@ analyzer_at_least <- function(v, min) {
 #' have been read.
 #'
 #' Lines under .RECORD_LONG_BYTES are parsed in one call and longer ones one at
-#' a time; the frames are built from the records in line order. The result is
-#' identical to .parse_records_per_line(lines), which takes over whenever the
-#' stream cannot be read this way.
+#' a time; the frames are built from the records in line order. A long dataset
+#' record is kept in `memo` by the sha256 of its line, and the next version
+#' reuses it. The result is identical to .parse_records_per_line(lines), with
+#' or without a memo, and that parser takes over whenever the stream cannot be
+#' read this way.
 #'
 #' @param lines Character vector of NDJSON lines (analyzer stdout).
+#' @param memo  A .record_memo() shared by one package's versions, or NULL.
 #' @return A list:
 #'   $summary   flattened named list, or NULL if no summary record was present.
 #'   $functions data.frame(lang, name, exported, file, line, loc, n_params,
@@ -419,8 +452,9 @@ analyzer_at_least <- function(v, min) {
 #'   $datasets  data.frame of dataset records.
 #'   $dcf       DESCRIPTION fields; character(0) for an empty record, NULL for none.
 #'   $release_notes the release_notes record, or NULL.
-parse_analyzer_records <- function(lines) {
+parse_analyzer_records <- function(lines, memo = NULL) {
   lines  <- lines[grepl("[^[:space:]]", lines, useBytes = TRUE)]
+  if (!is.null(memo)) .record_memo_rotate(memo)
   long   <- nchar(lines, type = "bytes") >= .RECORD_LONG_BYTES
   parsed <- vector("list", length(lines))
   short  <- which(!long)
@@ -438,7 +472,7 @@ parse_analyzer_records <- function(lines) {
     parsed[short] <- batch
   }
   for (i in which(long)) {
-    one <- .parse_long_record(lines[[i]])
+    one <- .parse_long_record(lines[[i]], memo)
     if (!one$ok) return(.parse_records_per_line(lines))
     parsed[i] <- list(one$value)
   }
@@ -494,13 +528,14 @@ parse_analyzer_records <- function(lines) {
 #'
 #' @param dir Path to the extracted package source (a DESCRIPTION at its root).
 #' @param kind The input kind passed as --input-kind.
+#' @param memo The package's .record_memo(), or NULL.
 #' @return A flat named list of metrics for the version, with nested values
 #'   (maps and arrays) serialised to JSON strings to match how the R metric
 #'   groups store fields such as lang_breakdown. The per-function and
 #'   per-call-edge detail frames are attached as the "functions" and "edges"
 #'   attributes (data.frames without package/version stamps). NULL if the binary
 #'   is unavailable or does not produce a summary record.
-analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND) {
+analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) {
   bin <- rpkg_analyzer_bin()
   if (!nzchar(bin)) return(NULL)
 
@@ -514,7 +549,7 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND) {
   if (!is.null(attr(out, "status"))) out <- NULL
   if (is.null(out) || length(out) == 0L) return(NULL)
 
-  parsed <- parse_analyzer_records(out)
+  parsed <- parse_analyzer_records(out, memo)
   if (is.null(parsed$summary)) return(NULL)
 
   metrics <- parsed$summary

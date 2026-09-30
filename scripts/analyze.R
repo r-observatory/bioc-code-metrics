@@ -549,6 +549,8 @@ analyze_package <- function(repo_dir, package) {
   # under 30s), from the same fork, so live progress covers the long tail too.
   .hb_t0   <- Sys.time()
   .hb_last <- .hb_t0
+  # Dataset records shared by this package's releases, two releases at a time.
+  memo <- .record_memo()
 
   for (i in seq_len(nrow(versions_df))) {
     v      <- versions_df$version[i]
@@ -620,7 +622,7 @@ analyze_package <- function(repo_dir, package) {
 
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
-      metrics <- analyze_with_binary(tmp)
+      metrics <- analyze_with_binary(tmp, memo = memo)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)

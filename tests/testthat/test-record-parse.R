@@ -115,3 +115,65 @@ test_that("a cap while parsing a long line parses it again and loses no record",
     .package = "jsonlite")
   expect_identical(parse_analyzer_records(lines), want)
 })
+
+# ---------------------------------------------------------------------------
+# The dataset memo
+# ---------------------------------------------------------------------------
+
+# jsonlite::fromJSON counting the calls made on a line of its own (not on the
+# one-call array) until the calling test ends. Returns the counter.
+.count_line_parses <- function(env = parent.frame()) {
+  n <- 0L
+  real <- jsonlite::fromJSON
+  local_mocked_bindings(fromJSON = function(txt, ...) {
+    if (!startsWith(txt, "[")) n <<- n + 1L
+    real(txt, ...)
+  }, .package = "jsonlite", .env = env)
+  function() n
+}
+
+test_that("a memo changes nothing on any of these streams", {
+  for (lines in c(list(.mixed_lines()), .quirk_streams())) {
+    expect_identical(parse_analyzer_records(lines, .record_memo()), .parse_records_per_line(lines))
+  }
+})
+
+test_that("a memo hit returns what a parse returns, without parsing the line again", {
+  lines <- c('{"package":"p","rec":"summary"}', .long_dataset_line("x"),
+             .long_dataset_line("y", fp = "other"))
+  want <- .parse_records_per_line(lines)
+  memo <- .record_memo()
+  parses <- .count_line_parses()
+  expect_identical(parse_analyzer_records(lines, memo), want)
+  expect_identical(parses(), 2L)
+  expect_identical(parse_analyzer_records(lines, memo), want)
+  expect_identical(parses(), 2L)
+})
+
+test_that("the memo keeps two generations and a hit stays for the next version", {
+  a <- .long_dataset_line("a")
+  b <- .long_dataset_line("b")
+  memo <- .record_memo()
+  parses <- .count_line_parses()
+  parse_analyzer_records(c(a, b), memo)   # version 1: both parsed
+  parse_analyzer_records(a, memo)         # version 2: a from version 1
+  parse_analyzer_records(a, memo)         # version 3: a again, kept by the hit
+  expect_identical(parses(), 2L)
+  parse_analyzer_records(b, memo)         # version 4: b was three versions back
+  expect_identical(parses(), 3L)
+  key <- function(x) digest::digest(x, algo = "sha256", serialize = FALSE)
+  expect_identical(ls(memo$cur), key(b))
+  expect_identical(ls(memo$prev), key(a))
+})
+
+test_that("a cap while parsing a long line with a memo parses it again and keeps it", {
+  lines <- .mixed_lines()
+  want  <- .parse_records_per_line(lines)
+  memo  <- .record_memo()
+  real  <- jsonlite::fromJSON
+  local_mocked_bindings(
+    fromJSON = .fires_cap_once(real, when = function(txt, ...) identical(txt, lines[[10L]])),
+    .package = "jsonlite")
+  expect_identical(parse_analyzer_records(lines, memo), want)
+  expect_identical(parse_analyzer_records(lines, memo), want)
+})
