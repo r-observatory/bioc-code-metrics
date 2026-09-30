@@ -26,7 +26,7 @@ rpkg_analyzer_bin <- function() {
 rpkg_analyzer_version <- function() {
   bin <- rpkg_analyzer_bin()
   if (!nzchar(bin)) return(NA_character_)
-  out <- tryCatch(
+  out <- .retry_after_time_limit(
     suppressWarnings(system2(bin, "--version", stdout = TRUE, stderr = FALSE)),
     error = function(e) character(0L))
   if (!length(out)) return(NA_character_)
@@ -174,6 +174,30 @@ analyzer_at_least <- function(v, min) {
   df
 }
 
+#' The condition parse_analyzer_records raises when lines still fail to parse
+#' after the retry.
+#'
+#' @param n_bad Number of lines that did not parse.
+#' @param line  The first of them.
+#' @return A condition of class c("analyzer_parse_incomplete", "error",
+#'   "condition") carrying n_bad and first_bad, the first 80 bytes of `line`.
+.analyzer_parse_incomplete <- function(n_bad, line) {
+  first_bad <- .head_bytes(line, 80L)
+  structure(
+    class = c("analyzer_parse_incomplete", "error", "condition"),
+    list(message = sprintf("%d analyzer line(s) did not parse, the first begins: %s",
+                           as.integer(n_bad), first_bad),
+         call = NULL, n_bad = as.integer(n_bad), first_bad = first_bad))
+}
+
+# The first n bytes of x as valid UTF-8; a byte of a character the cut split,
+# or of a line that was not UTF-8, is written <xx>.
+.head_bytes <- function(x, n) {
+  b <- charToRaw(x)
+  if (length(b) > n) b <- b[seq_len(n)]
+  iconv(rawToChar(b), from = "UTF-8", to = "UTF-8", sub = "byte")
+}
+
 #' Parse a full NDJSON analyzer stream into summary + detail frames.
 #'
 #' Reads every line (unlike the historical parser, which stopped at the summary)
@@ -186,7 +210,9 @@ analyzer_at_least <- function(v, min) {
 #'   - "dataset"   -> one row in the datasets frame.
 #'   - "dcf"       -> the first such record, as a named character vector.
 #'   - "release_notes" -> the first such record, as a list.
-#' Record types not named here are skipped.
+#' Record types not named here are skipped. Blank lines are skipped; any other
+#' line that does not parse raises analyzer_parse_incomplete once all lines
+#' have been read.
 #'
 #' @param lines Character vector of NDJSON lines (analyzer stdout).
 #' @return A list:
@@ -206,12 +232,25 @@ parse_analyzer_records <- function(lines) {
   ds_recs <- list()
   dcf <- NULL
   notes <- NULL
+  n_bad <- 0L
+  first_bad <- NULL
 
   for (line in lines) {
-    parsed <- tryCatch(
+    # A blank line was never a record.
+    if (!grepl("[^[:space:]]", line, useBytes = TRUE)) next
+    failed <- FALSE
+    parsed <- .retry_after_time_limit(
       jsonlite::fromJSON(line, simplifyVector = FALSE),
-      error = function(e) NULL
+      error = function(e) {
+        failed <<- TRUE
+        NULL
+      }
     )
+    if (failed) {
+      n_bad <- n_bad + 1L
+      if (is.null(first_bad)) first_bad <- line
+      next
+    }
     if (is.null(parsed)) next
     rec <- parsed[["rec"]]
 
@@ -244,6 +283,10 @@ parse_analyzer_records <- function(lines) {
       if (is.null(notes)) notes <- parsed
     }
   }
+
+  # A record that did not parse is not dropped: the package fails, and its
+  # stored rows stay as they were.
+  if (n_bad > 0L) stop(.analyzer_parse_incomplete(n_bad, first_bad))
 
   functions <- data.frame(
     lang = fn$lang, name = fn$name, exported = fn$exported,
@@ -280,11 +323,14 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND) {
   bin <- rpkg_analyzer_bin()
   if (!nzchar(bin)) return(NULL)
 
-  out <- tryCatch(
-    system2(bin, c(shQuote(dir), "--input-kind", kind), stdout = TRUE, stderr = FALSE),
-    error   = function(e) NULL,
-    warning = function(w) NULL
-  )
+  # A non-zero exit (a panic, an OOM kill) signals a warning and leaves a
+  # status, and either gives the R fallback rather than a partial parse.
+  out <- .retry_after_time_limit(
+    tryCatch(system2(bin, c(shQuote(dir), "--input-kind", kind),
+                     stdout = TRUE, stderr = FALSE),
+             warning = function(w) NULL),
+    error = function(e) NULL)
+  if (!is.null(attr(out, "status"))) out <- NULL
   if (is.null(out) || length(out) == 0L) return(NULL)
 
   parsed <- parse_analyzer_records(out)

@@ -140,15 +140,45 @@ test_that("parse_analyzer_records returns zero-row detail frames on an empty str
   expect_identical(names(parsed$edges), c("graph", "from", "to"))
 })
 
-test_that("parse_analyzer_records skips unparseable lines without aborting", {
+test_that("parse_analyzer_records raises analyzer_parse_incomplete for a line that does not parse", {
   lines <- c(
     "not json at all",
     '{"rec":"summary","package":"demo"}',
+    paste0('{"rec":"function","name":"', strrep("x", 200L)),
     '{"rec":"function","lang":"r","name":"foo","exported":true,"file":"R/f.R","line":1,"loc":2,"n_params":1,"cyclocomp":1}'
   )
-  parsed <- parse_analyzer_records(lines)
+  err <- tryCatch(parse_analyzer_records(lines), error = function(e) e)
+  expect_s3_class(err, "analyzer_parse_incomplete")
+  expect_identical(err$n_bad, 2L)
+  expect_identical(err$first_bad, "not json at all")
+  expect_match(conditionMessage(err), "2 analyzer line(s) did not parse", fixed = TRUE)
+})
+
+test_that("blank lines are skipped, not counted as records that failed", {
+  parsed <- parse_analyzer_records(c("", "   ", '{"rec":"summary","package":"demo"}', ""))
   expect_identical(parsed$summary$package, "demo")
-  expect_equal(nrow(parsed$functions), 1L)
+})
+
+test_that("the first bad line is kept to 80 bytes of valid UTF-8", {
+  ascii <- paste0("{", strrep("y", 200L))
+  err <- tryCatch(parse_analyzer_records(ascii), error = function(e) e)
+  expect_identical(err$first_bad, substr(ascii, 1L, 80L))
+  # 79 ASCII bytes, then a two-byte character the 80-byte cut splits.
+  split <- paste0("{", strrep("z", 78L), "é", "tail")
+  err <- tryCatch(parse_analyzer_records(split), error = function(e) e)
+  expect_true(validUTF8(err$first_bad))
+  expect_identical(err$first_bad, paste0("{", strrep("z", 78L), "<c3>"))
+})
+
+test_that("a cap while parsing one line parses it again and loses no record", {
+  lines <- .fixture_lines()
+  want  <- parse_analyzer_records(lines)
+  real  <- jsonlite::fromJSON
+  # The dcf record: the one curatedCRCData 3.22 lost when a cap was swallowed.
+  local_mocked_bindings(
+    fromJSON = .fires_cap_once(real, when = function(txt, ...) identical(txt, lines[[10L]])),
+    .package = "jsonlite")
+  expect_identical(parse_analyzer_records(lines), want)
 })
 
 # ---------------------------------------------------------------------------
@@ -385,4 +415,43 @@ test_that("the analyzer CI installs answers the self-check package", {
   if (analyzer_at_least(rpkg_analyzer_version(), "0.5.0")) {
     expect_true(rpkg_analyzer_selfcheck())
   }
+})
+
+# ---------------------------------------------------------------------------
+# A crashed analyzer, and a cap while asking the analyzer its version
+# ---------------------------------------------------------------------------
+
+test_that("an analyzer that prints its summary and then exits non-zero gives the R fallback", {
+  skip_on_os("windows")
+  dir <- withr::local_tempdir()
+  for (ending in c("exit 101", "kill -9 $$")) {
+    stub <- file.path(dir, "stub-crash.sh")
+    writeLines(c("#!/bin/sh",
+                 'echo "{\\"rec\\":\\"summary\\",\\"package\\":\\"demo\\"}"',
+                 ending), stub)
+    Sys.chmod(stub, mode = "0755")
+    withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+    expect_null(analyze_with_binary(dir), info = ending)
+  }
+})
+
+test_that("a cap while asking the analyzer its version asks again", {
+  skip_on_os("windows")
+  dir  <- withr::local_tempdir()
+  stub <- file.path(dir, "stub-version.sh")
+  writeLines(c("#!/bin/sh", 'echo "rpkg-analyzer 0.5.0-test"'), stub)
+  Sys.chmod(stub, mode = "0755")
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+  .local_global("system2", .fires_cap_once(base::system2))
+  expect_identical(rpkg_analyzer_version(), "0.5.0-test")
+})
+
+test_that("a cap while the analyzer runs runs it again for that version", {
+  skip_on_os("windows")
+  dir  <- withr::local_tempdir()
+  stub <- .write_stub_binary(dir, .fixture_lines())
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub)
+  want <- analyze_with_binary(dir)
+  .local_global("system2", .fires_cap_once(base::system2))
+  expect_identical(analyze_with_binary(dir), want)
 })

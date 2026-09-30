@@ -531,3 +531,39 @@ test_that("a release that cannot be extracted leaves the package's stored rows a
   expect_true(any(grepl("FAIL pkgA: extract failed", logged, fixed = TRUE)))
   expect_identical(.package_rows(out_dir, "pkgA"), before)
 })
+
+test_that("analyze_package fails with analyzer_parse_incomplete on a line that does not parse", {
+  skip_on_os("windows")
+  repo <- tempfile("bcm_pi_")
+  on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
+  .make_fake_clone("pkgP", repo, versions = c("1.0", "1.1"))
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir(), "1.1"))
+  err <- tryCatch(analyze_package(repo, "pkgP"), error = function(e) e)
+  expect_s3_class(err, "analyzer_parse_incomplete")
+  expect_identical(err$n_bad, 1L)
+})
+
+test_that("an analyzer line that does not parse leaves stored rows and read attempts as they were", {
+  skip_on_os("windows")
+  out_dir <- tempfile(); dir.create(out_dir)
+  on.exit(unlink(out_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir(), "1.1"))
+
+  v1 <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  run_update(.fake_io(v1, version_map = list(pkgA = "1.0")), out_dir, shard_size = 10L)
+  before <- .package_rows(out_dir, "pkgA")
+  expect_gt(nrow(before[[paste(DB_FILENAME, SUMMARY_TABLE)]]), 0L)
+
+  v2 <- data.frame(package = "pkgA", latest_version = "1.1", stringsAsFactors = FALSE)
+  m <- suppressWarnings(run_update(.fake_io(v2, version_map = list(pkgA = c("1.0", "1.1"))),
+                                   out_dir, shard_size = 10L))
+
+  expect_identical(m$shard_failures$packages, "pkgA")
+  expect_identical(.package_rows(out_dir, "pkgA"), before)
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(nrow(DBI::dbGetQuery(con,
+    "SELECT * FROM bioc_analyzer_read_attempts WHERE package = 'pkgA'")), 0L)
+})
