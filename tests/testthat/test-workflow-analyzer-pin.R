@@ -11,3 +11,7 @@ test_that("update.yml and test.yml install rpkg-analyzer v0.5.0", {
   expect_identical(.analyzer_pins("update.yml"), "v0.5.0")
   expect_identical(.analyzer_pins("test.yml"), "v0.5.0")
 })
+
+test_that("the pinned build is in ANALYZER_SAME_OUTPUT, so a pin change says what it re-queues", {
+  expect_true(sub("^v", "", .analyzer_pins("update.yml")) %in% ANALYZER_SAME_OUTPUT)
+})
