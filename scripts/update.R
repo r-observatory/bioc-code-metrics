@@ -1371,13 +1371,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   bootstrap_complete <- length(remaining_after) == 0L &&
     n_analyzed_pkgs >= (n_universe - n_permanent_failures)
 
-  # changed: something substantive happened OR the content hash shifted OR a
-  # verdict was written, which only persists if the shard publishes.
-  changed <- isTRUE(force_full) ||
+  # data_moved: something substantive happened OR the content hash shifted.
+  # changed adds a verdict written or released, which only persists if the
+  # shard publishes, but moves no data, so last_changed keys on data_moved.
+  data_moved <- isTRUE(force_full) ||
     length(fresh_pkgs) > 0L ||
-    !identical(prior_fp, new_fp) ||
-    n_verdicts_written > 0L ||
-    n_released > 0L
+    !identical(prior_fp, new_fp)
+  changed <- data_moved || n_verdicts_written > 0L || n_released > 0L
 
   manifest <- list(
     generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
@@ -1433,7 +1433,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # advance every run without pretending the data is newer than it is. NULL
   # (no previous manifest, or one predating these fields) means "now", which is
   # correct for a first run and honest for the changeover.
-  last_changed <- if (changed) NULL else
+  last_changed <- if (data_moved) NULL else
     (prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)

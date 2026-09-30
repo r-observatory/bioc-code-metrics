@@ -555,6 +555,33 @@ test_that("a shard whose only news is a failure reports changed", {
   expect_true(second$changed)
 })
 
+# last_changed says when the data moved, and a verdict or a release moves none.
+test_that("a shard whose only news is a verdict or a release keeps last_changed", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
+  .fv_run(io, out)
+  # Stand in for the prior release's manifest the workflow downloads.
+  prior <- jsonlite::read_json(file.path(out, "code-manifest.json"))
+  prior$last_changed <- "2026-01-05T00:00:00Z"
+  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
+  last_changed <- function() vapply(c("code-manifest.json", "data-manifest.json"),
+    function(f) jsonlite::read_json(file.path(out, f))$last_changed, character(1L),
+    USE.NAMES = FALSE)
+
+  failed <- .fv_run(io, out)
+  expect_identical(failed$n_fresh, 0L)
+  expect_true(failed$changed)
+  expect_true(jsonlite::read_json(file.path(out, "run-status.json"))$changed)
+  expect_identical(last_changed(), rep("2026-01-05T00:00:00Z", 2L))
+
+  released <- .fv_run(io, out, unpark = "pkgF")
+  expect_identical(released$n_fresh, 0L)
+  expect_true(released$changed)
+  expect_identical(jsonlite::read_json(file.path(out, "run-status.json"))$n_released, 1L)
+  expect_identical(last_changed(), rep("2026-01-05T00:00:00Z", 2L))
+})
+
 test_that("a weekly recheck that fails again at the same stage stays parked and publishes nothing", {
   out <- withr::local_tempdir()
   .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
