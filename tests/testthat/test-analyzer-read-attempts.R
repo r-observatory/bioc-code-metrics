@@ -237,3 +237,69 @@ test_that("a package given up on is asked again by the next analyzer build", {
   expect_equal(retried$n_fresh, 1L)
   expect_true(retried$changed)
 })
+
+# ---------------------------------------------------------------------------
+# A build declared to reproduce the stored rows' build re-queues nothing
+# ---------------------------------------------------------------------------
+
+# A stub build that reads pkgA: one summary and one dataset record.
+.dsa_reading_analyzer <- function(dir, version) {
+  stub <- file.path(dir, "stub-analyzer.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then',
+    sprintf('  echo "rpkg-analyzer %s"', version),
+    "  exit 0",
+    "fi",
+    'echo "{\\"rec\\":\\"summary\\",\\"input_kind\\":\\"git\\",\\"loc_r\\":1,\\"n_fns_r\\":1}"',
+    paste0('echo "{\\"rec\\":\\"dataset\\",\\"name\\":\\"d\\",\\"file\\":\\"data/d.rda\\",',
+           '\\"class\\":\\"data.frame\\",\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',
+           '\\"content_fp\\":\\"cf\\",\\"schema_fp\\":\\"sf\\"}"'),
+    "exit 0"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+# A call's value and every message it raised, one trimmed line each.
+.oc_messages <- function(expr) {
+  msgs <- character(0L)
+  value <- withCallingHandlers(suppressWarnings(expr), message = function(m) {
+    msgs <<- c(msgs, trimws(conditionMessage(m)))
+    invokeRestart("muffleMessage")
+  })
+  list(value = value, messages = msgs)
+}
+
+test_that("a build in the stored rows' output class re-queues nothing, and the run says so", {
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_reading_analyzer(stub_dir, "0.4.0-test"))
+  old <- ANALYZER_SAME_OUTPUT
+  ANALYZER_SAME_OUTPUT <<- c("0.4.0-test", "0.4.1-test")
+  on.exit(ANALYZER_SAME_OUTPUT <<- old, add = TRUE)
+
+  out <- withr::local_tempdir()
+  io  <- .dsa_io()
+  expect_identical(suppressWarnings(run_update(io, out, shard_size = 10L))$n_fresh, 1L)
+
+  .dsa_reading_analyzer(stub_dir, "0.4.1-test")
+  same <- .oc_messages(run_update(io, out, shard_size = 10L))
+  expect_identical(same$value$n_fresh, 0L)
+  expect_false(same$value$changed)
+  expect_true("dataset scans invalidated by analyzer change: 0" %in% same$messages)
+  expect_true("packages to re-read under this analyzer: 0" %in% same$messages)
+  expect_true(paste("analyzer 0.4.1-test, output class 0.4.0-test 0.4.1-test;",
+                    "latest rows on class: 1 of 1") %in% same$messages)
+  boot <- jsonlite::fromJSON(file.path(out, "code-manifest.json"), simplifyVector = FALSE)$bootstrap
+  expect_identical(boot$analyzer_version, "0.4.1-test")
+  expect_identical(boot$output_class, list("0.4.0-test", "0.4.1-test"))
+  expect_identical(boot$n_latest_on_build, 1L)
+
+  .dsa_reading_analyzer(stub_dir, "0.4.2-test")
+  other <- .oc_messages(run_update(io, out, shard_size = 10L))
+  expect_true("dataset scans invalidated by analyzer change: 1" %in% other$messages)
+  expect_identical(other$value$n_fresh, 1L)
+  status <- jsonlite::fromJSON(file.path(out, "run-status.json"), simplifyVector = FALSE)
+  expect_identical(status$output_class, list("0.4.2-test"))
+  expect_identical(status$n_latest_on_build, 1L)
+})

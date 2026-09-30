@@ -154,7 +154,39 @@
   invisible(NULL)
 }
 
-# Drop attempts made by any build other than the one running.
+# The builds counted as the running one: all of ANALYZER_SAME_OUTPUT when it
+# lists the running build, that build alone when it does not, and none when the
+# build cannot be named. Matching is exact, so "0.5.0-test" is not 0.5.0.
+.analyzer_output_class <- function(build, same_output = ANALYZER_SAME_OUTPUT) {
+  if (is.null(build) || length(build) != 1L || is.na(build) || !nzchar(build)) {
+    return(character(0L))
+  }
+  build <- as.character(build)
+  if (build %in% same_output) as.character(same_output) else build
+}
+
+# Latest rows written by a build in the running build's class, and all latest
+# rows: how far a rescan onto that class has come.
+.n_latest_on_class <- function(con, build, same_output = ANALYZER_SAME_OUTPUT) {
+  out <- c(on_class = 0L, latest = 0L)
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(out)
+  fields <- DBI::dbListFields(con, SUMMARY_TABLE)
+  if (!"latest_release_date" %in% fields) return(out)
+  out[["latest"]] <- as.integer(DBI::dbGetQuery(con, sprintf(
+    'SELECT COUNT(*) n FROM "%s" WHERE latest_release_date IS NOT NULL',
+    SUMMARY_TABLE))$n)
+  builds <- .analyzer_output_class(build, same_output)
+  if (length(builds) && "analyzer_version" %in% fields) {
+    out[["on_class"]] <- as.integer(DBI::dbGetQuery(con, sprintf(
+      'SELECT COUNT(*) n FROM "%s" WHERE latest_release_date IS NOT NULL
+          AND analyzer_version IN (%s)',
+      SUMMARY_TABLE, paste(rep("?", length(builds)), collapse = ",")),
+      params = as.list(builds))$n)
+  }
+  out
+}
+
+# Drop attempts made by any build outside the running build's output class.
 #
 # The count is the verdict of one reader, and a verdict that outlives its
 # reader retires a package for good on the say-so of a build nobody runs any
@@ -166,16 +198,16 @@
 # .invalidate_stale_dataset_scans does nothing: a run with no binary records
 # its attempts against no build, and clearing those on the next such run would
 # reset the count every time and the queue would never drain.
-.forget_other_builds_read_attempts <- function(con, current_version) {
+.forget_other_builds_read_attempts <- function(con, current_version,
+                                               same_output = ANALYZER_SAME_OUTPUT) {
   if (!"bioc_analyzer_read_attempts" %in% DBI::dbListTables(con)) return(0L)
-  if (is.null(current_version) || length(current_version) != 1L ||
-      is.na(current_version) || !nzchar(current_version)) {
-    return(0L)
-  }
-  DBI::dbExecute(con,
+  builds <- .analyzer_output_class(current_version, same_output)
+  if (!length(builds)) return(0L)
+  DBI::dbExecute(con, sprintf(
     "DELETE FROM bioc_analyzer_read_attempts
-      WHERE analyzer_version IS NULL OR analyzer_version <> ?",
-    params = list(as.character(current_version)))
+      WHERE analyzer_version IS NULL OR analyzer_version NOT IN (%s)",
+    paste(rep("?", length(builds)), collapse = ",")),
+    params = as.list(builds))
 }
 
 # Packages the backfill queues have stopped asking about.
@@ -297,7 +329,8 @@
   sort(as.character(pkgs))
 }
 
-#' Clear the dataset-scan marker on rows produced by a different analyzer build.
+#' Clear the dataset-scan marker on rows produced by a build outside the running
+#' build's output class (.analyzer_output_class).
 #'
 #' The marker records that a package was scanned, not what scanned it, so after
 #' an upgrade every package looks done and nothing re-runs. Comparing against the
@@ -305,13 +338,13 @@
 #'
 #' Does nothing when the running version cannot be determined: clearing on a
 #' guess would re-scan the archive on every run and never settle.
-.invalidate_stale_dataset_scans <- function(con, current_version) {
+.invalidate_stale_dataset_scans <- function(con, current_version,
+                                            same_output = ANALYZER_SAME_OUTPUT) {
   if (!"bioc_code_summary" %in% DBI::dbListTables(con)) return(0L)
   fields <- DBI::dbListFields(con, "bioc_code_summary")
   if (!"datasets_scanned" %in% fields) return(0L)
-  if (is.null(current_version) || is.na(current_version) || !nzchar(current_version)) {
-    return(0L)
-  }
+  builds <- .analyzer_output_class(current_version, same_output)
+  if (!length(builds)) return(0L)
   if (!"analyzer_version" %in% fields) {
     # Nothing on these rows says which build produced them, so none of them can
     # be shown to match the one running now. The column arrives with the first
@@ -322,11 +355,12 @@
       "UPDATE bioc_code_summary SET datasets_scanned = NULL
         WHERE datasets_scanned IS NOT NULL"))
   }
-  DBI::dbExecute(con,
+  DBI::dbExecute(con, sprintf(
     "UPDATE bioc_code_summary SET datasets_scanned = NULL
       WHERE datasets_scanned IS NOT NULL
-        AND (analyzer_version IS NULL OR analyzer_version <> ?)",
-    params = list(current_version))
+        AND (analyzer_version IS NULL OR analyzer_version NOT IN (%s))",
+    paste(rep("?", length(builds)), collapse = ",")),
+    params = as.list(builds))
 }
 
 # Address one summary row the way the shard's producers name it. Package names
@@ -620,6 +654,14 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # ---- 4. Permanent failures: exclude from to-do ----------------------------
   perm_fail_pkgs <- .permanent_failures(con)
 
+  # Which builds count as this one, and how many latest rows they wrote.
+  output_class <- .analyzer_output_class(analyzer_version)
+  on_class     <- .n_latest_on_class(con, analyzer_version)
+  message(sprintf("analyzer %s, output class %s; latest rows on class: %d of %d",
+                  analyzer_version %||% "none",
+                  if (length(output_class)) paste(output_class, collapse = " ") else "none",
+                  on_class[["on_class"]], on_class[["latest"]]))
+
   # ---- 5. To-do: packages that need analysis --------------------------------
   if (isTRUE(force_full)) {
     todo_pkgs <- sort(as.character(
@@ -647,17 +689,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # those puts them back in the queue below, which drains a shard at a time and
     # settles once every row carries the running build's version.
     n_stale <- .invalidate_stale_dataset_scans(con, analyzer_version)
-    if (n_stale > 0L) {
-      message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
-    }
+    message(sprintf("dataset scans invalidated by analyzer change: %d", n_stale))
     # The same change gives back the packages the previous build could not read.
     # Their rows carry no marker to invalidate, so this is the only thing that
     # puts them in front of a new reader. Before the queues are read, so this
     # run is the one that asks again.
     n_retry <- .forget_other_builds_read_attempts(con, analyzer_version)
-    if (n_retry > 0L) {
-      message(sprintf("packages to re-read under this analyzer: %d", n_retry))
-    }
+    message(sprintf("packages to re-read under this analyzer: %d", n_retry))
     # The packages this build has already been given MAX_ANALYZER_READ_ATTEMPTS
     # times and did not read. Both backfill queues below wait on fields only the
     # binary produces, so both would hand these back every run for good. They
@@ -933,7 +971,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                     n_datasets_unreadable = .n_datasets_unreadable(con),
                     # From the dataset database rather than this one: it is a
                     # count of catalog entries, not of packages.
-                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con))
+                    n_datasets_unmeasured = .n_datasets_unmeasured(data_con),
+                    analyzer_version = analyzer_version,
+                    output_class = I(output_class),
+                    n_latest_on_build = .n_latest_on_class(con, analyzer_version)[["on_class"]])
 
   # When this run moved nothing, the moment the data last moved is whatever the
   # previous manifest recorded. Carrying it forward is what lets last_checked
@@ -996,7 +1037,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_remaining = length(remaining_after), n_fresh = length(fresh_pkgs),
                       n_shard = length(shard_pkgs),
                       n_versions = nrow(fresh_summary),
-                      shard_failures = length(shard_failures)))
+                      shard_failures = length(shard_failures),
+                      analyzer_version = bootstrap$analyzer_version,
+                      output_class = bootstrap$output_class,
+                      n_latest_on_build = bootstrap$n_latest_on_build))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)

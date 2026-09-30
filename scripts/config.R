@@ -38,6 +38,11 @@ WORK_DIR           <- "work"
 # as the reader it was measured against.
 MAX_ANALYZER_READ_ATTEMPTS <- 2L
 
+# Builds whose output the pinned build reproduces record for record, as the
+# analyzer gate report quoted in the pin PR shows. A build not listed stands
+# alone, so leaving one out costs a rescan and never skips one.
+ANALYZER_SAME_OUTPUT <- c("0.5.0")
+
 SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
