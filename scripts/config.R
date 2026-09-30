@@ -107,6 +107,21 @@ MAX_DATASET_COLUMNS_BYTES <- 4 * 1024^2
   })
 }
 
+# A failure reason safe to print or store: tokens replaced by ***, bytes that
+# are not UTF-8 written as <xx>, one line, at most max_bytes.
+.redact_reason <- function(x, max_bytes = 512L) {
+  s <- paste(as.character(x[!is.na(x)]), collapse = "\n")
+  s <- iconv(s, from = "UTF-8", to = "UTF-8", sub = "byte")
+  s <- gsub("x-access-token:[^@]*@", "***", s, perl = TRUE)
+  s <- gsub("gh[pousr]_[A-Za-z0-9]+", "***", s, perl = TRUE)
+  s <- gsub("github_pat_[A-Za-z0-9_]+", "***", s, perl = TRUE)
+  s <- gsub("[[:space:]]+", " ", trimws(s))
+  if (nchar(s, type = "bytes") <= max_bytes) return(s)
+  chars <- strsplit(s, "")[[1L]]
+  keep  <- cumsum(nchar(chars, type = "bytes")) <= max_bytes - 3L
+  paste0(paste(chars[keep], collapse = ""), "...")
+}
+
 # Bioconductor rows describe the release branch as git holds it, before R CMD build.
 ANALYZER_INPUT_KIND <- "git"
 
