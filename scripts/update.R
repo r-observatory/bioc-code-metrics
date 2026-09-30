@@ -926,6 +926,69 @@ default_io <- function() {
 }
 
 # ---------------------------------------------------------------------------
+# Worker telemetry: each package's analyzer directory and phase times
+# ---------------------------------------------------------------------------
+
+# Whether RPA_CACHE turns the analyzer's cache off; every spelling of "no" counts.
+.analyzer_cache_off <- function(value = Sys.getenv("RPA_CACHE", unset = "")) {
+  tolower(trimws(value)) %in% c("off", "false", "no", "0")
+}
+
+# Put environment variables back as Sys.getenv(names, unset = NA) read them.
+.restore_envvars <- function(old) {
+  for (nm in names(old)) {
+    if (is.na(old[[nm]])) Sys.unsetenv(nm)
+    else do.call(Sys.setenv, stats::setNames(list(old[[nm]]), nm))
+  }
+  invisible(NULL)
+}
+
+# f, adding its elapsed seconds to the worker tally under `name`; f's value,
+# attributes included, is unchanged.
+.timed_phase <- function(name, f) {
+  force(f)
+  function(...) {
+    t0 <- proc.time()[["elapsed"]]
+    on.exit(.tally_add(name, .secs_since(t0)), add = TRUE)
+    f(...)
+  }
+}
+
+# worker, run in WORK_DIR/.rpa/<pkg> (no clone can land there): RPKG_ANALYZER_STATS
+# names a file and, unless RPA_CACHE is off, RPKG_ANALYZER_CACHE_DIR a cache; builds
+# before 0.5.1 read neither. A list result gains `tally` and `analyzer_stats`.
+.with_worker_telemetry <- function(worker) {
+  force(worker)
+  function(pkg) {
+    t0 <- proc.time()[["elapsed"]]
+    .tally_reset()
+    rpa   <- file.path(WORK_DIR, ".rpa", pkg)
+    stats <- file.path(rpa, "stats.ndjson")
+    old   <- Sys.getenv(c("RPKG_ANALYZER_CACHE_DIR", "RPKG_ANALYZER_STATS"),
+                        unset = NA_character_, names = TRUE)
+    on.exit({
+      .restore_envvars(old)
+      unlink(rpa, recursive = TRUE, force = TRUE)
+    }, add = TRUE)
+    Sys.unsetenv(c("RPKG_ANALYZER_CACHE_DIR", "RPKG_ANALYZER_STATS"))
+    dir.create(file.path(rpa, "cache"), recursive = TRUE, showWarnings = FALSE)
+    if (dir.exists(rpa)) {
+      rpa   <- normalizePath(rpa)
+      stats <- file.path(rpa, "stats.ndjson")
+      Sys.setenv(RPKG_ANALYZER_STATS = stats)
+      if (!.analyzer_cache_off()) Sys.setenv(RPKG_ANALYZER_CACHE_DIR = file.path(rpa, "cache"))
+    }
+    res <- worker(pkg)
+    .tally_add("package_s", .secs_since(t0))
+    if (is.list(res)) {
+      res$tally <- .tally_snapshot()
+      res$analyzer_stats <- if (file.exists(stats)) readLines(stats, warn = FALSE) else character(0L)
+    }
+    res
+  }
+}
+
+# ---------------------------------------------------------------------------
 # run_update
 # ---------------------------------------------------------------------------
 
@@ -1180,6 +1243,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
+  # Each clone's seconds go to the worker tally; its value and status do not change.
+  io$clone <- .timed_phase("clone_s", io$clone)
+
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
   # package failed, list(package, ok = FALSE, stage, elapsed, reason).
@@ -1245,7 +1311,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
          text = res$text, binary_versions = res$binary_versions)
   }
 
-  results <- parallel::mclapply(shard_pkgs, .pkg_worker,
+  results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),
                                 mc.cores       = ANALYSIS_CORES,
                                 mc.preschedule = FALSE)
 

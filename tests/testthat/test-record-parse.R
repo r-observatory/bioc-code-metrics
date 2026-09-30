@@ -177,3 +177,15 @@ test_that("a cap while parsing a long line with a memo parses it again and keeps
   expect_identical(parse_analyzer_records(lines, memo), want)
   expect_identical(parse_analyzer_records(lines, memo), want)
 })
+
+test_that("the worker tally counts memo hits and misses, and incomplete parses", {
+  .tally_reset()
+  memo  <- .record_memo()
+  lines <- c(.long_dataset_line("x"), .long_dataset_line("y"))
+  parse_analyzer_records(lines, memo)
+  parse_analyzer_records(lines, memo)
+  expect_s3_class(tryCatch(parse_analyzer_records("not json"), error = function(e) e),
+                  "analyzer_parse_incomplete")
+  expect_identical(.tally_snapshot()[c("incomplete_parses", "memo_hits", "memo_misses")],
+                   list(incomplete_parses = 1, memo_hits = 2, memo_misses = 2))
+})

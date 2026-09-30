@@ -45,6 +45,28 @@ analyzer_at_least <- function(v, min) {
   utils::compareVersion(lead, min) >= 0L
 }
 
+# Seconds and counts one worker adds up for its package, by name; each fork has
+# its own copy, which .with_worker_telemetry in update.R resets and reads.
+.WORKER_TALLY <- new.env(parent = emptyenv())
+
+.tally_reset <- function() {
+  rm(list = ls(.WORKER_TALLY, all.names = TRUE), envir = .WORKER_TALLY)
+  invisible(NULL)
+}
+
+.tally_add <- function(name, x) {
+  assign(name, (get0(name, envir = .WORKER_TALLY, inherits = FALSE) %||% 0) + x,
+         envir = .WORKER_TALLY)
+  invisible(NULL)
+}
+
+.tally_snapshot <- function() {
+  mget(sort(ls(.WORKER_TALLY, all.names = TRUE)), envir = .WORKER_TALLY)
+}
+
+# Seconds since t0, a proc.time()[["elapsed"]] reading.
+.secs_since <- function(t0) proc.time()[["elapsed"]] - t0
+
 # Extract one scalar field from a parsed NDJSON record, defaulting to NA.
 # With simplifyVector = FALSE, scalar JSON values decode to length-1 atomics.
 .rec_chr <- function(rec, key) {
@@ -263,7 +285,10 @@ analyzer_at_least <- function(v, min) {
 
   # A record that did not parse is not dropped: the package fails, and its
   # stored rows stay as they were.
-  if (n_bad > 0L) stop(.analyzer_parse_incomplete(n_bad, first_bad))
+  if (n_bad > 0L) {
+    .tally_add("incomplete_parses", 1)
+    stop(.analyzer_parse_incomplete(n_bad, first_bad))
+  }
 
   functions <- data.frame(
     lang = fn$lang, name = fn$name, exported = fn$exported,
@@ -400,6 +425,7 @@ analyzer_at_least <- function(v, min) {
     if (is.null(hit)) hit <- get0(key, envir = memo$prev, inherits = FALSE)
     if (!is.null(hit)) {
       assign(key, hit, envir = memo$cur)
+      .tally_add("memo_hits", 1)
       return(list(ok = TRUE, value = hit))
     }
   }
@@ -414,7 +440,10 @@ analyzer_at_least <- function(v, min) {
   if (failed) return(list(ok = FALSE, value = NULL))
   if (identical(.record_kind(p), "dataset")) {
     p <- .dataset_flat(p)
-    if (!is.null(key)) assign(key, p, envir = memo$cur)
+    if (!is.null(key)) {
+      assign(key, p, envir = memo$cur)
+      .tally_add("memo_misses", 1)
+    }
   }
   list(ok = TRUE, value = p)
 }
@@ -541,15 +570,19 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) {
 
   # A non-zero exit (a panic, an OOM kill) signals a warning and leaves a
   # status, and either gives the R fallback rather than a partial parse.
+  t0  <- proc.time()[["elapsed"]]
   out <- .retry_after_time_limit(
     tryCatch(system2(bin, c(shQuote(dir), "--input-kind", kind),
                      stdout = TRUE, stderr = FALSE),
              warning = function(w) NULL),
     error = function(e) NULL)
+  .tally_add("analyzer_s", .secs_since(t0))
   if (!is.null(attr(out, "status"))) out <- NULL
   if (is.null(out) || length(out) == 0L) return(NULL)
 
+  t0 <- proc.time()[["elapsed"]]
   parsed <- parse_analyzer_records(out, memo)
+  .tally_add("parse_s", .secs_since(t0))
   if (is.null(parsed$summary)) return(NULL)
 
   metrics <- parsed$summary

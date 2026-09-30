@@ -571,6 +571,7 @@ analyze_package <- function(repo_dir, package) {
     # Per-version work is wrapped in local() so on.exit fires per iteration
     # rather than accumulating in the outer function's exit handlers.
     # This ensures temp-dir cleanup even when the loop body throws.
+    t_version <- proc.time()[["elapsed"]]
     iter <- local({
       tmp <- tempfile(pattern = paste0("ccm_", package, "_"))
       dir.create(tmp, recursive = TRUE)
@@ -579,11 +580,13 @@ analyze_package <- function(repo_dir, package) {
       # A version that cannot be extracted fails the whole package, so every
       # stored row stays as it was. A cap that fires here extracts again into
       # an emptied directory.
+      t_extract <- proc.time()[["elapsed"]]
       files <- .retry_after_time_limit({
         unlink(list.files(tmp, all.files = TRUE, no.. = TRUE, full.names = TRUE),
                recursive = TRUE, force = TRUE)
         extract_version(repo_dir, ref, tmp)
       }, error = function(e) stop(e))
+      .tally_add("extract_s", .secs_since(t_extract))
 
       # Build a read_fn closed over this iteration's extraction directory
       read_fn <- local({
@@ -740,6 +743,7 @@ analyze_package <- function(repo_dir, package) {
            text_row = text_row, from_binary = binary_ran)
     })
 
+    .tally_add("versions_s", .secs_since(t_version))
     summary_rows[[i]]       <- iter$safe_metrics
     api_rows[[i]]           <- iter$api_row
     functions_rows[[i]]     <- iter$functions_row
