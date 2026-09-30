@@ -198,32 +198,9 @@ analyzer_at_least <- function(v, min) {
   iconv(rawToChar(b), from = "UTF-8", to = "UTF-8", sub = "byte")
 }
 
-#' Parse a full NDJSON analyzer stream into summary + detail frames.
-#'
-#' Reads every line (unlike the historical parser, which stopped at the summary)
-#' and dispatches on each record's "rec" field:
-#'   - "summary"   -> the first such record, flattened to length-1 scalars.
-#'   - "function"  -> one row in the functions frame. Compiled languages
-#'                    (c/cpp/rust/fortran) carry NA for exported/n_params/
-#'                    cyclocomp, which R functions populate.
-#'   - "call_edge" -> one row in the edges frame.
-#'   - "dataset"   -> one row in the datasets frame.
-#'   - "dcf"       -> the first such record, as a named character vector.
-#'   - "release_notes" -> the first such record, as a list.
-#' Record types not named here are skipped. Blank lines are skipped; any other
-#' line that does not parse raises analyzer_parse_incomplete once all lines
-#' have been read.
-#'
-#' @param lines Character vector of NDJSON lines (analyzer stdout).
-#' @return A list:
-#'   $summary   flattened named list, or NULL if no summary record was present.
-#'   $functions data.frame(lang, name, exported, file, line, loc, n_params,
-#'              cyclocomp); zero rows when the stream has no function records.
-#'   $edges     data.frame(graph, from, to); zero rows when none present.
-#'   $datasets  data.frame of dataset records.
-#'   $dcf       DESCRIPTION fields; character(0) for an empty record, NULL for none.
-#'   $release_notes the release_notes record, or NULL.
-parse_analyzer_records <- function(lines) {
+# The parser that reads one line at a time: the fallback that counts and names
+# a line that does not parse, and the result parse_analyzer_records must equal.
+.parse_records_per_line <- function(lines) {
   summ <- NULL
   fn <- list(lang = character(0L), name = character(0L), exported = logical(0L),
              file = character(0L), line = integer(0L), loc = integer(0L),
@@ -306,6 +283,210 @@ parse_analyzer_records <- function(lines) {
     datasets  = .datasets_frame(ds_recs),
     dcf       = dcf,
     release_notes = notes
+  )
+}
+
+# Lines this long or longer are parsed one at a time; shorter ones together.
+.RECORD_LONG_BYTES <- 4096L
+
+# A parsed record's "rec" string, or NA. A value that is not a list errors here
+# exactly where the per-line parser's parsed[["rec"]] does.
+.record_kind <- function(p) {
+  if (is.null(p)) return(NA_character_)
+  if (inherits(p, "dataset_flat")) return("dataset")
+  rec <- p[["rec"]]
+  if (is.character(rec) && length(rec) == 1L && !is.na(rec) && is.null(attributes(rec))) {
+    rec
+  } else {
+    NA_character_
+  }
+}
+
+# A dataset record as .datasets_frame_flat reads it, a pure function of the
+# record: its field names, each scalar as parsed, the JSON .datasets_frame
+# writes for each nested value, and n_cols.
+.dataset_flat <- function(rec) {
+  keys   <- setdiff(names(rec), "rec")
+  vals   <- lapply(keys, function(k) rec[[k]])
+  nested <- vapply(vals, function(v) !is.null(v) && (is.list(v) || length(v) != 1L),
+                   logical(1L))
+  json   <- rep(NA_character_, length(keys))
+  json[nested] <- vapply(vals[nested], function(v) {
+    as.character(jsonlite::toJSON(v, auto_unbox = TRUE, null = "null"))
+  }, character(1L))
+  vals[nested] <- list(NULL)
+  names(vals)   <- keys
+  names(nested) <- keys
+  names(json)   <- keys
+  cols <- rec[["columns"]]
+  structure(list(names = names(rec), vals = vals, nested = nested, json = json,
+                 n_cols = if (is.null(cols)) NA_integer_ else length(cols)),
+            class = "dataset_flat")
+}
+
+# .datasets_frame over flattened records, with the same result. The choices
+# that span records (which keys are nested anywhere, the JSON of a scalar in a
+# nested column, each column's type) are made here, per version.
+.datasets_frame_flat <- function(flats) {
+  n <- length(flats)
+  out <- list()
+  if (n) {
+    keys <- setdiff(unique(unlist(lapply(flats, function(f) f$names), use.names = FALSE)), "rec")
+    for (k in keys) {
+      vals   <- lapply(flats, function(f) f$vals[[k]])
+      nested <- vapply(flats, function(f) isTRUE(f$nested[k]), logical(1L))
+      if (any(nested)) {
+        out[[k]] <- vapply(seq_len(n), function(i) {
+          if (nested[[i]]) return(flats[[i]]$json[[k]])
+          v <- vals[[i]]
+          if (is.null(v)) NA_character_
+          else as.character(jsonlite::toJSON(v, auto_unbox = TRUE, null = "null"))
+        }, character(1L))
+        next
+      }
+      present <- vals[!vapply(vals, is.null, logical(1L))]
+      out[[k]] <- if (!length(present)) {
+        rep(NA, n)
+      } else if (all(vapply(present, is.logical, logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA else as.logical(v)[[1L]], logical(1L))
+      } else if (all(vapply(present, function(v) is.numeric(v) && !is.na(v) &&
+                                                 v == trunc(v) && abs(v) < .Machine$integer.max,
+                            logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA_integer_ else as.integer(v)[[1L]], integer(1L))
+      } else if (all(vapply(present, is.numeric, logical(1L)))) {
+        vapply(vals, function(v) if (is.null(v)) NA_real_ else as.numeric(v)[[1L]], numeric(1L))
+      } else {
+        vapply(vals, function(v) if (is.null(v)) NA_character_ else as.character(v)[[1L]], character(1L))
+      }
+    }
+    out[["n_cols"]] <- vapply(flats, function(f) f$n_cols, integer(1L))
+  }
+  for (k in names(.DATASET_BASE_COLS)) {
+    if (is.null(out[[k]])) {
+      out[[k]] <- rep(.DATASET_BASE_COLS[[k]][NA_integer_], n)
+    }
+  }
+  ord <- c(names(.DATASET_BASE_COLS), setdiff(names(out), names(.DATASET_BASE_COLS)))
+  out <- out[ord]
+  df <- as.data.frame(out, stringsAsFactors = FALSE, optional = TRUE)
+  names(df) <- ord
+  df
+}
+
+# One long line, parsed on its own; a dataset record comes back flattened.
+# Returns list(ok, value), with ok FALSE when the line does not parse.
+.parse_long_record <- function(line) {
+  failed <- FALSE
+  p <- .retry_after_time_limit(
+    jsonlite::fromJSON(line, simplifyVector = FALSE),
+    error = function(e) {
+      failed <<- TRUE
+      NULL
+    }
+  )
+  if (failed) return(list(ok = FALSE, value = NULL))
+  if (identical(.record_kind(p), "dataset")) p <- .dataset_flat(p)
+  list(ok = TRUE, value = p)
+}
+
+#' Parse a full NDJSON analyzer stream into summary + detail frames.
+#'
+#' Reads every line (unlike the historical parser, which stopped at the summary)
+#' and dispatches on each record's "rec" field:
+#'   - "summary"   -> the first such record, flattened to length-1 scalars.
+#'   - "function"  -> one row in the functions frame. Compiled languages
+#'                    (c/cpp/rust/fortran) carry NA for exported/n_params/
+#'                    cyclocomp, which R functions populate.
+#'   - "call_edge" -> one row in the edges frame.
+#'   - "dataset"   -> one row in the datasets frame.
+#'   - "dcf"       -> the first such record, as a named character vector.
+#'   - "release_notes" -> the first such record, as a list.
+#' Record types not named here are skipped. Blank lines are skipped; any other
+#' line that does not parse raises analyzer_parse_incomplete once all lines
+#' have been read.
+#'
+#' Lines under .RECORD_LONG_BYTES are parsed in one call and longer ones one at
+#' a time; the frames are built from the records in line order. The result is
+#' identical to .parse_records_per_line(lines), which takes over whenever the
+#' stream cannot be read this way.
+#'
+#' @param lines Character vector of NDJSON lines (analyzer stdout).
+#' @return A list:
+#'   $summary   flattened named list, or NULL if no summary record was present.
+#'   $functions data.frame(lang, name, exported, file, line, loc, n_params,
+#'              cyclocomp); zero rows when the stream has no function records.
+#'   $edges     data.frame(graph, from, to); zero rows when none present.
+#'   $datasets  data.frame of dataset records.
+#'   $dcf       DESCRIPTION fields; character(0) for an empty record, NULL for none.
+#'   $release_notes the release_notes record, or NULL.
+parse_analyzer_records <- function(lines) {
+  lines  <- lines[grepl("[^[:space:]]", lines, useBytes = TRUE)]
+  long   <- nchar(lines, type = "bytes") >= .RECORD_LONG_BYTES
+  parsed <- vector("list", length(lines))
+  short  <- which(!long)
+  if (length(short)) {
+    batch <- .retry_after_time_limit(
+      jsonlite::fromJSON(paste0("[", paste(lines[short], collapse = ","), "]"),
+                         simplifyVector = FALSE),
+      error = function(e) NULL
+    )
+    # A line that does not parse, or one holding two values, sends the stream
+    # through the per-line parser, which counts and names the bad line.
+    if (!is.list(batch) || length(batch) != length(short)) {
+      return(.parse_records_per_line(lines))
+    }
+    parsed[short] <- batch
+  }
+  for (i in which(long)) {
+    one <- .parse_long_record(lines[[i]])
+    if (!one$ok) return(.parse_records_per_line(lines))
+    parsed[i] <- list(one$value)
+  }
+
+  kinds <- vapply(parsed, .record_kind, character(1L))
+  first <- function(kind) {
+    i <- match(kind, kinds)
+    if (is.na(i)) NULL else parsed[[i]]
+  }
+  fns <- parsed[kinds %in% "function"]
+  egs <- parsed[kinds %in% "call_edge"]
+  ds  <- lapply(parsed[kinds %in% "dataset"], function(p) {
+    if (inherits(p, "dataset_flat")) p else .dataset_flat(p)
+  })
+  summ <- first("summary")
+  dcf  <- first("dcf")
+  if (!is.null(dcf)) {
+    # An empty record still says the DESCRIPTION was read, so it stays character(0).
+    fields <- dcf[setdiff(names(dcf), "rec")]
+    dcf <- vapply(fields, function(v) if (is.null(v)) NA_character_ else as.character(v)[[1L]],
+                  character(1L))
+  }
+
+  functions <- data.frame(
+    lang      = vapply(fns, .rec_chr, character(1L), key = "lang"),
+    name      = vapply(fns, .rec_chr, character(1L), key = "name"),
+    exported  = vapply(fns, .rec_lgl, logical(1L),   key = "exported"),
+    file      = vapply(fns, .rec_chr, character(1L), key = "file"),
+    line      = vapply(fns, .rec_int, integer(1L),   key = "line"),
+    loc       = vapply(fns, .rec_int, integer(1L),   key = "loc"),
+    n_params  = vapply(fns, .rec_int, integer(1L),   key = "n_params"),
+    cyclocomp = vapply(fns, .rec_int, integer(1L),   key = "cyclocomp"),
+    stringsAsFactors = FALSE
+  )
+  edges <- data.frame(
+    graph = vapply(egs, .rec_chr, character(1L), key = "graph"),
+    from  = vapply(egs, .rec_chr, character(1L), key = "from"),
+    to    = vapply(egs, .rec_chr, character(1L), key = "to"),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    summary   = if (is.null(summ)) NULL else .flatten_summary(summ),
+    functions = functions,
+    edges     = edges,
+    datasets  = .datasets_frame_flat(ds),
+    dcf       = dcf,
+    release_notes = first("release_notes")
   )
 }
 

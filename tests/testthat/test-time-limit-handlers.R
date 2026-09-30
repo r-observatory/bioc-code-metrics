@@ -34,7 +34,7 @@ test_that("every allowlisted handler is still there, exactly once", {
 
 test_that("the scan sees every wrapped handler, so it cannot pass by reading nothing", {
   inv <- .worker_handler_inventory()
-  expect_identical(attr(inv, "n_retry"), 35L)
+  expect_identical(attr(inv, "n_retry"), 37L)
   expect_identical(sum(inv$flagged), nrow(.HANDLER_ALLOWLIST))
 })
 
