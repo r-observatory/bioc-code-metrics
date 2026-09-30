@@ -30,3 +30,13 @@ test_that("PIPELINE_RUN_ID is set in the shard step's env and in no other step",
   expect_identical(grep("PIPELINE_RUN_ID", step, value = TRUE, fixed = TRUE),
                    "          PIPELINE_RUN_ID: ${{ github.run_id }}")
 })
+
+test_that("the shard loop stops where shard_loop_done says, and nowhere else", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl("if shard_loop_done out/run-status.json; then", yml, fixed = TRUE)))
+  expect_false(any(grepl('[ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]', yml,
+                         fixed = TRUE)))
+  expect_true(any(grepl("Time budget reached", yml, fixed = TRUE)))
+  sh <- readLines(file.path("..", "..", "scripts", "publish.sh"))
+  expect_length(grep("^shard_loop_done\\(\\) \\{", sh), 1L)
+})

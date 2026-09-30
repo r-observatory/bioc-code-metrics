@@ -259,8 +259,9 @@ jobs:
               published=1
             fi
 
-            if [ "$COMPLETE" = "true" ] || [ "$CHANGED" != "true" ]; then
-              echo "Nothing left to do (complete=${COMPLETE}, changed=${CHANGED})."
+            # scripts/publish.sh says when the loop is done, and why a drained
+            # queue ends it.
+            if shard_loop_done out/run-status.json; then
               break
             fi
             [ "$SECONDS" -ge "$BUDGET" ] && { echo "Time budget reached."; break; }

@@ -958,3 +958,21 @@ sweep_swap_leftovers() {
     done <<< "$names"
   done <<< "$rows"
 }
+
+# Whether the shard loop is done, read from run-status.json. A failed package waits for
+# the next run, so a drained queue ends this run's work; an unreadable file stops it too.
+shard_loop_done() {  # $1=run-status.json
+  local vals complete changed remaining shard
+  if ! vals=$(jq -r '[.bootstrap_complete, .changed, .n_remaining, .n_shard]
+                     | map(tostring) | join(" ")' "$1" 2>/dev/null) || [ -z "$vals" ]; then
+    echo "::warning::could not read $1; stopping the shard loop."
+    return 0
+  fi
+  read -r complete changed remaining shard <<< "$vals"
+  if [ "$complete" = "false" ] && [ "$changed" = "true" ] &&
+     [[ "$remaining" =~ ^[1-9][0-9]*$ ]] && [[ "$shard" =~ ^[1-9][0-9]*$ ]]; then
+    return 1
+  fi
+  echo "Nothing left to do (complete=${complete}, changed=${changed}, remaining=${remaining}, shard=${shard})."
+  return 0
+}
