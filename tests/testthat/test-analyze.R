@@ -134,3 +134,18 @@ test_that("analyze_package produces summary/churn/api data.frames from a local r
   expect_s3_class(result$churn, "data.frame")
   expect_true("package" %in% colnames(result$churn))
 })
+
+test_that("a cap inside one R-fallback group runs the group again rather than NA", {
+  file_map <- list(
+    "DESCRIPTION" = "Package: p\nVersion: 1.0\nImports: stats\n",
+    "NAMESPACE"   = "export(f)\n",
+    "R/f.R"       = "f <- function(x) x + 1\n"
+  )
+  mk  <- function() build_context("p", "1.0", "1.0", "2024-01-01",
+                                  names(file_map), function(p) file_map[[p]] %||% "")
+  want <- analyze_version(mk())
+  groups <- METRIC_GROUPS
+  groups$meta <- .fires_cap_once(groups$meta)
+  .local_global("METRIC_GROUPS", groups)
+  expect_identical(analyze_version(mk()), want)
+})

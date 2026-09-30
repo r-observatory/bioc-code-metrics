@@ -303,3 +303,13 @@ test_that("valid UTF-8 parses exactly as it did before decoding existed", {
   }
   expect_identical(parse_dcf(NULL), .parse_dcf_before_decoding(NULL))
 })
+
+test_that("a cap while reading a file reads it again rather than as empty", {
+  map <- list(DESCRIPTION = "Package: p\nVersion: 1.0\n",
+              NAMESPACE   = "export(foo)\nexport(bar)\n")
+  read_fn <- .fires_cap_once(function(p) map[[p]] %||% "",
+                             when = function(p) identical(p, "NAMESPACE"))
+  ctx <- build_context("p", "1.0", "1.0", "2024-01-01", names(map), read_fn)
+  # An empty NAMESPACE here would read as every export removed.
+  expect_identical(ctx$namespace$exports, c("foo", "bar"))
+})

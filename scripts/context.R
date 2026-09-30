@@ -208,7 +208,7 @@ build_context <- function(package, version, ref, date, files, read_fn,
   read_memo <- function(path) {
     cached <- .cache[[path]]
     if (!is.null(cached)) return(cached)
-    content <- tryCatch(read_fn(path), error = function(e) "")
+    content <- .retry_after_time_limit(read_fn(path), error = function(e) "")
     if (is.null(content) || length(content) == 0L) content <- ""
     .cache[[path]] <- content
     content
