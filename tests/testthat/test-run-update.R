@@ -837,3 +837,94 @@ test_that("a worker's tally holds the seconds of each phase it ran, and the stat
   expect_true(all(unlist(res$tally) >= 0))
   expect_length(res$analyzer_stats, 2L)
 })
+
+# ---------------------------------------------------------------------------
+# The shard's analyzer statistics and worker time
+# ---------------------------------------------------------------------------
+
+.run_status <- function(out_dir) {
+  jsonlite::fromJSON(file.path(out_dir, "run-status.json"), simplifyVector = FALSE)
+}
+
+test_that("the shard sums the analyzer's statistics lines and prints them with the worker time", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      STUB_SEEN = NA, RPA_CACHE = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB"), latest_version = c("1.1", "1.0"),
+                       stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"), pkgB = "1.0")),
+    out_dir, shard_size = 10L))
+
+  st <- .run_status(out_dir)
+  expect_identical(st$analyzer_stats$runs, 3L)
+  expect_identical(st$analyzer_stats$builds, "0.5.1-test")
+  expect_equal(st$analyzer_stats$ms, 4501.5)
+  expect_equal(st$analyzer_stats$compiled_files, 12)
+  expect_equal(st$analyzer_stats$compiled_hits, 9)
+  expect_identical(st$analyzer_stats$incomplete_parses, 0L)
+  expect_true(paste("analyzer: 3 versions in 5 s; compiled 12 files (75.0% reused);",
+                    "cache errors 0; verify mismatches 0; incomplete parses 0") %in% log)
+  expect_true(any(startsWith(log, "worker time: clone ")))
+  expect_identical(st$worker_phases$packages, 2L)
+  expect_true(all(unlist(st$worker_phases) >= 0))
+  expect_setequal(names(st$worker_phases),
+                  c("packages", "clone_s", "extract_s", "analyzer_s", "parse_s", "metrics_s",
+                    "other_s", "dataset_memo_hits", "dataset_memo_misses"))
+  published <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"), simplifyVector = FALSE)
+  expect_false(any(c("analyzer_stats", "worker_phases") %in%
+                     c(names(published), names(published$bootstrap))))
+})
+
+test_that("a build before 0.5.1 reports no statistics, and the shard says so", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir()))
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_true("analyzer: no statistics from this build; incomplete parses 0" %in% log)
+  expect_identical(.run_status(out_dir)$analyzer_stats$runs, 0L)
+})
+
+test_that("a package whose analyzer line does not parse is counted as an incomplete parse", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir(), "1.0"))
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_identical(.run_status(out_dir)$analyzer_stats$incomplete_parses, 1L)
+  expect_true("analyzer: no statistics from this build; incomplete parses 1" %in% log)
+})
+
+test_that("a statistics line cut short or unreadable is counted, not summed", {
+  good <- '{"build":"0.5.1","ms":10,"compiled":{"files":2,"hits":1},"cache_errors":1}'
+  s <- .sum_analyzer_stats(c(good, substr(good, 1L, 30L), "", "garbage", good))
+  expect_identical(s$runs, 2L)
+  expect_identical(s$unreadable, 3L)
+  expect_equal(c(s$ms, s$compiled_files, s$compiled_hits, s$cache_errors), c(20, 4, 2, 2))
+  expect_identical(s$builds, "0.5.1")
+})
+
+test_that("a fork that crashed adds nothing, and the phases add up to the package time", {
+  tel <- .shard_telemetry(list(
+    structure("boom", class = "try-error"), NULL,
+    list(tally = list(package_s = 10, clone_s = 1, versions_s = 8, extract_s = 1,
+                      analyzer_s = 4, parse_s = 1),
+         analyzer_stats = character(0L))))
+  expect_identical(tel$phases$packages, 1L)
+  expect_equal(unlist(tel$phases[c("clone_s", "extract_s", "analyzer_s", "parse_s",
+                                   "metrics_s", "other_s")]),
+               c(clone_s = 1, extract_s = 1, analyzer_s = 4, parse_s = 1,
+                 metrics_s = 2, other_s = 1))
+  expect_identical(tel$analyzer$runs, 0L)
+  expect_identical(.worker_phase_line(tel$phases), paste(
+    "worker time: clone 1.0 s, extract 1.0 s, analyzer 4.0 s, record parse 1.0 s,",
+    "metrics 2.0 s, other 1.0 s"))
+})
