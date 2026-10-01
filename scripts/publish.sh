@@ -959,9 +959,10 @@ sweep_swap_leftovers() {
   done <<< "$rows"
 }
 
-# Export ANALYSIS_CORES for the shards when the dispatch gave a core count. An
-# empty one exports nothing: scripts/config.R would read "" as NA.
-set_analysis_cores() {  # $1=the analysis_cores input
+# Export ANALYSIS_CORES for the shards when the dispatch input, or else the
+# ANALYSIS_CORES repository variable, gave a core count. An empty one exports
+# nothing: scripts/config.R would read "" as NA.
+set_analysis_cores() {  # $1=the core count, or empty
   [ -n "$1" ] || return 0
   if ! [[ "$1" =~ ^[1-9][0-9]{0,2}$ ]]; then
     echo "::error::analysis_cores must be a whole number from 1 to 999, got '$1'."

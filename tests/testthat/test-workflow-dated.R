@@ -81,11 +81,20 @@ test_that("the job outlasts the budget by more than one package's time limit", {
   expect_gt(limit_s - 16800L, .config_under()$WORKER_TIMEOUT)
 })
 
-test_that("the core count input reaches the shards through set_analysis_cores alone", {
+test_that("the core count of a dispatch, or of the repository variable, reaches the shards through set_analysis_cores alone", {
   yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
-  expect_true(any(grepl("^      analysis_cores:$", yml)))
-  uses <- trimws(grep("inputs.analysis_cores", yml, value = TRUE, fixed = TRUE))
-  expect_identical(uses, "CORES_INPUT: ${{ inputs.analysis_cores }}")
+  at <- grep("^      analysis_cores:$", yml)
+  expect_length(at, 1L)
+  expect_identical(yml[at + 1L], paste0(
+    '        description: "Packages to analyse at once, from 1 to 999 (empty: the ',
+    'ANALYSIS_CORES repository variable when set, otherwise every logical core)."'))
+  # A scheduled run has no inputs, so its count is the variable's. With neither
+  # set the value is empty, and every logical core is used.
+  cores <- "CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}"
+  for (source in c("inputs.analysis_cores", "vars.ANALYSIS_CORES")) {
+    expect_identical(trimws(grep(source, yml, value = TRUE, fixed = TRUE)), cores,
+                     info = source)
+  }
   # Never a key of an env block, where an empty input would set it to "".
   expect_false(any(grepl("^\\s*ANALYSIS_CORES\\s*:", yml)))
   set  <- which(yml == '          set_analysis_cores "${CORES_INPUT:-}" || exit 1')
