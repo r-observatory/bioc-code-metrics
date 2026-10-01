@@ -308,13 +308,14 @@ jobs:
         if: ${{ github.event_name == 'schedule' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # "all" keeps every dated release. Legacy code-/data- releases are
-          # held too.
+          # "all" selects no release for deletion. scripts/prune.R stops on a
+          # value that is neither "all" nor digits, and the step fails.
           KEEP: "all"
         run: |
           set -euo pipefail
-          # Only the metrics- series is listed. Drafts are left out so they
-          # do not take one of the KEEP slots from a real release.
+          # Only the metrics- series is listed, so the legacy code-/data-
+          # releases are left as they are. Drafts are left out so they do not
+          # take one of the KEEP slots from a real release.
           gh release list --exclude-drafts --limit 1000 --json tagName -q '.[].tagName' \
             | { grep "^metrics-" || true; } \
             | Rscript scripts/prune.R \
