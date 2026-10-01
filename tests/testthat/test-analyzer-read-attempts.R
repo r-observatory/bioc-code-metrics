@@ -303,3 +303,25 @@ test_that("a build in the stored rows' output class re-queues nothing, and the r
   expect_identical(status$output_class, list("0.4.2-test"))
   expect_identical(status$n_latest_on_build, 1L)
 })
+
+test_that("0.4.0 rows still go back in the queue, and a move from 0.5.0 to 0.5.1 re-queues nothing", {
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_reading_analyzer(stub_dir, "0.4.0"))
+  out <- withr::local_tempdir()
+  io  <- .dsa_io()
+  expect_identical(suppressWarnings(run_update(io, out, shard_size = 10L))$n_fresh, 1L)
+
+  .dsa_reading_analyzer(stub_dir, "0.5.0")
+  on_050 <- .oc_messages(run_update(io, out, shard_size = 10L))
+  expect_true("dataset scans invalidated by analyzer change: 1" %in% on_050$messages)
+  expect_identical(on_050$value$n_fresh, 1L)
+
+  .dsa_reading_analyzer(stub_dir, "0.5.1")
+  on_051 <- .oc_messages(run_update(io, out, shard_size = 10L))
+  expect_true("dataset scans invalidated by analyzer change: 0" %in% on_051$messages)
+  expect_true("packages to re-read under this analyzer: 0" %in% on_051$messages)
+  expect_true(paste("analyzer 0.5.1, output class 0.5.0 0.5.1;",
+                    "latest rows on class: 1 of 1") %in% on_051$messages)
+  expect_identical(on_051$value$n_fresh, 0L)
+})
