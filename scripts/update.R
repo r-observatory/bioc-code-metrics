@@ -926,6 +926,143 @@ default_io <- function() {
 }
 
 # ---------------------------------------------------------------------------
+# Worker telemetry: each package's analyzer directory and phase times
+# ---------------------------------------------------------------------------
+
+# Whether RPA_CACHE turns the analyzer's cache off; every spelling of "no" counts.
+.analyzer_cache_off <- function(value = Sys.getenv("RPA_CACHE", unset = "")) {
+  tolower(trimws(value)) %in% c("off", "false", "no", "0")
+}
+
+# Put environment variables back as Sys.getenv(names, unset = NA) read them.
+.restore_envvars <- function(old) {
+  for (nm in names(old)) {
+    if (is.na(old[[nm]])) Sys.unsetenv(nm)
+    else do.call(Sys.setenv, stats::setNames(list(old[[nm]]), nm))
+  }
+  invisible(NULL)
+}
+
+# f, adding its elapsed seconds to the worker tally under `name`; f's value,
+# attributes included, is unchanged.
+.timed_phase <- function(name, f) {
+  force(f)
+  function(...) {
+    t0 <- proc.time()[["elapsed"]]
+    on.exit(.tally_add(name, .secs_since(t0)), add = TRUE)
+    f(...)
+  }
+}
+
+# worker, run in WORK_DIR/.rpa/<pkg> (no clone can land there): RPKG_ANALYZER_STATS
+# names a file and, unless RPA_CACHE is off, RPKG_ANALYZER_CACHE_DIR a cache; builds
+# before 0.5.1 read neither. A list result gains `tally` and `analyzer_stats`.
+.with_worker_telemetry <- function(worker) {
+  force(worker)
+  function(pkg) {
+    t0 <- proc.time()[["elapsed"]]
+    .tally_reset()
+    rpa   <- file.path(WORK_DIR, ".rpa", pkg)
+    stats <- file.path(rpa, "stats.ndjson")
+    old   <- Sys.getenv(c("RPKG_ANALYZER_CACHE_DIR", "RPKG_ANALYZER_STATS"),
+                        unset = NA_character_, names = TRUE)
+    on.exit({
+      .restore_envvars(old)
+      unlink(rpa, recursive = TRUE, force = TRUE)
+    }, add = TRUE)
+    Sys.unsetenv(c("RPKG_ANALYZER_CACHE_DIR", "RPKG_ANALYZER_STATS"))
+    dir.create(file.path(rpa, "cache"), recursive = TRUE, showWarnings = FALSE)
+    if (dir.exists(rpa)) {
+      rpa   <- normalizePath(rpa)
+      stats <- file.path(rpa, "stats.ndjson")
+      Sys.setenv(RPKG_ANALYZER_STATS = stats)
+      if (!.analyzer_cache_off()) Sys.setenv(RPKG_ANALYZER_CACHE_DIR = file.path(rpa, "cache"))
+    }
+    res <- worker(pkg)
+    .tally_add("package_s", .secs_since(t0))
+    if (is.list(res)) {
+      res$tally <- .tally_snapshot()
+      res$analyzer_stats <- if (file.exists(stats)) readLines(stats, warn = FALSE) else character(0L)
+    }
+    res
+  }
+}
+
+# The analyzer's statistics lines (RPKG_ANALYZER_STATS, 0.5.1 and later) summed
+# over a shard; a line that does not parse is counted as unreadable.
+.sum_analyzer_stats <- function(lines) {
+  out <- list(runs = 0L, unreadable = 0L, builds = "",
+              ms = 0, ms_compiled = 0, ms_r = 0, ms_tests = 0, ms_data = 0, ms_other = 0,
+              compiled_files = 0, compiled_hits = 0, r_files = 0, tests_files = 0,
+              data_files = 0, cache_errors = 0, verify_mismatch = 0)
+  num <- function(x) if (is.numeric(x) && length(x) == 1L && !is.na(x)) x else 0
+  builds <- character(0L)
+  for (l in lines) {
+    s <- tryCatch(jsonlite::parse_json(l), error = function(e) NULL)
+    if (!is.list(s) || !is.numeric(s$ms)) {
+      out$unreadable <- out$unreadable + 1L
+      next
+    }
+    out$runs <- out$runs + 1L
+    if (is.character(s$build) && length(s$build) == 1L) builds <- c(builds, s$build)
+    for (k in c("ms", "ms_compiled", "ms_r", "ms_tests", "ms_data", "ms_other",
+                "cache_errors", "verify_mismatch")) {
+      out[[k]] <- out[[k]] + num(s[[k]])
+    }
+    for (kind in c("compiled", "r", "tests", "data")) {
+      out[[paste0(kind, "_files")]] <- out[[paste0(kind, "_files")]] + num(s[[kind]]$files)
+    }
+    out$compiled_hits <- out$compiled_hits + num(s$compiled$hits)
+  }
+  out$builds <- paste(sort(unique(builds)), collapse = " ")
+  out
+}
+
+# A shard's analyzer statistics and worker time by phase, from the worker
+# results; a fork that crashed returned no list and adds nothing.
+.shard_telemetry <- function(results) {
+  rs <- Filter(is.list, results)
+  tally <- function(name) {
+    sum(vapply(rs, function(r) as.numeric(r$tally[[name]] %||% 0), numeric(1L)))
+  }
+  analyzer <- .sum_analyzer_stats(unlist(lapply(rs, function(r) r$analyzer_stats),
+                                         use.names = FALSE))
+  analyzer$incomplete_parses <- as.integer(tally("incomplete_parses"))
+  versions <- tally("versions_s")
+  phases <- list(
+    packages   = length(rs),
+    clone_s    = tally("clone_s"),
+    extract_s  = tally("extract_s"),
+    analyzer_s = tally("analyzer_s"),
+    parse_s    = tally("parse_s"),
+    metrics_s  = max(0, versions - tally("extract_s") - tally("analyzer_s") - tally("parse_s")),
+    other_s    = max(0, tally("package_s") - tally("clone_s") - versions),
+    dataset_memo_hits   = as.integer(tally("memo_hits")),
+    dataset_memo_misses = as.integer(tally("memo_misses")))
+  list(analyzer = analyzer, phases = phases)
+}
+
+# The shard's analyzer line for the run log.
+.analyzer_stats_line <- function(a) {
+  if (a$runs == 0L) {
+    return(sprintf("analyzer: no statistics from this build; incomplete parses %d",
+                   a$incomplete_parses))
+  }
+  sprintf(paste0("analyzer: %d versions in %.0f s; compiled %.0f files (%.1f%% reused); ",
+                 "cache errors %.0f; verify mismatches %.0f; incomplete parses %d"),
+          a$runs, a$ms / 1000, a$compiled_files,
+          if (a$compiled_files > 0) 100 * a$compiled_hits / a$compiled_files else 0,
+          a$cache_errors, a$verify_mismatch, a$incomplete_parses)
+}
+
+# The shard's worker time by phase for the run log.
+.worker_phase_line <- function(p) {
+  sprintf(paste0("worker time: clone %.1f s, extract %.1f s, analyzer %.1f s, ",
+                 "record parse %.1f s, metrics %.1f s, other %.1f s"),
+          p$clone_s, p$extract_s, p$analyzer_s, p$parse_s, p$metrics_s, p$other_s)
+}
+
+# ---------------------------------------------------------------------------
 # run_update
 # ---------------------------------------------------------------------------
 
@@ -1180,6 +1317,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
 
   if (!dir.exists(WORK_DIR)) dir.create(WORK_DIR, recursive = TRUE)
 
+  # Each clone's seconds go to the worker tally; its value and status do not change.
+  io$clone <- .timed_phase("clone_s", io$clone)
+
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
   # package failed, list(package, ok = FALSE, stage, elapsed, reason).
@@ -1245,7 +1385,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
          text = res$text, binary_versions = res$binary_versions)
   }
 
-  results <- parallel::mclapply(shard_pkgs, .pkg_worker,
+  results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),
                                 mc.cores       = ANALYSIS_CORES,
                                 mc.preschedule = FALSE)
 
@@ -1397,6 +1537,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     n_versions           = nrow(fresh_summary)
   )
 
+  # ---- 8a. Analyzer statistics and worker time ------------------------------
+  telemetry <- .shard_telemetry(results)
+  cat(.analyzer_stats_line(telemetry$analyzer), "\n",
+      .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
+
   # ---- 8b. Shard receipt ----------------------------------------------------
   # One-line closing summary, printed after the collection loop and before the
   # manifest is written, so the merged CI log shows what this shard accomplished.
@@ -1510,7 +1655,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_tried_skipped = length(tried_pkgs),
                       n_recheck_due = length(recheck_pkgs),
                       latest_by_build = .latest_by_build(con),
-                      run_id = run_id, last_changed = code_manifest$last_changed))
+                      run_id = run_id, last_changed = code_manifest$last_changed,
+                      analyzer_stats = telemetry$analyzer,
+                      worker_phases = telemetry$phases))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)

@@ -409,7 +409,7 @@ test_that(".parse_bioc_release extracts release_version from config.yaml lines",
 .with_binary_returning <- function(value, expr) {
   env <- environment(analyze_package)
   old <- get("analyze_with_binary", envir = env)
-  assign("analyze_with_binary", function(dir) value, envir = env)
+  assign("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) value, envir = env)
   on.exit(assign("analyze_with_binary", old, envir = env), add = TRUE)
   force(expr)
 }
@@ -483,7 +483,7 @@ test_that("a cap during extraction extracts again into an emptied directory", {
   repo <- tempfile("bcm_xc_")
   on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
   .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) NULL)
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) NULL)
   want <- suppressWarnings(analyze_package(repo, "pkgX"))
 
   real  <- extract_version
@@ -582,7 +582,7 @@ test_that("a cap in a per-release step of analyze_package changes nothing it ret
                        functions = .empty_functions_df()[, -(1:2), drop = FALSE],
                        edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
                        datasets  = .datasets_frame(list()))
-  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND) metrics)
+  .local_global("analyze_with_binary", function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) metrics)
   # read_at is the clock at each reading, so it differs between any two runs.
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")
@@ -715,4 +715,216 @@ test_that("the shard loop stops at the shard that drains its queue and publishes
   on.exit(DBI::dbDisconnect(con), add = TRUE)
   expect_identical(DBI::dbGetQuery(con,
     "SELECT consecutive_failures FROM bioc_metrics_failures WHERE package = 'pkgC'")[[1L]], 1L)
+})
+
+
+# ---------------------------------------------------------------------------
+# Each package's analyzer directory, and the worker's phase times
+# ---------------------------------------------------------------------------
+
+# A stub analyzer that reads every version and, as 0.5.1 does, appends one
+# statistics line to $RPKG_ANALYZER_STATS. Run by a worker (the statistics
+# variable set), it notes its cache directory, or "no-cache", in $STUB_SEEN.
+.stub_stats_bin <- function(dir) {
+  stub <- file.path(dir, "stub-stats.sh")
+  stats <- paste0('{\\"build\\":\\"0.5.1-test\\",\\"ms\\":1500.5,\\"ms_compiled\\":1000,',
+                  '\\"ms_r\\":300,\\"ms_tests\\":100,\\"ms_data\\":50,\\"ms_other\\":50.5,',
+                  '\\"compiled\\":{\\"files\\":4,\\"hits\\":3},\\"r\\":{\\"files\\":2,\\"hits\\":0},',
+                  '\\"tests\\":{\\"files\\":1,\\"hits\\":0},\\"data\\":{\\"files\\":0,\\"hits\\":0},',
+                  '\\"cache_errors\\":0,\\"verify_mismatch\\":0}')
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then echo "rpkg-analyzer 0.5.1-test"; exit 0; fi',
+    sprintf('echo "{\\"rec\\":\\"summary\\",\\"input_kind\\":\\"%s\\",\\"loc_r\\":1,\\"n_fns_r\\":1}"',
+            ANALYZER_INPUT_KIND),
+    sprintf('if [ -n "$RPKG_ANALYZER_STATS" ]; then echo "%s" >> "$RPKG_ANALYZER_STATS"; fi', stats),
+    'if [ -n "$STUB_SEEN" ] && [ -n "$RPKG_ANALYZER_STATS" ]; then echo "${RPKG_ANALYZER_CACHE_DIR:-no-cache}" >> "$STUB_SEEN"; fi',
+    "exit 0"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("each package's analyzer directory carries its cache, and goes when the package is done", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  seen <- withr::local_tempfile()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      STUB_SEEN = seen, RPA_CACHE = NA,
+                      RPKG_ANALYZER_STATS = NA, RPKG_ANALYZER_CACHE_DIR = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB"), latest_version = c("1.1", "1.0"),
+                       stringsAsFactors = FALSE)
+  capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"), pkgB = "1.0")),
+    out_dir, shard_size = 10L))
+  dirs <- readLines(seen)
+  expect_length(dirs, 3L)
+  expect_setequal(basename(dirname(dirs)), c("pkgA", "pkgB"))
+  expect_true(all(basename(dirs) == "cache"))
+  expect_true(all(basename(dirname(dirname(dirs))) == ".rpa"))
+  expect_false(any(dir.exists(dirname(dirs))))
+  expect_identical(Sys.getenv("RPKG_ANALYZER_STATS", unset = "unset"), "unset")
+})
+
+test_that("RPA_CACHE turns the cache off however it is spelled, and keeps the statistics file", {
+  expect_true(all(vapply(c("off", "OFF", " Off ", "false", "no", "0"),
+                         .analyzer_cache_off, logical(1L))))
+  expect_false(any(vapply(c("", "on", "true", "1", "yes"), .analyzer_cache_off, logical(1L))))
+
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  seen <- withr::local_tempfile()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      STUB_SEEN = seen, RPA_CACHE = "off")
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_identical(readLines(seen), "no-cache")
+})
+
+test_that("the analyzer directory of foo never touches the clone of a package named foo.rpa", {
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  other <- file.path(WORK_DIR, "foo.rpa")
+  dir.create(other)
+  writeLines("Package: foo.rpa", file.path(other, "DESCRIPTION"))
+  inside <- NULL
+  .with_worker_telemetry(function(pkg) {
+    inside <<- Sys.getenv("RPKG_ANALYZER_STATS")
+    list(package = pkg, ok = TRUE)
+  })("foo")
+  expect_identical(basename(dirname(inside)), "foo")
+  expect_identical(basename(dirname(dirname(inside))), ".rpa")
+  expect_true(file.exists(file.path(other, "DESCRIPTION")))
+})
+
+test_that("a worker in this process puts the analyzer variables back after each package", {
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_CACHE_DIR = "/prior/cache", RPKG_ANALYZER_STATS = NA,
+                      RPA_CACHE = NA)
+  worker <- .with_worker_telemetry(function(pkg) {
+    list(package = pkg, ok = TRUE, cache = Sys.getenv("RPKG_ANALYZER_CACHE_DIR"),
+         stats = Sys.getenv("RPKG_ANALYZER_STATS"))
+  })
+  a <- worker("pkgA")
+  b <- worker("pkgB")
+  expect_identical(basename(dirname(a$cache)), "pkgA")
+  expect_identical(basename(dirname(b$stats)), "pkgB")
+  expect_identical(Sys.getenv("RPKG_ANALYZER_CACHE_DIR"), "/prior/cache")
+  expect_identical(Sys.getenv("RPKG_ANALYZER_STATS", unset = "unset"), "unset")
+  expect_true(is.numeric(a$tally$package_s))
+  expect_identical(a$analyzer_stats, character(0L))
+})
+
+test_that("a worker's tally holds the seconds of each phase it ran, and the statistics lines", {
+  skip_on_os("windows")
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      RPKG_ANALYZER_STATS = NA, STUB_SEEN = NA)
+  res <- .with_worker_telemetry(function(pkg) {
+    repo <- file.path(WORK_DIR, pkg)
+    .make_fake_clone(pkg, repo, versions = c("1.0", "1.1"))
+    out <- analyze_package(repo, pkg)
+    list(package = pkg, ok = TRUE, n = nrow(out$summary))
+  })("pkgT")
+  expect_identical(res$n, 2L)
+  expect_true(all(c("analyzer_s", "extract_s", "package_s", "parse_s", "versions_s") %in%
+                    names(res$tally)))
+  expect_true(all(unlist(res$tally) >= 0))
+  expect_length(res$analyzer_stats, 2L)
+})
+
+# ---------------------------------------------------------------------------
+# The shard's analyzer statistics and worker time
+# ---------------------------------------------------------------------------
+
+.run_status <- function(out_dir) {
+  jsonlite::fromJSON(file.path(out_dir, "run-status.json"), simplifyVector = FALSE)
+}
+
+test_that("the shard sums the analyzer's statistics lines and prints them with the worker time", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      STUB_SEEN = NA, RPA_CACHE = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB"), latest_version = c("1.1", "1.0"),
+                       stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"), pkgB = "1.0")),
+    out_dir, shard_size = 10L))
+
+  st <- .run_status(out_dir)
+  expect_identical(st$analyzer_stats$runs, 3L)
+  expect_identical(st$analyzer_stats$builds, "0.5.1-test")
+  expect_equal(st$analyzer_stats$ms, 4501.5)
+  expect_equal(st$analyzer_stats$compiled_files, 12)
+  expect_equal(st$analyzer_stats$compiled_hits, 9)
+  expect_identical(st$analyzer_stats$incomplete_parses, 0L)
+  expect_true(paste("analyzer: 3 versions in 5 s; compiled 12 files (75.0% reused);",
+                    "cache errors 0; verify mismatches 0; incomplete parses 0") %in% log)
+  expect_true(any(startsWith(log, "worker time: clone ")))
+  expect_identical(st$worker_phases$packages, 2L)
+  expect_true(all(unlist(st$worker_phases) >= 0))
+  expect_setequal(names(st$worker_phases),
+                  c("packages", "clone_s", "extract_s", "analyzer_s", "parse_s", "metrics_s",
+                    "other_s", "dataset_memo_hits", "dataset_memo_misses"))
+  published <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"), simplifyVector = FALSE)
+  expect_false(any(c("analyzer_stats", "worker_phases") %in%
+                     c(names(published), names(published$bootstrap))))
+})
+
+test_that("a build before 0.5.1 reports no statistics, and the shard says so", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir()))
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_true("analyzer: no statistics from this build; incomplete parses 0" %in% log)
+  expect_identical(.run_status(out_dir)$analyzer_stats$runs, 0L)
+})
+
+test_that("a package whose analyzer line does not parse is counted as an incomplete parse", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  wstate <- .override_work_dir()
+  on.exit(.restore_work_dir(wstate), add = TRUE)
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_reads_bin(withr::local_tempdir(), "1.0"))
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_identical(.run_status(out_dir)$analyzer_stats$incomplete_parses, 1L)
+  expect_true("analyzer: no statistics from this build; incomplete parses 1" %in% log)
+})
+
+test_that("a statistics line cut short or unreadable is counted, not summed", {
+  good <- '{"build":"0.5.1","ms":10,"compiled":{"files":2,"hits":1},"cache_errors":1}'
+  s <- .sum_analyzer_stats(c(good, substr(good, 1L, 30L), "", "garbage", good))
+  expect_identical(s$runs, 2L)
+  expect_identical(s$unreadable, 3L)
+  expect_equal(c(s$ms, s$compiled_files, s$compiled_hits, s$cache_errors), c(20, 4, 2, 2))
+  expect_identical(s$builds, "0.5.1")
+})
+
+test_that("a fork that crashed adds nothing, and the phases add up to the package time", {
+  tel <- .shard_telemetry(list(
+    structure("boom", class = "try-error"), NULL,
+    list(tally = list(package_s = 10, clone_s = 1, versions_s = 8, extract_s = 1,
+                      analyzer_s = 4, parse_s = 1),
+         analyzer_stats = character(0L))))
+  expect_identical(tel$phases$packages, 1L)
+  expect_equal(unlist(tel$phases[c("clone_s", "extract_s", "analyzer_s", "parse_s",
+                                   "metrics_s", "other_s")]),
+               c(clone_s = 1, extract_s = 1, analyzer_s = 4, parse_s = 1,
+                 metrics_s = 2, other_s = 1))
+  expect_identical(tel$analyzer$runs, 0L)
+  expect_identical(.worker_phase_line(tel$phases), paste(
+    "worker time: clone 1.0 s, extract 1.0 s, analyzer 4.0 s, record parse 1.0 s,",
+    "metrics 2.0 s, other 1.0 s"))
 })

@@ -549,6 +549,8 @@ analyze_package <- function(repo_dir, package) {
   # under 30s), from the same fork, so live progress covers the long tail too.
   .hb_t0   <- Sys.time()
   .hb_last <- .hb_t0
+  # Dataset records shared by this package's releases, two releases at a time.
+  memo <- .record_memo()
 
   for (i in seq_len(nrow(versions_df))) {
     v      <- versions_df$version[i]
@@ -569,6 +571,7 @@ analyze_package <- function(repo_dir, package) {
     # Per-version work is wrapped in local() so on.exit fires per iteration
     # rather than accumulating in the outer function's exit handlers.
     # This ensures temp-dir cleanup even when the loop body throws.
+    t_version <- proc.time()[["elapsed"]]
     iter <- local({
       tmp <- tempfile(pattern = paste0("ccm_", package, "_"))
       dir.create(tmp, recursive = TRUE)
@@ -577,11 +580,13 @@ analyze_package <- function(repo_dir, package) {
       # A version that cannot be extracted fails the whole package, so every
       # stored row stays as it was. A cap that fires here extracts again into
       # an emptied directory.
+      t_extract <- proc.time()[["elapsed"]]
       files <- .retry_after_time_limit({
         unlink(list.files(tmp, all.files = TRUE, no.. = TRUE, full.names = TRUE),
                recursive = TRUE, force = TRUE)
         extract_version(repo_dir, ref, tmp)
       }, error = function(e) stop(e))
+      .tally_add("extract_s", .secs_since(t_extract))
 
       # Build a read_fn closed over this iteration's extraction directory
       read_fn <- local({
@@ -620,7 +625,7 @@ analyze_package <- function(repo_dir, package) {
 
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
-      metrics <- analyze_with_binary(tmp)
+      metrics <- analyze_with_binary(tmp, memo = memo)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)
@@ -738,6 +743,7 @@ analyze_package <- function(repo_dir, package) {
            text_row = text_row, from_binary = binary_ran)
     })
 
+    .tally_add("versions_s", .secs_since(t_version))
     summary_rows[[i]]       <- iter$safe_metrics
     api_rows[[i]]           <- iter$api_row
     functions_rows[[i]]     <- iter$functions_row
