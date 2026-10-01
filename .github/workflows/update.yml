@@ -17,7 +17,7 @@ on:
         description: "Stop starting new shards after this many seconds (default 16800 = 4h 40m)."
         default: "16800"
       analysis_cores:
-        description: "Packages to analyse at once, from 1 to 999 (empty: every logical core)."
+        description: "Packages to analyse at once, from 1 to 999 (empty: the ANALYSIS_CORES repository variable when set, otherwise every logical core)."
         default: ""
       unpark:
         description: "Release parked failure verdicts: all, fetch, analyze, timeout, or package names separated by commas."
@@ -213,7 +213,7 @@ jobs:
           PIPELINE_RUN_ID: ${{ github.run_id }}
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
-          CORES_INPUT: ${{ inputs.analysis_cores }}
+          CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}
         run: |
           set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '16800' }}"
