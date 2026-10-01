@@ -33,6 +33,24 @@
   suppressWarnings(run_update(io, out, shard_size = shard_size, ...))
 }
 
+# The two manifests in `out`, by series.
+.fv_manifests <- function(out) lapply(
+  c(code = "code-manifest.json", data = "data-manifest.json"),
+  function(f) jsonlite::read_json(file.path(out, f)))
+
+.fv_last_changed <- function(out) vapply(.fv_manifests(out),
+  function(m) m$last_changed, character(1L))
+
+# Stand in for the workflow, which downloads the prior release's manifests as
+# prev-*-manifest.json: `prior`, with each series given its own last_changed.
+.fv_write_prior <- function(out, prior, last_changed) {
+  for (series in names(prior)) {
+    prior[[series]]$last_changed <- last_changed[[series]]
+    write_manifest(file.path(out, sprintf("prev-%s-manifest.json", series)),
+                   prior[[series]])
+  }
+}
+
 # ---------------------------------------------------------------------------
 # How a failure is classified
 # ---------------------------------------------------------------------------
@@ -595,72 +613,84 @@ test_that("a shard whose only news is a failure reports changed", {
 })
 
 # last_changed says when the data moved, and a verdict or a release moves none.
-test_that("a shard whose only news is a verdict or a release keeps last_changed", {
+# The prior release's two manifests are a second apart here, so a manifest
+# given the other's time would show.
+test_that("a shard whose only news is a verdict or a release keeps each manifest's last_changed", {
   out <- withr::local_tempdir()
   .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
   io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
   .fv_run(io, out)
-  # Stand in for the prior release's manifest the workflow downloads.
-  prior <- jsonlite::read_json(file.path(out, "code-manifest.json"))
-  prior$last_changed <- "2026-01-05T00:00:00Z"
-  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
-  last_changed <- function() vapply(c("code-manifest.json", "data-manifest.json"),
-    function(f) jsonlite::read_json(file.path(out, f))$last_changed, character(1L),
-    USE.NAMES = FALSE)
+  was <- c(code = "2026-01-05T00:00:00Z", data = "2026-01-05T00:00:01Z")
+  .fv_write_prior(out, .fv_manifests(out), was)
 
   failed <- .fv_run(io, out)
   expect_identical(failed$n_fresh, 0L)
   expect_true(failed$changed)
   expect_true(jsonlite::read_json(file.path(out, "run-status.json"))$changed)
-  expect_identical(last_changed(), rep("2026-01-05T00:00:00Z", 2L))
+  expect_identical(.fv_last_changed(out), was)
 
   released <- .fv_run(io, out, unpark = "pkgF")
   expect_identical(released$n_fresh, 0L)
   expect_true(released$changed)
   expect_identical(jsonlite::read_json(file.path(out, "run-status.json"))$n_released, 1L)
-  expect_identical(last_changed(), rep("2026-01-05T00:00:00Z", 2L))
+  expect_identical(.fv_last_changed(out), was)
 })
 
-# The workflow downloads the prior release's manifest once, so every shard of a
-# run reads the same pre-run last_changed. A later shard that moves no data has
-# to keep the time an earlier shard of the same run moved it.
+# A release an interrupted publish left without its data manifest gives the
+# data manifest no time of its own to carry.
+test_that("a data manifest with no last_changed to carry takes the code manifest's", {
+  out <- withr::local_tempdir()
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
+  .fv_run(io, out)
+  .fv_write_prior(out, .fv_manifests(out)["code"], c(code = "2026-01-05T00:00:00Z"))
+  file.remove(file.path(out, "data-manifest.json"))
+
+  failed <- .fv_run(io, out)
+  expect_identical(failed$n_fresh, 0L)
+  expect_identical(.fv_last_changed(out),
+                   c(code = "2026-01-05T00:00:00Z", data = "2026-01-05T00:00:00Z"))
+})
+
+# The workflow downloads the prior release's manifests once, so every shard of
+# a run reads the same pre-run last_changed. A later shard that moves no data
+# has to keep the time an earlier shard of the same run moved it.
 test_that("a verdict-only shard keeps the last_changed an earlier shard of its run wrote", {
   out <- withr::local_tempdir()
   .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
   .fv_run(.fv_io(c("pkgA", "pkgZ")), out)
-  # Stand in for the workflow, which moves the prior release's manifest aside.
-  prior <- jsonlite::read_json(file.path(out, "code-manifest.json"))
-  prior$last_changed <- "2026-01-05T00:00:00Z"
-  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
-  file.remove(file.path(out, "code-manifest.json"))
-  last_changed <- function() vapply(c("code-manifest.json", "data-manifest.json"),
-    function(f) jsonlite::read_json(file.path(out, f))$last_changed, character(1L),
-    USE.NAMES = FALSE)
+  # Stand in for the workflow, which moves the prior release's manifests aside.
+  prior <- .fv_manifests(out)
+  was <- c(code = "2026-01-05T00:00:00Z", data = "2026-01-05T00:00:01Z")
+  .fv_write_prior(out, prior, was)
+  file.remove(file.path(out, c("code-manifest.json", "data-manifest.json")))
   io <- .fv_io(c("pkgA", "pkgF", "pkgZ"), fail_clones = c(pkgF = 128L))
+  # Each read is a second after the last, so a shard that stamped its own time
+  # would differ from shard 1's, and so would a second read within a shard.
+  .local_stepping_clock()
 
   withr::with_envvar(c(PIPELINE_RUN_ID = "r1"), {
     # Shard 1 analyses pkgA again at the version it already has: the data
     # moves and the fingerprint does not.
     first <- .fv_run(io, out, requeue = "pkgA", shard_size = 1L)
-    moved <- last_changed()
-    # A shard that stamped its own time would differ from shard 1's by now.
-    Sys.sleep(1.1)
+    moved <- .fv_last_changed(out)
     # Shard 2 only records pkgF's failure.
     second <- .fv_run(io, out, shard_size = 1L)
   })
   expect_identical(first$n_fresh, 1L)
-  expect_identical(first$fingerprint, prior$fingerprint)
-  expect_false("2026-01-05T00:00:00Z" %in% moved)
+  expect_identical(first$fingerprint, prior$code$fingerprint)
+  expect_false(any(moved %in% was))
+  expect_identical(moved[["data"]], moved[["code"]])
   expect_identical(second$n_fresh, 0L)
   expect_identical(second$shard_failures$packages, "pkgF")
   expect_true(second$changed)
-  expect_identical(last_changed(), moved)
+  expect_identical(.fv_last_changed(out), moved)
 
   # A later run reads its own prior release, not the last run's status file.
-  prior$last_changed <- "2026-02-01T00:00:00Z"
-  write_manifest(file.path(out, "prev-code-manifest.json"), prior)
+  later <- c(code = "2026-02-01T00:00:00Z", data = "2026-02-01T00:00:01Z")
+  .fv_write_prior(out, prior, later)
   withr::with_envvar(c(PIPELINE_RUN_ID = "r2"), .fv_run(io, out, shard_size = 1L))
-  expect_identical(last_changed(), rep("2026-02-01T00:00:00Z", 2L))
+  expect_identical(.fv_last_changed(out), later)
 })
 
 test_that("a weekly recheck that fails again at the same stage stays parked and publishes nothing", {
