@@ -98,3 +98,32 @@ test_that("the step summary says done, or n/a, when there is no rate to go on", 
   stuck <- .step_summary(list(n_remaining = 50L, n_shard = 50L), 60, 50)$output
   expect_identical(stuck[[length(stuck)]], "| ETA at this run's rate | n/a |")
 })
+
+# ---------------------------------------------------------------------------
+# The core count a dispatch asks for
+# ---------------------------------------------------------------------------
+
+# Call set_analysis_cores as the shard step does, then print the ANALYSIS_CORES
+# a shard's Rscript would inherit, or "unset".
+.cores_bash <- function(input) {
+  skip_on_os("windows")
+  out <- suppressWarnings(system2("bash", c("-c", shQuote(sprintf(paste(
+    "set -euo pipefail; unset ANALYSIS_CORES; source %s;",
+    "set_analysis_cores %s || exit 1;",
+    "printenv ANALYSIS_CORES || echo unset"),
+    shQuote(.loop_script()), shQuote(input)))), stdout = TRUE, stderr = TRUE))
+  list(status = attr(out, "status") %||% 0L, output = as.character(out))
+}
+
+test_that("an empty core count leaves ANALYSIS_CORES unset, and a count exports it", {
+  expect_identical(.cores_bash(""), list(status = 0L, output = "unset"))
+  expect_identical(.cores_bash("2"), list(status = 0L, output = "2"))
+  expect_identical(.cores_bash("999"), list(status = 0L, output = "999"))
+})
+
+test_that("a core count that is not a whole number from 1 to 999 stops the step", {
+  for (bad in c("0", "1000", "abc", "1.5", "-1", " ", "2 ")) {
+    expect_identical(.cores_bash(bad), list(status = 1L, output = sprintf(
+      "::error::analysis_cores must be a whole number from 1 to 999, got '%s'.", bad)))
+  }
+})
