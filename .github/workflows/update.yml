@@ -14,8 +14,11 @@ on:
         type: boolean
         default: false
       time_budget_seconds:
-        description: "Stop starting new shards after this many seconds (default 18000 = 5h)."
-        default: "18000"
+        description: "Stop starting new shards after this many seconds (default 16800 = 4h 40m)."
+        default: "16800"
+      analysis_cores:
+        description: "Packages to analyse at once, from 1 to 999 (empty: every logical core)."
+        default: ""
       unpark:
         description: "Release parked failure verdicts: all, fetch, analyze, timeout, or package names separated by commas."
         default: ""
@@ -210,9 +213,10 @@ jobs:
           PIPELINE_RUN_ID: ${{ github.run_id }}
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
+          CORES_INPUT: ${{ inputs.analysis_cores }}
         run: |
           set -euo pipefail
-          BUDGET="${{ inputs.time_budget_seconds || '18000' }}"
+          BUDGET="${{ inputs.time_budget_seconds || '16800' }}"
           FORCE=""; [ "${{ inputs.force_full }}" = "true" ] && FORCE="--bootstrap"
           RECOLLECT=""; [ "${{ inputs.recollect }}" = "true" ] && RECOLLECT="--recollect"
           # Operator releases go to the first shard only, as --bootstrap does,
@@ -228,6 +232,9 @@ jobs:
           # which never leave a draft to build on and fail the step when an
           # upload does not land.
           source scripts/publish.sh
+
+          # An empty input exports nothing, so the shards use every core.
+          set_analysis_cores "${CORES_INPUT:-}" || exit 1
 
           # Publish ONE dated release carrying both the code and data metrics DBs
           # (plus both manifests) as assets, with a single notes body. render_notes.R
@@ -260,6 +267,7 @@ jobs:
           while :; do
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
+            free -m || true
             Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}
             FORCE=""
             RELEASE=()

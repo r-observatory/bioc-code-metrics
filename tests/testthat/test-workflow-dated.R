@@ -60,3 +60,47 @@ test_that("the shard step leaves a summary of the run on the Actions page", {
     'write_step_summary out/run-status.json "$SECONDS" "${START_QUEUE:-0}" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"',
     yml, fixed = TRUE)))
 })
+
+test_that("the run budget defaults to 16,800 s for a dispatch and for the schedule", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  at <- grep("^      time_budget_seconds:$", yml)
+  expect_length(at, 1L)
+  expect_identical(yml[at + 1:2], c(
+    '        description: "Stop starting new shards after this many seconds (default 16800 = 4h 40m)."',
+    '        default: "16800"'))
+  expect_true(any(yml == "          BUDGET=\"${{ inputs.time_budget_seconds || '16800' }}\""))
+  expect_false(any(grepl("18000", yml, fixed = TRUE)))
+})
+
+test_that("the job outlasts the budget by more than one package's time limit", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  update_job <- yml[seq(grep("^  update:$", yml), grep("^  keepalive:$", yml) - 1L)]
+  limit_s <- 60L * as.integer(sub("^    timeout-minutes: ", "",
+                                  grep("^    timeout-minutes: [0-9]+$", update_job, value = TRUE)))
+  expect_identical(limit_s, 21000L)
+  expect_gt(limit_s - 16800L, .config_under()$WORKER_TIMEOUT)
+})
+
+test_that("the core count input reaches the shards through set_analysis_cores alone", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  expect_true(any(grepl("^      analysis_cores:$", yml)))
+  uses <- trimws(grep("inputs.analysis_cores", yml, value = TRUE, fixed = TRUE))
+  expect_identical(uses, "CORES_INPUT: ${{ inputs.analysis_cores }}")
+  # Never a key of an env block, where an empty input would set it to "".
+  expect_false(any(grepl("^\\s*ANALYSIS_CORES\\s*:", yml)))
+  set  <- which(yml == '          set_analysis_cores "${CORES_INPUT:-}" || exit 1')
+  loop <- which(yml == "          while :; do")
+  expect_length(set, 1L)
+  expect_length(loop, 1L)
+  expect_lt(set, loop)
+  src <- which(yml == "          source scripts/publish.sh")
+  expect_gt(set, max(src[src < loop]))
+})
+
+test_that("each shard prints free memory before it starts", {
+  yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
+  banner <- which(yml == '            echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="')
+  expect_length(banner, 1L)
+  expect_identical(yml[banner + 1L], "            free -m || true")
+  expect_true(startsWith(yml[banner + 2L], "            Rscript scripts/update.R out/ "))
+})

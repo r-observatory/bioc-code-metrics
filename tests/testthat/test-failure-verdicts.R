@@ -459,6 +459,45 @@ test_that("a clone failure parks after five runs and is released by the next Bio
   expect_identical(row$fetch_version, "3.24")
 })
 
+test_that("timeouts counted at 600 s park nothing at the default limit, and the package is analysed again", {
+  cap <- .config_under()$WORKER_TIMEOUT
+  expect_identical(cap, 2400L)
+  out <- withr::local_tempdir()
+  con <- open_or_init_db(file.path(out, DB_FILENAME))
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) {
+    .fv_fail(con, "pkgSlow", "timeout", build = NA_character_, wt = 600L)
+  }
+  u <- .fv_universe("pkgSlow")
+  expect_identical(.permanent_failures(con, NA_character_, 600L, u), "pkgSlow")
+  expect_identical(.permanent_failures(con, NA_character_, cap, u), character(0L))
+  DBI::dbDisconnect(con)
+
+  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("WORKER_TIMEOUT", 600L)
+  parked <- .fv_run(.fv_io("pkgSlow"), out)
+  expect_identical(c(parked$n_shard, parked$permanent_failures), c(0L, 1L))
+
+  .local_global("WORKER_TIMEOUT", cap)
+  released <- .fv_run(.fv_io("pkgSlow"), out)
+  expect_identical(c(released$n_shard, released$permanent_failures), c(1L, 0L))
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(nrow(.fv_row(con, "pkgSlow")), 0L)
+  expect_identical(DBI::dbGetQuery(con, "SELECT package FROM bioc_code_summary")$package,
+                   "pkgSlow")
+})
+
+test_that("a timeout at the default limit after three at 600 s counts as the first", {
+  cap <- .config_under()$WORKER_TIMEOUT
+  con <- .fv_con()
+  for (i in seq_len(MAX_TIMEOUT_FAILURES)) .fv_fail(con, "pkgSlow", "timeout", wt = 600L)
+  .fv_fail(con, "pkgSlow", "timeout", wt = cap)
+  row <- .fv_row(con, "pkgSlow")
+  expect_identical(c(row$timeout_failures, row$worker_timeout), c(1L, cap))
+  expect_identical(.permanent_failures(con, "0.5.0", cap, .fv_universe("pkgSlow")),
+                   character(0L))
+})
+
 test_that("a run without the analyzer parks under no build, and a run with one asks again", {
   con <- .fv_con()
   u <- .fv_universe(c("pkgA", "pkgF"))

@@ -959,6 +959,17 @@ sweep_swap_leftovers() {
   done <<< "$rows"
 }
 
+# Export ANALYSIS_CORES for the shards when the dispatch gave a core count. An
+# empty one exports nothing: scripts/config.R would read "" as NA.
+set_analysis_cores() {  # $1=the analysis_cores input
+  [ -n "$1" ] || return 0
+  if ! [[ "$1" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    echo "::error::analysis_cores must be a whole number from 1 to 999, got '$1'."
+    return 1
+  fi
+  export ANALYSIS_CORES="$1"
+}
+
 # Whether the shard loop is done: bootstrap complete, nothing changed, queue
 # drained (a failed package waits for the next run), or status unreadable.
 shard_loop_done() {  # $1=run-status.json

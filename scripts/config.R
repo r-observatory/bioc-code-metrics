@@ -70,8 +70,9 @@ ANALYSIS_CORES <- {
 
 # Per-package analysis timeout in seconds. A hard cap so a pathological
 # file in a metric group (e.g. a catastrophic regex) cannot stall a shard.
-# Overridable via WORKER_TIMEOUT env var.
-WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "600"))
+# Overridable via WORKER_TIMEOUT env var. The default is 2,400 s because
+# packages that finish have taken more than 1,500 s.
+WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
 
 # The most one worker's progress line may be, in bytes. The forks share fd 1,
 # and a write within PIPE_BUF (at least 512 bytes by POSIX) arrives whole, so
