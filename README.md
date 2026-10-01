@@ -18,9 +18,9 @@ differs (Bioconductor uses release branches rather than per-version tags).
 
 ## Output
 
-`bioc-code-metrics.db` (published as a dated `code-YYYY-MM-DD` release; a
-release is immutable once a later day's release exists, and old releases are
-pruned on a retention schedule):
+`bioc-code-metrics.db` (published as an asset of a dated `metrics-YYYY-MM-DD`
+release; no run uploads to a release once a later day's release exists, and old
+releases are kept; see Retention):
 
 - `bioc_code_summary` - one row per package release, with the metric columns and
   the release date.
@@ -36,13 +36,13 @@ pruned on a retention schedule):
   `bioc_release_text_versions` - every DESCRIPTION field and NEWS section of
   every analysed release, and which releases were read. Not merged downstream.
 
-`bioc-data-metrics.db` is published the same way, as a dated `data-YYYY-MM-DD`
-release, and holds the dataset-focused tables.
+`bioc-data-metrics.db` is an asset of the same `metrics-YYYY-MM-DD` release and
+holds the dataset-focused tables.
 
-Each dated release carries its own `manifest.json` asset (copied from
-`code-manifest.json` or `data-manifest.json`). A separate `run-status.json`,
-written alongside but not published, carries the `changed` and
-`bootstrap_complete` flags that drive the shard loop.
+Each dated release also carries `code-manifest.json` and `data-manifest.json`,
+one manifest for each database. A separate `run-status.json`, written alongside
+but not published, carries the `changed` and `bootstrap_complete` flags that
+drive the shard loop.
 
 ## Retired columns
 
@@ -78,6 +78,19 @@ Moving the rpkg-analyzer pin re-queues every package unless `ANALYZER_SAME_OUTPU
 Each worker gives rpkg-analyzer a directory of its own for the package it analyses, `work/.rpa/<package>`, and removes it when the package is done. `RPKG_ANALYZER_CACHE_DIR` names a cache there, so a compiled file that did not change between versions is parsed once, and `RPKG_ANALYZER_STATS` names a statistics file. Builds before 0.5.1 read neither variable. Set `RPA_CACHE` to `off` (or `false`, `no`, `0`) in the workflow's environment to leave the cache out; the output is the same either way.
 
 Each shard's log carries an `analyzer:` line (versions analysed, seconds, compiled files and the share taken from the cache, cache errors, verify mismatches, incomplete parses) and a `worker time:` line (clone, extract, analyzer, record parse, metrics, other). `run-status.json` keeps the same figures under `analyzer_stats` and `worker_phases`; the published manifests do not carry them.
+
+## Retention
+
+The update workflow's prune step runs only on a scheduled run whose earlier steps succeeded. It lists the published `metrics-` releases and passes their tags to `scripts/prune.R` with `KEEP: "all"`, which selects none of them, so the step deletes no published release. The legacy `code-` and `data-` releases are not in that list. After surrounding whitespace is trimmed, `KEEP` takes `all` in any case or a whole number written in digits alone, at most 2147483647, and the step fails on any other value. A number keeps that many of the newest `metrics-` releases and every one whose tag ends in `-01`, and selects the rest for deletion.
+
+Still deleted:
+
+- Drafts under a `metrics-` tag other than today's, by `delete_stale_drafts` in the prune step. A draft under today's tag, left by a publish that did not finish, is deleted by the next publish that day, which starts the release again.
+- `swap-prev-` and `swap-next-` staging assets, by `repair_asset` in `scripts/publish.sh`. It runs in the download step on the release a run builds on, ahead of each replacement of an asset on a published release, and in the prune step's sweep (`sweep_swap_leftovers`) of every published `metrics-` release other than today's. When the release has lost the asset itself, its `swap-prev-` copy takes the name back, or else a `swap-next-` copy whose upload finished takes it, instead of being deleted.
+- An asset whose upload did not finish, by the same `repair_asset` calls: on the release a run builds on, on a published release where the asset of that name is about to be replaced, and in the sweep on an earlier release that still carries a staging copy of that name. A run also deletes its own `swap-next-` upload when it cannot confirm from the release that the upload finished at the local file's size and, where the release reports a digest, with its sha256 (`discard_asset`).
+- The copy of an asset that a replacement displaces. Each shard whose `run-status.json` reports `changed` publishes under the day's tag, and every publish after the day's first replaces both databases and both manifests on that release. A run that publishes nothing and saw a non-empty package universe replaces the two manifests on the release it built on. Each displaced copy stays under `swap-prev-` until a `repair_asset` call clears it.
+
+The newest dated release covers every analysed Bioconductor release of a package, not only the latest: one row each in `bioc_code_summary` and `bioc_api_history`, the per-file churn between consecutive releases in `bioc_code_churn`, and per-function and call-graph detail in `bioc_functions` and `bioc_call_edges` for each release the analyzer reported any for. It keeps no copy of the rows a later analysis replaced. A package is analysed again, across all its release branches, when Bioconductor has a new release, among other reasons. `upsert_shard` in `scripts/export.R` then deletes all of the package's rows from those five tables and writes the new ones, `upsert_datasets` does the same in `bioc_dataset_versions` and `bioc_datasets` in the dataset database, and a retired column is dropped from `bioc_code_summary` (see Retired columns). What an earlier analysis wrote is then only in the dated releases published before the package was analysed again. `KEEP: "all"` stays until a retention rule for these metrics releases is approved on its own.
 
 ## Feedback
 

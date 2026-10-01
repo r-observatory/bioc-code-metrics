@@ -1,7 +1,7 @@
 # scripts/prune.R: choose which dated releases of one series to delete.
 
 #' @param tags Character vector of all tags of ONE series (e.g. all "code-*").
-#' @param keep Number of most-recent dailies to always keep (default 30).
+#' @param keep Number of most-recent dailies to always keep (default 30), or Inf to keep all.
 #' @return Character vector of tags to delete. Never deletes a first-of-month
 #'   (tag ending "-01") release.
 releases_to_prune <- function(tags, keep = 30L) {
@@ -11,11 +11,26 @@ releases_to_prune <- function(tags, keep = 30L) {
   candidates[!grepl("-01$", candidates)]
 }
 
+# KEEP with surrounding whitespace trimmed: "all" in any case keeps every
+# release (Inf), and digits alone up to 2147483647 are read as an integer.
+# Anything else stops with an error naming KEEP.
+parse_keep <- function(x) {
+  x <- trimws(as.character(x))
+  if (identical(tolower(x), "all")) return(Inf)
+  n <- if (isTRUE(grepl("^[0-9]+$", x))) suppressWarnings(as.integer(x)) else NA_integer_
+  if (is.na(n)) {
+    stop("KEEP must be \"all\" or a whole number written in digits, at most ",
+         .Machine$integer.max, ", got: \"", x, "\"", call. = FALSE)
+  }
+  n
+}
+
 if (identical(sys.nframe(), 0L)) {
   # Reads tags on stdin (one per line), prints tags to delete.
   con <- file("stdin"); on.exit(close(con))
   tags <- readLines(con, warn = FALSE)
   tags <- tags[nzchar(tags)]
-  keep <- as.integer(Sys.getenv("KEEP", "30"))
-  cat(releases_to_prune(tags, keep = keep), sep = "\n")
+  keep <- parse_keep(Sys.getenv("KEEP", "30"))
+  del <- releases_to_prune(tags, keep = keep)
+  if (length(del)) cat(del, sep = "\n")
 }
