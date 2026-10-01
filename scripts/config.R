@@ -44,8 +44,8 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1")
 
 # Timeouts, crashes and git timeouts a package may take under one analyzer
-# build and one WORKER_TIMEOUT before it is parked. Each costs a worker at
-# least WORKER_TIMEOUT, and three in three runs is not one slow runner.
+# build and one WORKER_TIMEOUT before it is parked. A timeout costs a worker
+# at least WORKER_TIMEOUT, and three in three runs is not one slow runner.
 MAX_TIMEOUT_FAILURES <- 3L
 
 # Days after which a fetch-parked package with no stored rows is tried once

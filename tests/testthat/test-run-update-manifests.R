@@ -6,7 +6,7 @@
 
 test_that("run_update writes both manifests and the changed-packages file", {
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
       analyzer_version = "0.4.0-test", stringsAsFactors = FALSE),
@@ -52,7 +52,7 @@ test_that("both manifests report the packages no dataset scan reached", {
   # scanned. Only the new count says so, and it has to reach the file: the log
   # line that would have said it scrolls away with the run.
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = 1L,
       stringsAsFactors = FALSE),
@@ -78,7 +78,7 @@ test_that("both manifests report the datasets the reader could not measure", {
   # catalog with no profile behind it. Nothing outside the shard's own log said
   # how many, so a build that started losing objects looked like a quiet run.
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = 1L, detail_scanned = 1L,
       analyzer_version = "0.4.0-test", stringsAsFactors = FALSE),

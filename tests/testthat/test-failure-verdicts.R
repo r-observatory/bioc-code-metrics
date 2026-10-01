@@ -113,7 +113,7 @@ test_that("a failure line names its stage and time, and a pass past the cap says
 
 test_that("each failure in a run is printed with its stage", {
   .local_global("WORKER_TIMEOUT", 1L)
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     switch(pkg,
       pkgBadLine = {
         tryCatch(.busy(1.5), error = function(e) NULL)
@@ -138,7 +138,7 @@ test_that("a fork that dies without a result is printed by the parent as a crash
   skip_on_os("windows")
   .local_global("WORK_DIR", withr::local_tempdir())
   .local_global("ANALYSIS_CORES", 2L)
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (identical(pkg, "pkgKilled")) tools::pskill(Sys.getpid(), tools::SIGKILL)
     .fv_result(pkg)
   })
@@ -327,7 +327,7 @@ test_that("the run id is PIPELINE_RUN_ID, never GITHUB_RUN_ID", {
 test_that("each failure in a run is stored with its stage", {
   .local_global("WORKER_TIMEOUT", 1L)
   withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     switch(pkg,
       pkgBadLine = {
         tryCatch(.busy(1.5), error = function(e) NULL)
@@ -362,7 +362,7 @@ test_that("a fork that dies without a result is stored as a crash with no elapse
   skip_on_os("windows")
   .local_global("WORK_DIR", withr::local_tempdir())
   .local_global("ANALYSIS_CORES", 2L)
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (identical(pkg, "pkgKilled")) tools::pskill(Sys.getpid(), tools::SIGKILL)
     .fv_result(pkg)
   })
@@ -490,7 +490,7 @@ test_that("timeouts counted at 600 s park nothing at the default limit, and the 
   expect_identical(.permanent_failures(con, NA_character_, cap, u), character(0L))
   DBI::dbDisconnect(con)
 
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   .local_global("WORKER_TIMEOUT", 600L)
   parked <- .fv_run(.fv_io("pkgSlow"), out)
   expect_identical(c(parked$n_shard, parked$permanent_failures), c(0L, 1L))
@@ -553,7 +553,7 @@ test_that("the packages tried this run are the ones whose verdict names it", {
 test_that("a package that failed is attempted once per run", {
   out <- withr::local_tempdir()
   io  <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   attempts <- function() {
     con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
     on.exit(DBI::dbDisconnect(con))
@@ -584,14 +584,14 @@ test_that("GITHUB_RUN_ID alone does not make a run, so every call attempts again
 
 test_that("a package tried this run is left out of every queue, a backfill included", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     r <- .fv_result(pkg)
     r$summary$datasets_scanned <- NA_integer_
     r
   })
   .fv_run(.fv_io("pkgB"), out)
   withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
-  .local_global("analyze_package", function(dest, pkg) stop("broke"))
+  .local_global("analyze_package", function(dest, pkg, ...) stop("broke"))
   first  <- .fv_run(.fv_io("pkgB"), out)
   second <- .fv_run(.fv_io("pkgB"), out)
   expect_identical(c(first$n_shard, second$n_shard), c(1L, 0L))
@@ -603,7 +603,7 @@ test_that("a package tried this run is left out of every queue, a backfill inclu
 
 test_that("a shard whose only news is a failure reports changed", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
   .fv_run(io, out)
   second <- .fv_run(io, out)
@@ -617,7 +617,7 @@ test_that("a shard whose only news is a failure reports changed", {
 # given the other's time would show.
 test_that("a shard whose only news is a verdict or a release keeps each manifest's last_changed", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
   .fv_run(io, out)
   was <- c(code = "2026-01-05T00:00:00Z", data = "2026-01-05T00:00:01Z")
@@ -640,7 +640,7 @@ test_that("a shard whose only news is a verdict or a release keeps each manifest
 # data manifest no time of its own to carry.
 test_that("a data manifest with no last_changed to carry takes the code manifest's", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
   .fv_run(io, out)
   .fv_write_prior(out, .fv_manifests(out)["code"], c(code = "2026-01-05T00:00:00Z"))
@@ -657,7 +657,7 @@ test_that("a data manifest with no last_changed to carry takes the code manifest
 # has to keep the time an earlier shard of the same run moved it.
 test_that("a verdict-only shard keeps the last_changed an earlier shard of its run wrote", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   .fv_run(.fv_io(c("pkgA", "pkgZ")), out)
   # Stand in for the workflow, which moves the prior release's manifests aside.
   prior <- .fv_manifests(out)
@@ -695,7 +695,7 @@ test_that("a verdict-only shard keeps the last_changed an earlier shard of its r
 
 test_that("a weekly recheck that fails again at the same stage stays parked and publishes nothing", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   io <- .fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L))
   for (i in seq_len(MAX_CLONE_FAILURES)) .fv_run(io, out)
   settled <- .fv_run(io, out)
@@ -714,14 +714,14 @@ test_that("a weekly recheck that fails again at the same stage stays parked and 
 
 test_that("a weekly recheck that fails at a new stage publishes", {
   out <- withr::local_tempdir()
-  .local_global("analyze_package", function(dest, pkg) .fv_result(pkg))
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
   for (i in seq_len(MAX_CLONE_FAILURES)) {
     .fv_run(.fv_io(c("pkgF", "pkgOk"), fail_clones = c(pkgF = 128L)), out)
   }
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
   .fv_age(con, "pkgF", FETCH_RECHECK_DAYS + 1L)
   DBI::dbDisconnect(con)
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (identical(pkg, "pkgF")) stop(.extract_failure("archive", "1.0", 128L, "bad"))
     .fv_result(pkg)
   })
@@ -739,7 +739,7 @@ test_that("a pass past the cap goes on the standing list, and a pass under it ta
   .local_global("WORKER_TIMEOUT", 1L)
   withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
   slow <- TRUE
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (slow) tryCatch(.busy(1.5), error = function(e) NULL)
     .fv_result(pkg)
   })
@@ -771,12 +771,12 @@ test_that("the standing list is read longest first", {
 test_that("a package on the standing list that then fails stays on it", {
   out <- withr::local_tempdir()
   .local_global("WORKER_TIMEOUT", 1L)
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     tryCatch(.busy(1.5), error = function(e) NULL)
     .fv_result(pkg)
   })
   .fv_run(.fv_io("pkgBig"), out)
-  .local_global("analyze_package", function(dest, pkg) stop("broke"))
+  .local_global("analyze_package", function(dest, pkg, ...) stop("broke"))
   .fv_run(.fv_io("pkgBig", "1.1"), out)
   con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -885,7 +885,7 @@ test_that("a requeue is analysed again in the same run, and over_cap reaches the
   out <- withr::local_tempdir()
   .local_global("WORKER_TIMEOUT", 1L)
   slow <- TRUE
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (slow) tryCatch(.busy(1.5), error = function(e) NULL)
     .fv_result(pkg)
   })
@@ -949,7 +949,7 @@ test_that("the manifest and run status carry the verdict counts, and the data ma
   out <- withr::local_tempdir()
   .local_global("WORKER_TIMEOUT", 1L)
   withr::local_envvar(c(PIPELINE_RUN_ID = "r1"))
-  .local_global("analyze_package", function(dest, pkg) {
+  .local_global("analyze_package", function(dest, pkg, ...) {
     if (identical(pkg, "pkgBad")) stop("broke")
     if (identical(pkg, "pkgBig")) tryCatch(.busy(1.5), error = function(e) NULL)
     .fv_result(pkg)

@@ -7,8 +7,10 @@
 # the R metric groups' output and adds many static metrics, so it replaces the
 # build_context + analyze_version computation for a single version.
 #
-# This is binary-first with an R fallback: when the binary is unavailable or
-# fails, analyze_with_binary() returns NULL and the caller uses analyze_version.
+# This is binary-first with an R fallback: when the binary gives no usable
+# result on a version with no stored analyzer row, analyze_with_binary()
+# returns NULL and the caller uses analyze_version. A killed analyzer, or no
+# usable result on a version with an analyzer row, is raised.
 
 #' Locate the rpkg-analyzer binary.
 #'
@@ -553,37 +555,106 @@ parse_analyzer_records <- function(lines, memo = NULL) {
   )
 }
 
+#' The condition analyze_with_binary raises for an analyzer that was killed: an
+#' exit status of 128 or above, or a zero status with no statistics line.
+#'
+#' @param status The exit status; NA when the statistics line is what is missing.
+#' @return A condition of class c("analyzer_killed", "error", "condition")
+#'   carrying status.
+.analyzer_killed <- function(status = NA_integer_) {
+  status <- as.integer(status)
+  structure(
+    class = c("analyzer_killed", "error", "condition"),
+    list(message = if (is.na(status)) {
+           "rpkg-analyzer exited 0 without its statistics line"
+         } else {
+           sprintf("rpkg-analyzer was killed, exit status %d", status)
+         },
+         call = NULL, status = status))
+}
+
+#' The condition analyze_with_binary raises when a version that has a stored
+#' analyzer row gets no usable result and the analyzer was not killed.
+#'
+#' @param status The exit status; NA when the run left none.
+#' @param what   What happened instead, when there is no status.
+#' @return A condition of class c("analyzer_failed", "error", "condition")
+#'   carrying status.
+.analyzer_failed <- function(status = NA_integer_, what = "gave no result") {
+  status <- as.integer(status)
+  if (!is.na(status)) what <- sprintf("exited %d", status)
+  structure(
+    class = c("analyzer_failed", "error", "condition"),
+    list(message = sprintf("rpkg-analyzer %s on a version with analyzer rows", what),
+         call = NULL, status = status))
+}
+
+# The size of the statistics file, 0 when none is named or it does not exist.
+.stats_bytes <- function(path) {
+  n <- if (nzchar(path)) file.size(path) else NA_real_
+  if (is.na(n)) 0 else n
+}
+
+# Whether a run left no statistics line although its build writes one: 0.5.1
+# and later, with RPKG_ANALYZER_STATS naming the file.
+.stats_line_missing <- function(path, bytes_before) {
+  nzchar(path) && .stats_bytes(path) <= bytes_before &&
+    analyzer_at_least(rpkg_analyzer_version(), "0.5.1")
+}
+
 #' Run the analyzer over an extracted package directory.
 #'
 #' @param dir Path to the extracted package source (a DESCRIPTION at its root).
 #' @param kind The input kind passed as --input-kind.
 #' @param memo The package's .record_memo(), or NULL.
+#' @param protect Whether the version has a stored analyzer row, which a
+#'   fallback row must not replace.
 #' @return A flat named list of metrics for the version, with nested values
 #'   (maps and arrays) serialised to JSON strings to match how the R metric
 #'   groups store fields such as lang_breakdown. The per-function and
 #'   per-call-edge detail frames are attached as the "functions" and "edges"
-#'   attributes (data.frames without package/version stamps). NULL if the binary
-#'   is unavailable or does not produce a summary record.
-analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) {
+#'   attributes (data.frames without package/version stamps). Raises
+#'   analyzer_killed for a status of 128 or above or a zero status with no
+#'   statistics line. Any other run with no usable result (no binary, a binary
+#'   that could not be run, another non-zero status, no summary record) is
+#'   NULL on an unprotected version and raises analyzer_failed on a protected
+#'   one.
+analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
+                                protect = FALSE) {
+  # No usable result: the R fallback, unless its row would replace an analyzer row.
+  unusable <- function(...) {
+    if (isTRUE(protect)) stop(.analyzer_failed(...))
+    NULL
+  }
   bin <- rpkg_analyzer_bin()
-  if (!nzchar(bin)) return(NULL)
+  if (!nzchar(bin)) return(unusable(what = "was not found"))
 
-  # A non-zero exit (a panic, an OOM kill) signals a warning and leaves a
-  # status, and either gives the R fallback rather than a partial parse.
+  # A non-zero exit signals a warning and leaves a status, which is read below.
+  # R raises an error of its own for status 127 and for a pipe it cannot open.
+  stats <- Sys.getenv("RPKG_ANALYZER_STATS", unset = "")
   t0  <- proc.time()[["elapsed"]]
-  out <- .retry_after_time_limit(
-    tryCatch(system2(bin, c(shQuote(dir), "--input-kind", kind),
-                     stdout = TRUE, stderr = FALSE),
-             warning = function(w) NULL),
-    error = function(e) NULL)
+  out <- .retry_after_time_limit({
+    stats_before <- .stats_bytes(stats)
+    withCallingHandlers(system2(bin, c(shQuote(dir), "--input-kind", kind),
+                                stdout = TRUE, stderr = FALSE),
+                        warning = function(w) invokeRestart("muffleWarning"))
+  }, error = function(e) e)
   .tally_add("analyzer_s", .secs_since(t0))
-  if (!is.null(attr(out, "status"))) out <- NULL
-  if (is.null(out) || length(out) == 0L) return(NULL)
+  if (inherits(out, "condition")) {
+    return(unusable(what = sprintf("could not be run (%s)", conditionMessage(out))))
+  }
+
+  status <- as.integer(attr(out, "status") %||% 0L)
+  if (status >= 128L) stop(.analyzer_killed(status))
+  if (status != 0L) return(unusable(status))
+  # A signalled analyzer can come back with partial lines and no status.
+  if (.stats_line_missing(stats, stats_before)) stop(.analyzer_killed())
+  if (length(out) == 0L) return(unusable(what = "printed nothing"))
 
   t0 <- proc.time()[["elapsed"]]
   parsed <- parse_analyzer_records(out, memo)
   .tally_add("parse_s", .secs_since(t0))
-  if (is.null(parsed$summary)) return(NULL)
+  if (is.null(parsed$summary)) return(unusable(what = "printed no summary record"))
 
   metrics <- parsed$summary
   attr(metrics, "functions") <- parsed$functions
@@ -595,13 +666,16 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL) {
 }
 
 #' Whether the analyzer honours the input kind this pipeline passes: a
-#' DESCRIPTION-only package must come back with a summary naming `kind`.
+#' DESCRIPTION-only package must come back with a summary naming `kind`. An
+#' analyzer that is killed, or fails, on that package does not pass.
 rpkg_analyzer_selfcheck <- function(kind = ANALYZER_INPUT_KIND) {
   dir <- tempfile("selfcheck_")
   dir.create(dir)
   on.exit(unlink(dir, recursive = TRUE, force = TRUE), add = TRUE)
   writeLines(c("Package: selfcheck", "Version: 0.0.1"), file.path(dir, "DESCRIPTION"))
-  metrics <- analyze_with_binary(dir, kind = kind)
+  metrics <- tryCatch(analyze_with_binary(dir, kind = kind),
+                      analyzer_killed = function(e) NULL,
+                      analyzer_failed = function(e) NULL)
   if (is.null(metrics)) return(FALSE)
   identical(as.character(metrics[["input_kind"]] %||% NA_character_), kind)
 }
