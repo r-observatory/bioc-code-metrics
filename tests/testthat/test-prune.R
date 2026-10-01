@@ -17,21 +17,48 @@ test_that("nothing is pruned when under the keep threshold", {
                    character(0L))
 })
 
-test_that("KEEP all selects nothing among 400 tags", {
+test_that("keep = Inf selects nothing among 400 tags", {
   tags <- format(as.Date("2025-01-01") + 0:399, "metrics-%Y-%m-%d")
-  expect_identical(releases_to_prune(tags, keep = parse_keep("all")), character(0L))
-  expect_identical(releases_to_prune(tags, keep = parse_keep(" ALL ")), character(0L))
+  expect_identical(releases_to_prune(tags, keep = Inf), character(0L))
 })
 
-test_that("a numeric KEEP is unchanged", {
+test_that("parse_keep maps all to Inf and reads digits as an integer", {
+  expect_identical(parse_keep("all"), Inf)
+  expect_identical(parse_keep(" ALL "), Inf)
   expect_identical(parse_keep("30"), 30L)
+  expect_identical(parse_keep(" 30 "), 30L)
   expect_identical(parse_keep("5"), 5L)
-  tags <- format(as.Date("2025-01-01") + 0:399, "metrics-%Y-%m-%d")
-  expect_gt(length(releases_to_prune(tags, keep = parse_keep("30"))), 0L)
+  expect_identical(parse_keep("2147483647"), 2147483647L)
 })
 
-test_that("a KEEP that is neither a number nor all is an error", {
-  expect_error(parse_keep("lots"), "KEEP")
+test_that("parse_keep refuses anything but all or digits", {
+  for (bad in c("lots", "30.5", "1e3", "0x10", "-1", "", "  ", "+3", "3 0",
+                "2147483648", "99999999999")) {
+    expect_error(parse_keep(bad), "KEEP", info = bad)
+  }
+  expect_error(parse_keep(NA_character_), "KEEP")
+})
+
+test_that("the script prints nothing for KEEP=all, prunes for a number, and fails otherwise", {
+  tags <- format(as.Date("2025-01-01") + 0:399, "metrics-%Y-%m-%d")
+  script <- file.path("..", "..", "scripts", "prune.R")
+  run <- function(keep, stderr = "") {
+    f <- tempfile(); on.exit(unlink(f)); writeLines(tags, f)
+    system2("Rscript", script, stdin = f, stdout = TRUE, stderr = stderr,
+            env = paste0("KEEP=", keep))
+  }
+  out_all <- run("all")
+  expect_null(attr(out_all, "status"))
+  expect_length(out_all, 0L)
+  out_30 <- run("30")
+  expect_null(attr(out_30, "status"))
+  expect_identical(sort(out_30), sort(releases_to_prune(tags, keep = 30L)))
+  expect_gt(length(out_30), 0L)
+  for (bad in c("30.5", "1e3", "0x10", "-1")) {
+    out_bad <- suppressWarnings(run(bad, stderr = FALSE))
+    expect_false(is.null(attr(out_bad, "status")), info = bad)
+    expect_length(out_bad, 0L)
+  }
 })
 
 test_that("the prune step keeps everything but still clears drafts and swap assets", {
@@ -39,7 +66,8 @@ test_that("the prune step keeps everything but still clears drafts and swap asse
                collapse = "\n")
   step <- sub("(?s).*- name: Prune old dated releases", "", yml, perl = TRUE)
   step <- sub("(?s)\n  keepalive:.*", "", step, perl = TRUE)
-  expect_true(grepl('KEEP: "all"', step, fixed = TRUE))
+  expect_true(grepl('(?m)^\\s*KEEP: "all"\\s*$', step, perl = TRUE))
+  expect_false(grepl('KEEP: "30"', step, fixed = TRUE))
   expect_true(grepl("delete_stale_drafts metrics", step, fixed = TRUE))
   expect_true(grepl("sweep_swap_leftovers metrics", step, fixed = TRUE))
 })
