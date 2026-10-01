@@ -32,7 +32,7 @@ test_that("update.yml refuses to publish a heartbeat for an empty universe", {
 
 .stub_analyze <- function() {
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) {
+  assign("analyze_package", function(dest, pkg, ...) {
     build <- rpkg_analyzer_version()
     # The analyzer prints a dcf record, and from 0.5.0 a release_notes record too.
     notes <- if (analyzer_at_least(build, "0.5.0")) {

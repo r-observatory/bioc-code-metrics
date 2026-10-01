@@ -686,7 +686,7 @@ test_that("a scanned row records which build scanned it and which generation it 
 .ds_stub_analyze <- function(version = "0.4.0-test") {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L, n_fns_r = 1L,
       latest_release_date = "2026-01-01", datasets_scanned = TRUE, detail_scanned = TRUE,
       analyzer_version = version, stringsAsFactors = FALSE),
@@ -700,7 +700,7 @@ test_that("a scanned row records which build scanned it and which generation it 
 .ds_stub_fallback <- function() {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L,
       latest_release_date = "2026-01-01", datasets_scanned = NA, detail_scanned = TRUE,
       stringsAsFactors = FALSE),

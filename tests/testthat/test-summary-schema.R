@@ -84,7 +84,7 @@ test_that("a run under a 0.5.0 analyzer writes the declared types", {
   env <- environment(run_update)
   old <- get("analyze_package", envir = env)
   on.exit(assign("analyze_package", old, envir = env), add = TRUE)
-  assign("analyze_package", function(dest, pkg) {
+  assign("analyze_package", function(dest, pkg, ...) {
     s <- .ss_all_na_shard(pkg)
     s$analyzer_version <- "0.5.0-test"
     s$latest_release_date <- "2026-01-01"

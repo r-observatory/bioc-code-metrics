@@ -83,12 +83,14 @@
 }
 
 # The stage of an error analyze_package raised. An elapsed time at the cap also
-# catches a cap swallowed earlier and a later failure.
+# catches a cap swallowed earlier and a later failure. An analyzer that was
+# killed, or failed on a version with analyzer rows, is a crash.
 .classify_failure <- function(e, elapsed, worker_timeout = WORKER_TIMEOUT) {
   if (inherits(e, "extract_failure")) {
     return(if (isTRUE(e$status == 124L)) "git_timeout" else "extract")
   }
   if (inherits(e, "analyzer_parse_incomplete")) return("analyze")
+  if (inherits(e, c("analyzer_killed", "analyzer_failed"))) return("crash")
   if ((inherits(e, "condition") && .is_time_limit(e)) ||
       isTRUE(elapsed >= worker_timeout)) {
     return("timeout")
@@ -806,6 +808,22 @@
   summary_df
 }
 
+# The versions of each package whose stored row names an analyzer build, any
+# build. A named list with an entry, possibly empty, for every package asked.
+.stamped_versions <- function(con, pkgs) {
+  pkgs <- as.character(pkgs)
+  out  <- stats::setNames(rep(list(character(0L)), length(pkgs)), pkgs)
+  if (!SUMMARY_TABLE %in% DBI::dbListTables(con)) return(out)
+  if (!"analyzer_version" %in% DBI::dbListFields(con, SUMMARY_TABLE)) return(out)
+  sql <- sprintf('SELECT version FROM "%s" WHERE package = ?
+                     AND analyzer_version IS NOT NULL AND analyzer_version != \'\'
+                   ORDER BY version', SUMMARY_TABLE)
+  for (p in pkgs) {
+    out[[p]] <- as.character(DBI::dbGetQuery(con, sql, params = list(p))$version)
+  }
+  out
+}
+
 # ---------------------------------------------------------------------------
 # default_io
 # ---------------------------------------------------------------------------
@@ -1107,12 +1125,13 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # and every dataset row come from the binary alone, so each package analysed
   # stays in the backfill pool and the next run selects the same shard again.
   # The bootstrap never advances and nothing else in the output says so, which
-  # is a silent stall rather than a failure.
+  # is a silent stall rather than a failure. A package with analyzer rows
+  # fails instead, so those rows stay.
   if (!nzchar(rpkg_analyzer_bin())) {
     warning("rpkg-analyzer not found: per-package detail and dataset rows will ",
-            "not be written, the backfill pool will not drain, and the shard ",
-            "will not advance between runs. Set RPKG_ANALYZER_BIN or install ",
-            "the binary.",
+            "not be written, the backfill pool will not drain, the shard will ",
+            "not advance between runs, and a package with analyzer rows will ",
+            "fail. Set RPKG_ANALYZER_BIN or install the binary.",
             call. = FALSE, immediate. = TRUE)
   }
 
@@ -1121,8 +1140,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
-  # A build that rejected the flag would exit 2 on every package and leave every
-  # row to the R fallback, so a 0.5.0 build proves it reads the flag first.
+  # A build that rejected the flag would exit 2 on every package: a crash for
+  # each one with analyzer rows and the R fallback for the rest. So a 0.5.0
+  # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
       !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
     stop(sprintf(paste0(
@@ -1320,6 +1340,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # Each clone's seconds go to the worker tally; its value and status do not change.
   io$clone <- .timed_phase("clone_s", io$clone)
 
+  # Read here because a worker cannot: an analyzer failure on one of these
+  # versions fails its package instead of replacing the stored row.
+  shard_stamped <- .stamped_versions(con, shard_pkgs)
+
   # Worker: clone + analyze one package. No database access.
   # Returns list(package, ok = TRUE, elapsed, summary, churn, ...) or, when the
   # package failed, list(package, ok = FALSE, stage, elapsed, reason).
@@ -1366,7 +1390,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
     err <- NULL
     res <- tryCatch(
-      analyze_package(dest, pkg),
+      analyze_package(dest, pkg, stamped = shard_stamped[[pkg]]),
       error = function(e) {
         err <<- e
         NULL

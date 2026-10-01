@@ -11,7 +11,7 @@ test_that("run_update produces separate code and data DB files", {
   # Stub analyze_package to emit a summary row plus one dataset row.
   local_mocked_bindings <- NULL
   old <- analyze_package
-  assign("analyze_package", function(dest, pkg) list(
+  assign("analyze_package", function(dest, pkg, ...) list(
     summary = data.frame(package = pkg, version = "1.0", loc_r = 10L,
                          n_fns_r = 1L, latest_release_date = "2026-01-01",
                          datasets_scanned = 1L, detail_scanned = 1L,

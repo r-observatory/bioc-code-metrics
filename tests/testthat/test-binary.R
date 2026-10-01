@@ -421,18 +421,24 @@ test_that("the analyzer CI installs answers the self-check package", {
 # A crashed analyzer, and a cap while asking the analyzer its version
 # ---------------------------------------------------------------------------
 
-test_that("an analyzer that prints its summary and then exits non-zero gives the R fallback", {
+test_that("an analyzer that prints its summary and then exits 101 gives the R fallback, and one that is killed is raised", {
   skip_on_os("windows")
   dir <- withr::local_tempdir()
-  for (ending in c("exit 101", "kill -9 $$")) {
+  withr::local_envvar(RPKG_ANALYZER_STATS = NA)
+  crashed <- function(ending) {
     stub <- file.path(dir, "stub-crash.sh")
     writeLines(c("#!/bin/sh",
                  'echo "{\\"rec\\":\\"summary\\",\\"package\\":\\"demo\\"}"',
                  ending), stub)
     Sys.chmod(stub, mode = "0755")
     withr::local_envvar(RPKG_ANALYZER_BIN = stub)
-    expect_null(analyze_with_binary(dir), info = ending)
+    tryCatch(analyze_with_binary(dir), error = function(e) e)
   }
+  expect_null(crashed("exit 101"))
+  # A real signal, which the shell reports as 128 plus its number.
+  killed <- crashed("kill -9 $$")
+  expect_s3_class(killed, "analyzer_killed")
+  expect_identical(killed$status, 137L)
 })
 
 test_that("a cap while asking the analyzer its version asks again", {
