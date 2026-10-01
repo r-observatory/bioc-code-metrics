@@ -1608,10 +1608,14 @@ upsert_datasets <- function(data_con, datasets_df, pkgs) {
 #'   the manifest carries how many declared columns hold nothing for anybody,
 #'   so the finding outlives the run that made it. NULL leaves the block out,
 #'   which is what the code series does: it has no dataset columns to measure.
+#' @param now         The time stamped as generated_at and last_checked, and as
+#'   last_changed when none is given. A shard passes one read to both of its
+#'   manifests, so the two cannot land a second apart.
 build_manifest <- function(con, series, repo, db_filename, db_bytes,
                            tables, fp_table, fp_cols, pkg_table, ver_table,
                            stat_table, stat_cols, bootstrap,
-                           last_changed = NULL, coverage = NULL) {
+                           last_changed = NULL, coverage = NULL,
+                           now = Sys.time()) {
   present <- DBI::dbListTables(con)
   count_tbl <- function(t) {
     if (!t %in% present) return(0L)
@@ -1674,7 +1678,7 @@ build_manifest <- function(con, series, repo, db_filename, db_bytes,
     }
   }
 
-  now_iso <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  now_iso <- format(now, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
   out <- list(
     schema_version = 1L,

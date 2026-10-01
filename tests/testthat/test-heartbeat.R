@@ -102,6 +102,44 @@ test_that("build_manifest defaults last_changed to this run when none is supplie
   expect_equal(m$last_changed, m$generated_at)
 })
 
+test_that("build_manifest stamps the time it is given", {
+  con <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  m <- build_manifest(con, "code", "r-observatory/bioc-code-metrics",
+                      DB_FILENAME, 1024, character(0L), "t", "c", "t", "t",
+                      "t", character(0L),
+                      list(n_analyzed = 0L, n_universe = 0L, n_remaining = 0L,
+                           bootstrap_complete = TRUE),
+                      now = as.POSIXct("2026-07-22 06:38:00", tz = "UTC"))
+
+  expect_identical(c(m$generated_at, m$last_checked, m$last_changed),
+                   rep("2026-07-22T06:38:00Z", 3L))
+})
+
+# A shard writes two manifests, and a second can turn over between two clock
+# reads. The clock here moves a second at every read, so a shard that read it
+# once per manifest would date the data manifest a second after the code one.
+test_that("a shard stamps both manifests and its status from one clock read", {
+  old <- .stub_analyze()
+  on.exit(assign("analyze_package", old, envir = environment(run_update)), add = TRUE)
+
+  out <- withr::local_tempdir()
+  .local_stepping_clock()
+  returned <- run_update(.heartbeat_io(), out, shard_size = 10L)
+  code   <- jsonlite::fromJSON(file.path(out, "code-manifest.json"))
+  data   <- jsonlite::fromJSON(file.path(out, "data-manifest.json"))
+  status <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+
+  expect_true(returned$changed)
+  for (field in c("generated_at", "last_checked", "last_changed")) {
+    expect_identical(data[[field]], code[[field]], info = field)
+  }
+  expect_identical(returned$generated_at, code$generated_at)
+  expect_identical(c(status$last_changed, status$data_last_changed),
+                   rep(code$last_changed, 2L))
+})
+
 # The behaviour that actually fixes the daily red merge: a run that finds nothing
 # to do must still refresh last_checked, while leaving last_changed at the moment
 # the data really moved.

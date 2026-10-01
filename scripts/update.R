@@ -1497,12 +1497,16 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                           "SELECT COUNT(*) n FROM bioc_over_cap WHERE last_run_id = ?",
                           params = list(run_id))$n))
 
-  prev_manifest <- tryCatch({
-    prev_path <- file.path(out_dir, "prev-code-manifest.json")
-    cur_path  <- file.path(out_dir, "code-manifest.json")
+  # The manifest a series had before this shard: the prior release's when the
+  # workflow fetched one, else the one already in out_dir.
+  prior_manifest <- function(name) tryCatch({
+    prev_path <- file.path(out_dir, paste0("prev-", name))
+    cur_path  <- file.path(out_dir, name)
     src <- if (file.exists(prev_path)) prev_path else if (file.exists(cur_path)) cur_path else NULL
     if (is.null(src)) NULL else jsonlite::fromJSON(src)
   }, error = function(e) NULL)
+  prev_manifest      <- prior_manifest("code-manifest.json")
+  prev_data_manifest <- prior_manifest("data-manifest.json")
   prior_fp <- prev_manifest[["fingerprint"]]
 
   # bootstrap_complete: no deferred packages remain AND DB covers the universe
@@ -1519,8 +1523,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     !identical(prior_fp, new_fp)
   changed <- data_moved || n_verdicts_written > 0L || n_released > 0L
 
+  # The shard's one clock read. Both manifests and the list returned carry it:
+  # a read for each could land either side of a second.
+  shard_now <- Sys.time()
+
   manifest <- list(
-    generated_at         = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    generated_at         = format(shard_now, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
     n_universe           = n_universe,
     n_analyzed           = n_analyzed_pkgs,
     n_shard              = length(shard_pkgs),
@@ -1582,12 +1590,20 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # when it carries this run's id: out/ can hold one left by another run. NULL
   # (no previous manifest, or one predating these fields) means "now", which is
   # correct for a first run and honest for the changeover.
+  #
+  # Each manifest carries its own time forward. The two published before a
+  # shard read the clock once can sit a second apart, and one written into the
+  # other would move that manifest's last_changed. A data manifest with no time
+  # of its own to carry takes the code manifest's.
   this_run <- tryCatch(jsonlite::fromJSON(file.path(out_dir, "run-status.json")),
                        error = function(e) NULL)
   same_run <- !is.na(run_id) && identical(this_run[["run_id"]], run_id)
-  last_changed <- if (data_moved) NULL else
-    ((if (same_run) this_run[["last_changed"]]) %||%
-       prev_manifest[["last_changed"]] %||% prev_manifest[["generated_at"]])
+  carried <- function(prev, status_key) if (data_moved) NULL else
+    ((if (same_run) this_run[[status_key]]) %||%
+       prev[["last_changed"]] %||% prev[["generated_at"]])
+  code_last_changed <- carried(prev_manifest, "last_changed")
+  data_last_changed <- carried(prev_data_manifest, "data_last_changed") %||%
+    code_last_changed
   code_db_bytes <- as.numeric(file.info(db_path)$size %||% 0)
   data_db_bytes <- as.numeric(file.info(data_db_path)$size %||% 0)
 
@@ -1622,7 +1638,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     fp_table = "bioc_code_summary", fp_cols = c("package", "version"),
     pkg_table = "bioc_code_summary", ver_table = "bioc_code_summary",
     stat_table = "bioc_code_summary", stat_cols = c("loc_r", "n_fns_r"),
-    bootstrap = bootstrap, last_changed = last_changed)
+    bootstrap = bootstrap, last_changed = code_last_changed, now = shard_now)
 
   data_manifest <- build_manifest(
     data_con, series = "data", repo = PUBLISH_REPO, db_filename = DATA_DB_FILENAME,
@@ -1631,8 +1647,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     fp_table = "bioc_datasets", fp_cols = c("package", "name", "current_content_id"),
     pkg_table = "bioc_datasets", ver_table = "bioc_dataset_versions",
     stat_table = "bioc_dataset_contents", stat_cols = c("nrow", "ncol"),
-    bootstrap = bootstrap, last_changed = last_changed,
-    coverage = dataset_coverage)
+    bootstrap = bootstrap, last_changed = data_last_changed,
+    coverage = dataset_coverage, now = shard_now)
 
   write_manifest(file.path(out_dir, "code-manifest.json"), code_manifest)
   write_manifest(file.path(out_dir, "data-manifest.json"), data_manifest)
@@ -1656,6 +1672,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       n_recheck_due = length(recheck_pkgs),
                       latest_by_build = .latest_by_build(con),
                       run_id = run_id, last_changed = code_manifest$last_changed,
+                      data_last_changed = data_manifest$last_changed,
                       analyzer_stats = telemetry$analyzer,
                       worker_phases = telemetry$phases))
 
