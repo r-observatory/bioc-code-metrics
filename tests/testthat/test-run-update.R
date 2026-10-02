@@ -932,3 +932,249 @@ test_that("a fork that crashed adds nothing, and the phases add up to the packag
     "worker time: clone 1.0 s, extract 1.0 s, analyzer 4.0 s, record parse 1.0 s,",
     "metrics 2.0 s, other 1.0 s"))
 })
+
+# ---------------------------------------------------------------------------
+# The shard's memory lines
+# ---------------------------------------------------------------------------
+
+# One statistics line of a build that writes the memory keys; each argument is
+# JSON text, so "null" is a key the platform could not fill.
+.mem_stats <- function(rss = "null", vm = "null", kept = "null", over = "null") {
+  sprintf(paste0('{"build":"0.5.2-test","ms":1,"peak_rss_kb":%s,"peak_vm_kb":%s,',
+                 '"data_kept_max":%s,"data_over_budget":%s}'), rss, vm, kept, over)
+}
+
+# A stub analyzer of build 0.5.2-test. `lines` names, by "package/version", the
+# statistics line that release appends; any other release appends one with the
+# memory keys null. A release named in `exits` ends with that status instead.
+.stub_memory_bin <- function(dir, lines = character(0L), exits = integer(0L)) {
+  stub <- file.path(dir, "stub-memory.sh")
+  writeLines(c(
+    "#!/bin/sh",
+    'if [ "$1" = "--version" ]; then echo "rpkg-analyzer 0.5.2-test"; exit 0; fi',
+    'p=$(sed -n "s/^Package: *//p" "$1/DESCRIPTION" | head -1)',
+    'v=$(sed -n "s/^Version: *//p" "$1/DESCRIPTION" | head -1)',
+    sprintf("stats='%s'", .mem_stats()),
+    'case "$p/$v" in',
+    sprintf("  %s) exit %d ;;", names(exits), as.integer(exits)),
+    sprintf("  %s) stats='%s' ;;", names(lines), lines),
+    "esac",
+    sprintf("echo '{\"rec\":\"summary\",\"input_kind\":\"%s\",\"loc_r\":1,\"n_fns_r\":1}'",
+            ANALYZER_INPUT_KIND),
+    'if [ -n "$RPKG_ANALYZER_STATS" ]; then echo "$stats" >> "$RPKG_ANALYZER_STATS"; fi',
+    "exit 0"), stub)
+  Sys.chmod(stub, mode = "0755")
+  stub
+}
+
+test_that("the shard keeps the largest peak of each kind with its package, and what the data kept", {
+  s <- .sum_analyzer_stats(
+    c(.mem_stats(1000, 9000, 10, 0), .mem_stats(3000, 3500, 30, 2),
+      .mem_stats(2000, 4000, 20, 0), .mem_stats(), .mem_stats(500, 600, 5, 1)),
+    packages = c("pkgA", "pkgB", "pkgB", "pkgC", "pkgD"))
+  expect_identical(s$runs, 5L)
+  expect_equal(s$peak_rss_kb, 3000)
+  expect_identical(s$peak_rss_package, "pkgB")
+  expect_equal(s$peak_vm_kb, 9000)
+  expect_identical(s$peak_vm_package, "pkgA")
+  expect_equal(s$data_kept_max, 30)
+  expect_identical(as.character(s$data_over_budget), c("pkgB", "pkgD"))
+  # One row a package, its largest of each over its releases, largest resident first.
+  expect_equal(s$peaks, list(
+    list(package = "pkgB", peak_rss_kb = 3000, peak_vm_kb = 4000),
+    list(package = "pkgA", peak_rss_kb = 1000, peak_vm_kb = 9000),
+    list(package = "pkgD", peak_rss_kb = 500, peak_vm_kb = 600)))
+})
+
+test_that("only the five largest peaks are kept", {
+  rss  <- c(10, 70, 30, 50, 20, 60, 40)
+  pkgs <- paste0("pkg", LETTERS[seq_along(rss)])
+  s <- .sum_analyzer_stats(vapply(rss, function(x) .mem_stats(x, x + 1), character(1L)),
+                           packages = pkgs)
+  expect_identical(vapply(s$peaks, function(p) p$package, character(1L)),
+                   c("pkgB", "pkgF", "pkgD", "pkgG", "pkgC"))
+  expect_equal(vapply(s$peaks, function(p) p$peak_rss_kb, numeric(1L)), c(70, 60, 50, 40, 30))
+})
+
+test_that("absent or null memory keys read as no memory figures from this build", {
+  old <- '{"build":"0.5.1","ms":10,"compiled":{"files":2,"hits":1},"cache_errors":0}'
+  for (lines in list(c(old, old), c(.mem_stats(), .mem_stats()), character(0L))) {
+    s <- .sum_analyzer_stats(lines, packages = rep("pkgA", length(lines)))
+    for (k in c("peak_rss_kb", "peak_rss_package", "peak_vm_kb", "peak_vm_package",
+                "data_kept_max")) {
+      expect_true(is.na(s[[k]]), info = k)
+    }
+    expect_length(s$data_over_budget, 0L)
+    expect_length(s$peaks, 0L)
+    expect_identical(.analyzer_memory_line(s),
+                     "analyzer memory: no memory figures from this build")
+  }
+  # The sums 0.5.1 has always given are what they were.
+  expect_equal(.sum_analyzer_stats(c(old, old))$ms, 20)
+})
+
+test_that("the analyzer memory line names each figure it has, with its package", {
+  s <- .sum_analyzer_stats(
+    c(.mem_stats(1382400, 1458176, 1045000000, 0), .mem_stats(2048, 4096, 1048576, 3)),
+    packages = c("HMP16SData", "pkgB"))
+  expect_identical(.analyzer_memory_line(s), paste0(
+    "analyzer memory: peak resident 1350.0 MiB (HMP16SData), ",
+    "peak virtual 1424.0 MiB (HMP16SData), largest data kept 996.6 MiB, ",
+    "over the data budget: pkgB"))
+  none <- .sum_analyzer_stats(.mem_stats(2048, 4096, 1048576, 0), packages = "pkgA")
+  expect_match(.analyzer_memory_line(none), "over the data budget: none$")
+  # Off Linux the build writes the peaks as null and still counts the data.
+  mac <- .sum_analyzer_stats(.mem_stats(kept = 1048576, over = 0), packages = "pkgA")
+  expect_identical(.analyzer_memory_line(mac), paste0(
+    "analyzer memory: no peak figures on this platform, largest data kept 1.0 MiB, ",
+    "over the data budget: none"))
+})
+
+test_that("a figure is read from the process status file, and is NA where there is none", {
+  status <- withr::local_tempfile()
+  writeLines(c("Name:\tR", "VmPeak:\t 2101248 kB", "VmHWM:\t  239616 kB", "Threads:\t1"), status)
+  expect_equal(.proc_status_kb("VmHWM", status), 239616)
+  expect_equal(.proc_status_kb("VmPeak", status), 2101248)
+  expect_true(is.na(.proc_status_kb("VmSwap", status)))
+  expect_true(is.na(.proc_status_kb("VmHWM", file.path(withr::local_tempdir(), "none"))))
+  here <- .proc_status_kb("VmHWM")
+  if (file.exists("/proc/self/status")) expect_gt(here, 0) else expect_true(is.na(here))
+})
+
+test_that("a worker returns its peak and the size of its result, and fails nowhere", {
+  .local_global("WORK_DIR", withr::local_tempdir())
+  res <- .with_worker_telemetry(function(pkg) {
+    list(package = pkg, ok = TRUE, summary = data.frame(x = seq_len(1000L)))
+  })("pkgA")
+  expect_gt(res$memory$result_bytes, 4000)
+  if (file.exists("/proc/self/status")) {
+    expect_gt(res$memory$peak_rss_kb, 0)
+  } else {
+    expect_true(is.na(res$memory$peak_rss_kb))
+  }
+  # A fork that raised returned no list, and gains nothing.
+  expect_identical(.with_worker_telemetry(function(pkg) "boom")("pkgB"), "boom")
+})
+
+test_that("the shard keeps the largest worker peak and the largest result, each with its package", {
+  tel <- .shard_telemetry(list(
+    list(package = "pkgA", memory = list(peak_rss_kb = 239616, result_bytes = 1048576)),
+    NULL, structure("boom", class = "try-error"),
+    list(package = "pkgB", memory = list(peak_rss_kb = 102400, result_bytes = 52428800)),
+    list(package = "pkgC")))
+  expect_equal(tel$workers, list(peak_rss_kb = 239616, peak_rss_package = "pkgA",
+                                 result_bytes = 52428800, result_package = "pkgB"))
+  expect_identical(.worker_memory_line(tel$workers),
+                   "worker memory: peak resident 234.0 MiB (pkgA), largest result 50.0 MiB (pkgB)")
+
+  off_linux <- .shard_telemetry(list(
+    list(package = "pkgA", memory = list(peak_rss_kb = NA_real_, result_bytes = 2097152))))
+  expect_true(is.na(off_linux$workers$peak_rss_kb))
+  expect_identical(.worker_memory_line(off_linux$workers), paste0(
+    "worker memory: no peak figure on this platform, largest result 2.0 MiB (pkgA)"))
+  expect_identical(.worker_memory_line(.shard_telemetry(list(NULL))$workers),
+                   "worker memory: no memory figures")
+})
+
+test_that("the shard prints its memory lines and writes the peaks to run-status.json alone", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  stub <- .stub_memory_bin(withr::local_tempdir(), lines = c(
+    "pkgA/1.0" = .mem_stats(1382400, 1458176, 1045000000, 0),
+    "pkgA/1.1" = .mem_stats(102400, 2097152, 1048576, 0),
+    "pkgB/1.0" = .mem_stats(204800, 409600, 2097152, 1)))
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub, RPA_CACHE = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB", "pkgC"),
+                       latest_version = c("1.1", "1.0", "1.0"), stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"))), out_dir, shard_size = 10L))
+
+  expect_true(paste0(
+    "analyzer memory: peak resident 1350.0 MiB (pkgA), peak virtual 2048.0 MiB (pkgA), ",
+    "largest data kept 996.6 MiB, over the data budget: pkgB") %in% log)
+  expect_length(grep("^worker memory: ", log), 1L)
+  expect_match(grep("^worker memory: ", log, value = TRUE),
+               "largest result [0-9.]+ MiB \\(pkg[ABC]\\)$")
+
+  st <- .run_status(out_dir)
+  expect_identical(st$analyzer_stats$runs, 4L)
+  expect_equal(st$analyzer_stats$peak_rss_kb, 1382400)
+  expect_identical(st$analyzer_stats$peak_rss_package, "pkgA")
+  expect_equal(st$analyzer_stats$peak_vm_kb, 2097152)
+  expect_identical(st$analyzer_stats$peak_vm_package, "pkgA")
+  expect_equal(st$analyzer_stats$data_kept_max, 1045000000)
+  expect_identical(st$analyzer_stats$data_over_budget, list("pkgB"))
+  expect_equal(st$analyzer_stats$peaks, list(
+    list(package = "pkgA", peak_rss_kb = 1382400, peak_vm_kb = 2097152),
+    list(package = "pkgB", peak_rss_kb = 204800, peak_vm_kb = 409600)))
+  expect_setequal(names(st$worker_memory),
+                  c("peak_rss_kb", "peak_rss_package", "result_bytes", "result_package"))
+  expect_gt(st$worker_memory$result_bytes, 0)
+  for (f in c("code-manifest.json", "data-manifest.json")) {
+    published <- jsonlite::fromJSON(file.path(out_dir, f), simplifyVector = FALSE)
+    expect_false(any(c("worker_memory", "peaks", "peak_rss_kb") %in%
+                       c(names(published), names(published$bootstrap))), info = f)
+  }
+})
+
+test_that("a build that writes no memory keys says so, and run-status.json holds nulls", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  withr::local_envvar(RPKG_ANALYZER_BIN = .stub_stats_bin(withr::local_tempdir()),
+                      STUB_SEEN = NA, RPA_CACHE = NA)
+  pkg_df <- data.frame(package = "pkgA", latest_version = "1.0", stringsAsFactors = FALSE)
+  log <- capture.output(run_update(.fake_io(pkg_df), out_dir, shard_size = 10L))
+  expect_true("analyzer memory: no memory figures from this build" %in% log)
+  st <- .run_status(out_dir)$analyzer_stats
+  expect_true(all(c("peak_rss_kb", "peak_rss_package", "peak_vm_kb", "peak_vm_package",
+                    "data_kept_max", "data_over_budget", "peaks") %in% names(st)))
+  expect_null(st$peak_rss_kb)
+  expect_null(st$peak_vm_package)
+  expect_identical(st$data_over_budget, list())
+  expect_identical(st$peaks, list())
+})
+
+# ---------------------------------------------------------------------------
+# The analyzer's exit status on the worker's line
+# ---------------------------------------------------------------------------
+
+test_that(".worker_line carries the analyzer's non-zero exits, ok or not", {
+  expect_identical(
+    .worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5, analyzer_exit = "101 x2"),
+    "[2/9] ok pkgA: 3 versions in 1.5s [analyzer exit 101 x2]\n")
+  expect_identical(
+    .worker_line(1L, 9L, FALSE, "pkgB", "crash", 0L, 0.5, "it died", analyzer_exit = "134 x1"),
+    "[1/9] FAIL pkgB: crash after 0.5s [analyzer exit 134 x1]: it died\n")
+  expect_identical(.worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5, analyzer_exit = ""),
+                   .worker_line(2L, 9L, TRUE, "pkgA", "ok", 3L, 1.5))
+})
+
+test_that("the exits a worker counted read as status and count, and as nothing when all were 0", {
+  expect_identical(.analyzer_exit_text(list(analyzer_s = 2, package_s = 3)), "")
+  expect_identical(.analyzer_exit_text(list(analyzer_exit_134 = 1, analyzer_exit_101 = 2,
+                                            analyzer_s = 2)), "101 x2, 134 x1")
+})
+
+test_that("a package whose analyzer exited non-zero prints its line with the status", {
+  skip_on_os("windows")
+  out_dir <- withr::local_tempdir()
+  .local_global("WORK_DIR", withr::local_tempdir())
+  # One core, so the lines the workers print are captured here.
+  .local_global("ANALYSIS_CORES", 1L)
+  # pkgA takes the R fallback on both releases, pkgB is killed, pkgC and pkgD pass.
+  stub <- .stub_memory_bin(withr::local_tempdir(), exits = c(
+    "pkgA/1.0" = 101L, "pkgA/1.1" = 101L, "pkgB/1.0" = 134L))
+  withr::local_envvar(RPKG_ANALYZER_BIN = stub, RPA_CACHE = NA)
+  pkg_df <- data.frame(package = c("pkgA", "pkgB", "pkgC", "pkgD"),
+                       latest_version = c("1.1", "1.0", "1.0", "1.0"), stringsAsFactors = FALSE)
+  log <- capture.output(run_update(
+    .fake_io(pkg_df, version_map = list(pkgA = c("1.0", "1.1"))), out_dir, shard_size = 10L))
+  expect_length(grep("^\\[1/4\\] ok pkgA: 2 versions in [0-9.]+s \\[analyzer exit 101 x2\\]$",
+                     log), 1L)
+  expect_length(grep(paste0("^\\[2/4\\] FAIL pkgB: crash after [0-9.]+s ",
+                            "\\[analyzer exit 134 x1\\]: rpkg-analyzer was killed"), log), 1L)
+  # A package whose analyzer exited 0 is still thinned out of the log.
+  expect_length(grep("pkgC", log), 0L)
+})

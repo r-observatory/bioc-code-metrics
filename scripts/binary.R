@@ -66,6 +66,16 @@ analyzer_at_least <- function(v, min) {
   mget(sort(ls(.WORKER_TALLY, all.names = TRUE)), envir = .WORKER_TALLY)
 }
 
+# The analyzer's non-zero exits in a worker's tally, as its line carries them:
+# "101 x2, 134 x1" for two runs that exited 101 and one that exited 134; ""
+# when every run exited 0.
+.analyzer_exit_text <- function(tally = .tally_snapshot()) {
+  nm <- sort(grep("^analyzer_exit_", names(tally), value = TRUE))
+  if (length(nm) == 0L) return("")
+  paste(sprintf("%s x%d", sub("^analyzer_exit_", "", nm), as.integer(unlist(tally[nm]))),
+        collapse = ", ")
+}
+
 # Seconds since t0, a proc.time()[["elapsed"]] reading.
 .secs_since <- function(t0) proc.time()[["elapsed"]] - t0
 
@@ -645,6 +655,7 @@ analyze_with_binary <- function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL,
   }
 
   status <- as.integer(attr(out, "status") %||% 0L)
+  if (status != 0L) .tally_add(sprintf("analyzer_exit_%d", status), 1)
   if (status >= 128L) stop(.analyzer_killed(status))
   if (status != 0L) return(unusable(status))
   # A signalled analyzer can come back with partial lines and no status.
