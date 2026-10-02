@@ -74,6 +74,16 @@ ANALYSIS_CORES <- {
 # packages that finish have taken more than 1,500 s.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
 
+# The address space one analyzer process may take, in MiB, set with prlimit
+# where the runner has it. An analyzer past it aborts, which fails its package
+# and leaves the stored rows as they were. 0 is no limit. Overridable via the
+# ANALYZER_MEMORY_LIMIT_MB env var; a value that is empty or not a whole number
+# of zero or more leaves the default.
+ANALYZER_MEMORY_LIMIT_MB <- {
+  mb <- suppressWarnings(as.integer(Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = "")))
+  if (is.na(mb) || mb < 0L) 3072L else mb
+}
+
 # The most one worker's progress line may be, in bytes. The forks share fd 1,
 # and a write within PIPE_BUF (at least 512 bytes by POSIX) arrives whole, so
 # a line that now carries a failure's reason cannot be split by another fork's.

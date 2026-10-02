@@ -385,6 +385,18 @@
           p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
 }
 
+# The shard plan's line on the analyzer's address-space limit.
+.analyzer_limit_line <- function(limit_mb = .analyzer_limit_mb(),
+                                 configured_mb = ANALYZER_MEMORY_LIMIT_MB) {
+  if (limit_mb > 0L) {
+    return(sprintf("analyzer memory limit: %d MiB of address space for each analyzer\n",
+                   limit_mb))
+  }
+  sprintf("analyzer memory limit: none%s (ANALYZER_MEMORY_LIMIT_MB is %d)\n",
+          if (isTRUE(configured_mb > 0L)) ", prlimit was not found" else "",
+          as.integer(configured_mb))
+}
+
 # The shard receipt's verdict line.
 .verdict_receipt_line <- function(stages, over_cap, n_standing) {
   by <- .stage_counts(stages)
@@ -1261,9 +1273,11 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
       !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
+    limit_mb <- .analyzer_limit_mb()
     stop(sprintf(paste0(
-      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it; ",
-      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND),
+      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it%s; ",
+      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND,
+      if (limit_mb > 0L) sprintf(" under its %d MiB address-space limit", limit_mb) else ""),
       call. = FALSE)
   }
 
@@ -1431,6 +1445,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
       file = stdout())
+  analyzer_limit_mb <- .analyzer_limit_mb()
+  cat(.analyzer_limit_line(analyzer_limit_mb), file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -1817,6 +1833,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       latest_by_build = .latest_by_build(con),
                       run_id = run_id, last_changed = code_manifest$last_changed,
                       data_last_changed = data_manifest$last_changed,
+                      analyzer_memory_limit_mb = analyzer_limit_mb,
                       analyzer_stats = telemetry$analyzer,
                       worker_phases = telemetry$phases,
                       worker_memory = telemetry$workers))
