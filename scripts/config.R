@@ -41,7 +41,7 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 # Builds whose output the pinned build reproduces record for record, as the
 # analyzer gate report quoted in the pin PR shows. A build not listed stands
 # alone, so leaving one out costs a rescan and never skips one.
-ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1")
+ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1", "0.5.2")
 
 # Timeouts, crashes and git timeouts a package may take under one analyzer
 # build and one WORKER_TIMEOUT before it is parked. A timeout costs a worker
