@@ -41,7 +41,7 @@ MAX_ANALYZER_READ_ATTEMPTS <- 2L
 # Builds whose output the pinned build reproduces record for record, as the
 # analyzer gate report quoted in the pin PR shows. A build not listed stands
 # alone, so leaving one out costs a rescan and never skips one.
-ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1")
+ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1", "0.5.2")
 
 # Timeouts, crashes and git timeouts a package may take under one analyzer
 # build and one WORKER_TIMEOUT before it is parked. A timeout costs a worker
@@ -73,6 +73,18 @@ ANALYSIS_CORES <- {
 # Overridable via WORKER_TIMEOUT env var. The default is 2,400 s because
 # packages that finish have taken more than 1,500 s.
 WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
+
+# The address space one analyzer process may take, in MiB, set with prlimit
+# where the runner has it. An analyzer past it aborts, which fails its package
+# and leaves the stored rows as they were. 0 is no limit. Overridable via the
+# ANALYZER_MEMORY_LIMIT_MB env var: after its spaces are trimmed, a value of
+# decimal digits alone, at most 2147483647, names the limit, and any other
+# value, an empty one included, leaves the default. as.integer would read
+# "0.5" and "NaN" as 0 and "1e3" as 1000.
+ANALYZER_MEMORY_LIMIT_MB <- {
+  mb <- trimws(Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = ""))
+  if (grepl("^[0-9]+$", mb) && as.numeric(mb) <= .Machine$integer.max) as.integer(mb) else 3072L
+}
 
 # The most one worker's progress line may be, in bytes. The forks share fd 1,
 # and a write within PIPE_BUF (at least 512 bytes by POSIX) arrives whole, so

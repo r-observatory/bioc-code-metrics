@@ -61,9 +61,11 @@
 #' @param elapsed Seconds the worker took; NA for a fork that returned nothing.
 #' @param reason Why it failed, appended after a colon and clipped so the whole
 #'   line fits in one pipe write. NULL or "" leaves it off.
+#' @param analyzer_exit The analyzer's non-zero exits, from .analyzer_exit_text;
+#'   "" leaves them off.
 #' @return A single string ending in one newline.
 .worker_line <- function(idx, n, ok, pkg, stage, nver, elapsed, reason = NULL,
-                         worker_timeout = WORKER_TIMEOUT) {
+                         worker_timeout = WORKER_TIMEOUT, analyzer_exit = "") {
   stem <- if (isTRUE(ok)) {
     sprintf("[%d/%d] ok %s: %d versions in %.1fs%s", idx, n, pkg, nver, elapsed,
             if (isTRUE(elapsed >= worker_timeout))
@@ -73,6 +75,7 @@
   } else {
     sprintf("[%d/%d] FAIL %s: %s after %.1fs", idx, n, pkg, stage, elapsed)
   }
+  if (nzchar(analyzer_exit)) stem <- sprintf("%s [analyzer exit %s]", stem, analyzer_exit)
   if (is.null(reason) || !nzchar(trimws(as.character(reason)))) {
     return(paste0(stem, "\n"))
   }
@@ -380,6 +383,27 @@
                  "fetch rechecks due: %d\n"),
           if (nzchar(b)) b else "none", as.integer(n_released), p$fetch, p$analyze,
           p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
+}
+
+# The shard plan's line on the analyzer's address-space limit: limit_mb is the
+# limit in force and build the analyzer build the run read.
+.analyzer_limit_line <- function(limit_mb, build, configured_mb = ANALYZER_MEMORY_LIMIT_MB) {
+  if (limit_mb > 0L) {
+    return(sprintf("analyzer memory limit: %d MiB of address space for each analyzer\n",
+                   limit_mb))
+  }
+  b   <- .build_key(build)
+  why <- if (!isTRUE(configured_mb > 0L)) {
+    ""
+  } else if (!nzchar(b)) {
+    ", no rpkg-analyzer version was read"
+  } else if (!analyzer_at_least(b, "0.5.2")) {
+    sprintf(", rpkg-analyzer %s is older than 0.5.2", b)
+  } else {
+    ", prlimit was not found"
+  }
+  sprintf("analyzer memory limit: none%s (ANALYZER_MEMORY_LIMIT_MB is %d)\n", why,
+          as.integer(configured_mb))
 }
 
 # The shard receipt's verdict line.
@@ -972,9 +996,20 @@ default_io <- function() {
   }
 }
 
+# A kB figure of this process from /proc/self/status, such as VmHWM, its peak
+# resident size. NA where that file does not exist, which is anywhere but Linux.
+.proc_status_kb <- function(key, path = "/proc/self/status") {
+  if (!file.exists(path)) return(NA_real_)
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0L))
+  hit   <- grep(sprintf("^%s:", key), lines, value = TRUE)
+  if (length(hit) == 0L) return(NA_real_)
+  suppressWarnings(as.numeric(sub("^[^:]*:[[:space:]]*([0-9]+).*$", "\\1", hit[[1L]])))
+}
+
 # worker, run in WORK_DIR/.rpa/<pkg> (no clone can land there): RPKG_ANALYZER_STATS
 # names a file and, unless RPA_CACHE is off, RPKG_ANALYZER_CACHE_DIR a cache; builds
-# before 0.5.1 read neither. A list result gains `tally` and `analyzer_stats`.
+# before 0.5.1 read neither. A list result gains `tally`, `analyzer_stats` and
+# `memory`: the worker's peak resident size and the in-memory size of the result.
 .with_worker_telemetry <- function(worker) {
   force(worker)
   function(pkg) {
@@ -999,6 +1034,9 @@ default_io <- function() {
     res <- worker(pkg)
     .tally_add("package_s", .secs_since(t0))
     if (is.list(res)) {
+      # Read before the result is serialised for the parent, so that copy is not in it.
+      res$memory <- list(peak_rss_kb = .proc_status_kb("VmHWM"),
+                         result_bytes = as.numeric(utils::object.size(res)))
       res$tally <- .tally_snapshot()
       res$analyzer_stats <- if (file.exists(stats)) readLines(stats, warn = FALSE) else character(0L)
     }
@@ -1006,17 +1044,54 @@ default_io <- function() {
   }
 }
 
+# The largest of x and the package beside it; both NA when x holds no figure.
+.largest <- function(x, packages) {
+  if (length(x) == 0L || all(is.na(x))) return(list(value = NA, package = NA))
+  i <- which.max(x)
+  list(value = x[[i]], package = packages[[i]])
+}
+
+# The memory figures of a shard's statistics lines, each line's package beside
+# it: the largest resident and virtual peak with their packages, the most data
+# one file kept, the packages with a file over the data budget, and the five
+# packages with the largest resident peak. A figure no line carried is NA.
+.analyzer_memory <- function(packages, rss, vm, kept, over) {
+  top_rss <- .largest(rss, packages)
+  top_vm  <- .largest(vm, packages)
+  of <- function(x, p) {
+    v <- x[packages %in% p & !is.na(x)]
+    if (length(v)) max(v) else NA
+  }
+  peaks <- lapply(unique(packages[!is.na(packages) & !is.na(rss)]), function(p) {
+    list(package = p, peak_rss_kb = of(rss, p), peak_vm_kb = of(vm, p))
+  })
+  peaks <- peaks[order(-vapply(peaks, function(p) p$peak_rss_kb, numeric(1L)))]
+  list(peak_rss_kb = top_rss$value, peak_rss_package = top_rss$package,
+       peak_vm_kb = top_vm$value, peak_vm_package = top_vm$package,
+       data_kept_max = .largest(kept, packages)$value,
+       data_over_budget = I(sort(unique(packages[!is.na(packages) & over %in% TRUE]))),
+       peaks = utils::head(peaks, 5L))
+}
+
 # The analyzer's statistics lines (RPKG_ANALYZER_STATS, 0.5.1 and later) summed
-# over a shard; a line that does not parse is counted as unreadable.
-.sum_analyzer_stats <- function(lines) {
+# over a shard; a line that does not parse is counted as unreadable. `packages`
+# names the package of each line, for the memory keys 0.5.2 and later write:
+# peak_rss_kb, peak_vm_kb, data_kept_max and data_over_budget. Absent or null,
+# they add nothing.
+.sum_analyzer_stats <- function(lines, packages = rep(NA_character_, length(lines))) {
   out <- list(runs = 0L, unreadable = 0L, builds = "",
               ms = 0, ms_compiled = 0, ms_r = 0, ms_tests = 0, ms_data = 0, ms_other = 0,
               compiled_files = 0, compiled_hits = 0, r_files = 0, tests_files = 0,
               data_files = 0, cache_errors = 0, verify_mismatch = 0)
   num <- function(x) if (is.numeric(x) && length(x) == 1L && !is.na(x)) x else 0
+  figure <- function(x) {
+    if (is.numeric(x) && length(x) == 1L && !is.na(x)) as.numeric(x) else NA_real_
+  }
   builds <- character(0L)
-  for (l in lines) {
-    s <- tryCatch(jsonlite::parse_json(l), error = function(e) NULL)
+  rss <- vm <- kept <- rep(NA_real_, length(lines))
+  over <- rep(NA, length(lines))
+  for (i in seq_along(lines)) {
+    s <- tryCatch(jsonlite::parse_json(lines[[i]]), error = function(e) NULL)
     if (!is.list(s) || !is.numeric(s$ms)) {
       out$unreadable <- out$unreadable + 1L
       next
@@ -1031,20 +1106,40 @@ default_io <- function() {
       out[[paste0(kind, "_files")]] <- out[[paste0(kind, "_files")]] + num(s[[kind]]$files)
     }
     out$compiled_hits <- out$compiled_hits + num(s$compiled$hits)
+    rss[[i]]  <- figure(s$peak_rss_kb)
+    vm[[i]]   <- figure(s$peak_vm_kb)
+    kept[[i]] <- figure(s$data_kept_max)
+    over[[i]] <- figure(s$data_over_budget) > 0
   }
   out$builds <- paste(sort(unique(builds)), collapse = " ")
-  out
+  c(out, .analyzer_memory(as.character(packages), rss, vm, kept, over))
 }
 
-# A shard's analyzer statistics and worker time by phase, from the worker
-# results; a fork that crashed returned no list and adds nothing.
+# The largest worker peak and the largest result of a shard, each with its
+# package. The peak is NA off Linux, and both are when no worker returned.
+.worker_memory <- function(rs) {
+  pkgs <- vapply(rs, function(r) as.character(r$package %||% NA_character_), character(1L))
+  of   <- function(key) {
+    vapply(rs, function(r) as.numeric(r$memory[[key]] %||% NA_real_), numeric(1L))
+  }
+  peak   <- .largest(of("peak_rss_kb"), pkgs)
+  result <- .largest(of("result_bytes"), pkgs)
+  list(peak_rss_kb = peak$value, peak_rss_package = peak$package,
+       result_bytes = result$value, result_package = result$package)
+}
+
+# A shard's analyzer statistics, worker time by phase and worker memory, from
+# the worker results; a fork that crashed returned no list and adds nothing.
 .shard_telemetry <- function(results) {
   rs <- Filter(is.list, results)
   tally <- function(name) {
     sum(vapply(rs, function(r) as.numeric(r$tally[[name]] %||% 0), numeric(1L)))
   }
-  analyzer <- .sum_analyzer_stats(unlist(lapply(rs, function(r) r$analyzer_stats),
-                                         use.names = FALSE))
+  analyzer <- .sum_analyzer_stats(
+    unlist(lapply(rs, function(r) r$analyzer_stats), use.names = FALSE),
+    unlist(lapply(rs, function(r) {
+      rep(as.character(r$package %||% NA_character_), length(r$analyzer_stats))
+    }), use.names = FALSE))
   analyzer$incomplete_parses <- as.integer(tally("incomplete_parses"))
   versions <- tally("versions_s")
   phases <- list(
@@ -1057,7 +1152,7 @@ default_io <- function() {
     other_s    = max(0, tally("package_s") - tally("clone_s") - versions),
     dataset_memo_hits   = as.integer(tally("memo_hits")),
     dataset_memo_misses = as.integer(tally("memo_misses")))
-  list(analyzer = analyzer, phases = phases)
+  list(analyzer = analyzer, phases = phases, workers = .worker_memory(rs))
 }
 
 # The shard's analyzer line for the run log.
@@ -1078,6 +1173,48 @@ default_io <- function() {
   sprintf(paste0("worker time: clone %.1f s, extract %.1f s, analyzer %.1f s, ",
                  "record parse %.1f s, metrics %.1f s, other %.1f s"),
           p$clone_s, p$extract_s, p$analyzer_s, p$parse_s, p$metrics_s, p$other_s)
+}
+
+# kB as text in MiB.
+.mib <- function(kb) sprintf("%.1f MiB", kb / 1024)
+
+# Whether a memory figure was reported.
+.has_figure <- function(x) length(x) == 1L && !is.na(x)
+
+# The shard's analyzer memory line for the run log. The peaks are in kB and
+# come from Linux alone; the data figures are bytes and the same everywhere.
+.analyzer_memory_line <- function(a) {
+  peaks <- c(
+    if (.has_figure(a$peak_rss_kb)) {
+      sprintf("peak resident %s (%s)", .mib(a$peak_rss_kb), a$peak_rss_package %||% "?")
+    },
+    if (.has_figure(a$peak_vm_kb)) {
+      sprintf("peak virtual %s (%s)", .mib(a$peak_vm_kb), a$peak_vm_package %||% "?")
+    })
+  data <- if (.has_figure(a$data_kept_max)) {
+    over <- as.character(a$data_over_budget)
+    c(sprintf("largest data kept %s", .mib(a$data_kept_max / 1024)),
+      sprintf("over the data budget: %s",
+              if (length(over)) paste(utils::head(over, 20L), collapse = " ") else "none"))
+  }
+  if (is.null(peaks) && is.null(data)) {
+    return("analyzer memory: no memory figures from this build")
+  }
+  paste0("analyzer memory: ",
+         paste(c(peaks %||% "no peak figures on this platform", data), collapse = ", "))
+}
+
+# The shard's worker memory line for the run log.
+.worker_memory_line <- function(w) {
+  peak <- if (.has_figure(w$peak_rss_kb)) {
+    sprintf("peak resident %s (%s)", .mib(w$peak_rss_kb), w$peak_rss_package %||% "?")
+  }
+  result <- if (.has_figure(w$result_bytes)) {
+    sprintf("largest result %s (%s)", .mib(w$result_bytes / 1024), w$result_package %||% "?")
+  }
+  if (is.null(peak) && is.null(result)) return("worker memory: no memory figures")
+  paste0("worker memory: ",
+         paste(c(peak %||% "no peak figure on this platform", result), collapse = ", "))
 }
 
 # ---------------------------------------------------------------------------
@@ -1140,14 +1277,19 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
+  # The address-space limit of every analyzer this run starts, the
+  # self-check's included, worked out once from that build.
+  analyzer_limit <- .analyzer_limit(analyzer_version)
   # A build that rejected the flag would exit 2 on every package: a crash for
   # each one with analyzer rows and the R fallback for the rest. So a 0.5.0
   # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
-      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
+      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND, analyzer_limit)) {
+    limit_mb <- analyzer_limit$limit_mb
     stop(sprintf(paste0(
-      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it; ",
-      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND),
+      "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it%s; ",
+      "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND,
+      if (limit_mb > 0L) sprintf(" under its %d MiB address-space limit", limit_mb) else ""),
       call. = FALSE)
   }
 
@@ -1315,6 +1457,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
       file = stdout())
+  cat(.analyzer_limit_line(analyzer_limit$limit_mb, analyzer_version), file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -1355,18 +1498,20 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
     # position, every failure, every slow (>=30s) package, every package past
-    # the cap, and the last position.
+    # the cap, every package whose analyzer exited non-zero, and the last position.
     # One fully-formed cat() to stdout, kept under PIPE_BUF by .worker_line:
     # forks reorder whole lines but never byte-interleave, and fd 1 is disjoint
     # from mclapply's result pipe. The emit is wrapped in try() so a
     # broken-stream write can never turn an ok package into a recorded failure.
     .done <- function(ok, stage, nver, el, reason = NULL) {
+      exits <- .analyzer_exit_text()
       if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && el < WORKER_TIMEOUT &&
-          !identical(.idx, .n)) {
+          !identical(.idx, .n) && !nzchar(exits)) {
         return(invisible())
       }
       try({
-        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason),
+        cat(.worker_line(.idx, .n, ok, pkg, stage, nver, el, reason,
+                         analyzer_exit = exits),
             file = stdout())
         flush(stdout())
       }, silent = TRUE)
@@ -1390,7 +1535,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
     err <- NULL
     res <- tryCatch(
-      analyze_package(dest, pkg, stamped = shard_stamped[[pkg]]),
+      analyze_package(dest, pkg, stamped = shard_stamped[[pkg]], limit = analyzer_limit),
       error = function(e) {
         err <<- e
         NULL
@@ -1569,10 +1714,12 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     n_versions           = nrow(fresh_summary)
   )
 
-  # ---- 8a. Analyzer statistics and worker time ------------------------------
+  # ---- 8a. Analyzer statistics, worker time and memory ----------------------
   telemetry <- .shard_telemetry(results)
   cat(.analyzer_stats_line(telemetry$analyzer), "\n",
-      .worker_phase_line(telemetry$phases), "\n", sep = "", file = stdout())
+      .worker_phase_line(telemetry$phases), "\n",
+      .analyzer_memory_line(telemetry$analyzer), "\n",
+      .worker_memory_line(telemetry$workers), "\n", sep = "", file = stdout())
 
   # ---- 8b. Shard receipt ----------------------------------------------------
   # One-line closing summary, printed after the collection loop and before the
@@ -1697,8 +1844,10 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       latest_by_build = .latest_by_build(con),
                       run_id = run_id, last_changed = code_manifest$last_changed,
                       data_last_changed = data_manifest$last_changed,
+                      analyzer_memory_limit_mb = analyzer_limit$limit_mb,
                       analyzer_stats = telemetry$analyzer,
-                      worker_phases = telemetry$phases))
+                      worker_phases = telemetry$phases,
+                      worker_memory = telemetry$workers))
 
   if (length(fresh_pkgs) > 0L) {
     record_changed_packages(file.path(out_dir, "changed-packages.txt"), fresh_pkgs)

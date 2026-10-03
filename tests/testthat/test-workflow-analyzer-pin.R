@@ -7,18 +7,20 @@
   sub("^gh release download (v[0-9.]+) .*$", "\\1", hits)
 }
 
-test_that("update.yml and test.yml install rpkg-analyzer v0.5.1", {
-  expect_identical(.analyzer_pins("update.yml"), "v0.5.1")
-  expect_identical(.analyzer_pins("test.yml"), "v0.5.1")
+test_that("update.yml and test.yml install rpkg-analyzer v0.5.2", {
+  expect_identical(.analyzer_pins("update.yml"), "v0.5.2")
+  expect_identical(.analyzer_pins("test.yml"), "v0.5.2")
 })
 
 test_that("the pinned build is in ANALYZER_SAME_OUTPUT, so a pin change says what it re-queues", {
   expect_true(sub("^v", "", .analyzer_pins("update.yml")) %in% ANALYZER_SAME_OUTPUT)
 })
 
-test_that("0.5.1 counts as 0.5.0 and 0.4.0 stands alone, so this pin re-queues nothing new", {
-  expect_identical(ANALYZER_SAME_OUTPUT, c("0.5.0", "0.5.1"))
-  expect_identical(.analyzer_output_class("0.5.1"), c("0.5.0", "0.5.1"))
+test_that("0.5.2 counts as 0.5.0 and 0.5.1, and 0.4.0 stands alone, so this pin re-queues nothing new", {
+  expect_identical(ANALYZER_SAME_OUTPUT, c("0.5.0", "0.5.1", "0.5.2"))
+  for (build in ANALYZER_SAME_OUTPUT) {
+    expect_identical(.analyzer_output_class(build), ANALYZER_SAME_OUTPUT, info = build)
+  }
   expect_identical(.analyzer_output_class("0.4.0"), "0.4.0")
 })
 

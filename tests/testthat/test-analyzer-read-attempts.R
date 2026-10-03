@@ -242,7 +242,8 @@ test_that("a package given up on is asked again by the next analyzer build", {
 # A build declared to reproduce the stored rows' build re-queues nothing
 # ---------------------------------------------------------------------------
 
-# A stub build that reads pkgA: one summary and one dataset record.
+# A stub build that reads a package: one summary and one dataset record, and
+# the statistics line a 0.5.1 or later build must leave.
 .dsa_reading_analyzer <- function(dir, version) {
   stub <- file.path(dir, "stub-analyzer.sh")
   writeLines(c(
@@ -255,6 +256,8 @@ test_that("a package given up on is asked again by the next analyzer build", {
     paste0('echo "{\\"rec\\":\\"dataset\\",\\"name\\":\\"d\\",\\"file\\":\\"data/d.rda\\",',
            '\\"class\\":\\"data.frame\\",\\"kind\\":\\"table\\",\\"confidence\\":\\"exact\\",',
            '\\"content_fp\\":\\"cf\\",\\"schema_fp\\":\\"sf\\"}"'),
+    paste0('if [ -n "$RPKG_ANALYZER_STATS" ]; then ',
+           'echo "{\\"build\\":\\"stub\\",\\"ms\\":1}" >> "$RPKG_ANALYZER_STATS"; fi'),
     "exit 0"), stub)
   Sys.chmod(stub, mode = "0755")
   stub
@@ -304,7 +307,7 @@ test_that("a build in the stored rows' output class re-queues nothing, and the r
   expect_identical(status$n_latest_on_build, 1L)
 })
 
-test_that("0.4.0 rows still go back in the queue, and a move from 0.5.0 to 0.5.1 re-queues nothing", {
+test_that("0.4.0 rows still go back in the queue, and a move from 0.5.0 to 0.5.1 or 0.5.2 re-queues nothing", {
   skip_on_os("windows")
   stub_dir <- withr::local_tempdir()
   withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_reading_analyzer(stub_dir, "0.4.0"))
@@ -321,7 +324,48 @@ test_that("0.4.0 rows still go back in the queue, and a move from 0.5.0 to 0.5.1
   on_051 <- .oc_messages(run_update(io, out, shard_size = 10L))
   expect_true("dataset scans invalidated by analyzer change: 0" %in% on_051$messages)
   expect_true("packages to re-read under this analyzer: 0" %in% on_051$messages)
-  expect_true(paste("analyzer 0.5.1, output class 0.5.0 0.5.1;",
+  expect_true(paste("analyzer 0.5.1, output class 0.5.0 0.5.1 0.5.2;",
                     "latest rows on class: 1 of 1") %in% on_051$messages)
   expect_identical(on_051$value$n_fresh, 0L)
+
+  .dsa_reading_analyzer(stub_dir, "0.5.2")
+  on_052 <- .oc_messages(run_update(io, out, shard_size = 10L))
+  expect_true("dataset scans invalidated by analyzer change: 0" %in% on_052$messages)
+  expect_true("packages to re-read under this analyzer: 0" %in% on_052$messages)
+  expect_identical(on_052$value$n_fresh, 0L)
+})
+
+test_that("the 0.5.2 pin analyses nothing on a database whose latest rows are 0.5.0 and 0.5.1", {
+  skip_on_os("windows")
+  stub_dir <- withr::local_tempdir()
+  withr::local_envvar(RPKG_ANALYZER_BIN = .dsa_reading_analyzer(stub_dir, "0.5.0"))
+  .local_global("WORK_DIR", withr::local_tempdir())
+  out <- withr::local_tempdir()
+  io  <- function(pkgs) list(
+    package_list = function() data.frame(package = pkgs, latest_version = "1.0",
+                                         stringsAsFactors = FALSE),
+    clone = .dsa_clone)
+  # pkgA under 0.5.0, then pkgB under 0.5.1, which leaves pkgA as it is.
+  expect_identical(suppressWarnings(run_update(io("pkgA"), out, shard_size = 10L))$n_fresh, 1L)
+  both <- io(c("pkgA", "pkgB"))
+  .dsa_reading_analyzer(stub_dir, "0.5.1")
+  expect_identical(suppressWarnings(run_update(both, out, shard_size = 10L))$n_fresh, 1L)
+  status <- function() jsonlite::fromJSON(file.path(out, "run-status.json"),
+                                          simplifyVector = FALSE)
+  expect_identical(status()$latest_by_build, list(`0.5.0` = 1L, `0.5.1` = 1L))
+  before <- lapply(c(pkgA = "pkgA", pkgB = "pkgB"), function(p) .package_rows(out, p))
+
+  .dsa_reading_analyzer(stub_dir, "0.5.2")
+  pinned <- .oc_messages(run_update(both, out, shard_size = 10L))
+  expect_identical(c(pinned$value$n_fresh, pinned$value$shard_failures$count), c(0L, 0L))
+  expect_false(pinned$value$changed)
+  expect_true("dataset scans invalidated by analyzer change: 0" %in% pinned$messages)
+  expect_true("packages to re-read under this analyzer: 0" %in% pinned$messages)
+  expect_true(paste("analyzer 0.5.2, output class 0.5.0 0.5.1 0.5.2;",
+                    "latest rows on class: 2 of 2") %in% pinned$messages)
+  st <- status()
+  expect_identical(c(st$n_shard, st$n_versions, st$n_remaining), c(0L, 0L, 0L))
+  expect_identical(st$latest_by_build, list(`0.5.0` = 1L, `0.5.1` = 1L))
+  expect_identical(lapply(c(pkgA = "pkgA", pkgB = "pkgB"), function(p) .package_rows(out, p)),
+                   before)
 })

@@ -522,10 +522,13 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #' @param stamped   The package's versions whose stored row names an analyzer
 #'   build. An analyzer that gives no usable result on one of them fails the
 #'   package, so the R fallback never replaces that row.
+#' @param limit     The address-space limit each analyzer runs under, an
+#'   .analyzer_limit().
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
 #'   and $binary_versions: the versions whose metrics the analyzer binary
 #'   produced, as opposed to the pure-R fallback.
-analyze_package <- function(repo_dir, package, stamped = character(0L)) {
+analyze_package <- function(repo_dir, package, stamped = character(0L),
+                            limit = .analyzer_limit()) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
 
@@ -628,7 +631,8 @@ analyze_package <- function(repo_dir, package, stamped = character(0L)) {
 
       # Prefer the rpkg-analyzer binary (a superset of analyze_version, computed
       # from the same extracted source); fall back to the R groups when absent.
-      metrics <- analyze_with_binary(tmp, memo = memo, protect = v %in% stamped)
+      metrics <- analyze_with_binary(tmp, memo = memo, protect = v %in% stamped,
+                                     limit = limit)
       binary_ran <- !is.null(metrics)
       if (is.null(metrics)) {
         metrics <- analyze_version(ctx)

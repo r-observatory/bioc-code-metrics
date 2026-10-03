@@ -51,6 +51,18 @@ test_that("rows and read attempts of a build in the class survive a move within 
   expect_identical(.analyzer_read_exhausted(con), "p1")
 })
 
+test_that("the 0.5.2 pin re-queues nothing where every latest row is 0.5.0 or 0.5.1", {
+  con <- .oc_db(c("0.5.0", "0.5.1", "0.5.0", "0.5.1"))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  pkgs <- paste0("p", 1:4)
+  # The class the scripts hold, not one the test names.
+  expect_identical(.invalidate_stale_dataset_scans(con, "0.5.2"), 0L)
+  expect_identical(.forget_other_builds_read_attempts(con, "0.5.2"), 0L)
+  expect_identical(.oc_scanned(con), pkgs)
+  expect_identical(sort(.analyzer_read_exhausted(con)), pkgs)
+  expect_identical(.n_latest_on_class(con, "0.5.2"), c(on_class = 4L, latest = 4L))
+})
+
 test_that("with the class naming only the old build, the same move re-queues them", {
   con <- .oc_db("0.5.0")
   on.exit(DBI::dbDisconnect(con), add = TRUE)
