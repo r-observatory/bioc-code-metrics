@@ -72,13 +72,15 @@
   stub
 }
 
-# A result without the second each version's text was read at, the one value
-# two analyses of the same package are expected to differ in.
+# A result without the second each version's text was read at and the second
+# the walk began, the values two analyses of the same package are expected to
+# differ in.
 .without_read_at <- function(res) {
   res$text <- lapply(res$text, function(d) {
     if (is.data.frame(d)) d$read_at <- NULL
     d
   })
+  res$state$read_at <- NULL
   res
 }
 

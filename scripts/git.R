@@ -147,6 +147,25 @@ list_versions <- function(repo) {
   )
 }
 
+#' The tree of each commit, in order, from one git rev-parse.
+#'
+#' @param repo    Path to a local git repository.
+#' @param commits Commit SHAs, as list_versions() gives them.
+#' @return Character vector as long as commits. All NA when git cannot resolve
+#'   every one, so a tree is never paired with the wrong commit.
+commit_trees <- function(repo, commits) {
+  commits <- as.character(commits)
+  if (length(commits) == 0L) return(character(0L))
+  out <- suppressWarnings(
+    system2("git", c("-C", repo, "rev-parse", shQuote(paste0(commits, "^{tree}"))),
+            stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
+  )
+  ok <- is.null(attr(out, "status")) && length(out) == length(commits) &&
+    all(grepl("^[0-9a-f]{40}([0-9a-f]{24})?$", out))
+  if (!ok) return(rep(NA_character_, length(commits)))
+  as.character(out)
+}
+
 #' The condition extract_version raises when git archive or tar exits non-zero.
 #'
 #' @param step   "archive" or "tar".

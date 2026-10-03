@@ -491,6 +491,52 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
   )
 }
 
+# Zero-row version state frame, typed as the table.
+.empty_version_state <- function() {
+  data.frame(package = character(0L), version = character(0L),
+             commit_sha = character(0L), tree_sha = character(0L),
+             prev_version = character(0L), prev_commit = character(0L),
+             deprecated = character(0L), uses_lifecycle = integer(0L),
+             read_at = character(0L), stringsAsFactors = FALSE)
+}
+
+#' The version state rows of one walk, built after it from what it holds.
+#'
+#' One row per listed version: the commit it was read from and that commit's
+#' tree, the version and commit before it in the walk (NA for the first), and
+#' its deprecation signals, the symbols as a JSON array and uses_lifecycle as
+#' 0 or 1.
+#'
+#' @param repo_dir           The clone the walk read.
+#' @param versions_df        list_versions() of the clone, in walk order.
+#' @param deprecation_series The walk's deprecation_signals(), one per version.
+#' @param read_at            UTC timestamp of the walk.
+#' @return A data.frame shaped as .empty_version_state().
+.version_state_rows <- function(repo_dir, package, versions_df, deprecation_series,
+                                read_at) {
+  n <- nrow(versions_df)
+  if (n == 0L) return(.empty_version_state())
+  versions <- as.character(versions_df$version)
+  commits  <- as.character(versions_df$commit)
+  sig <- lapply(seq_len(n), function(i) {
+    if (i <= length(deprecation_series)) deprecation_series[[i]]
+  })
+  data.frame(
+    package        = rep(package, n),
+    version        = versions,
+    commit_sha     = commits,
+    tree_sha       = commit_trees(repo_dir, commits),
+    prev_version   = c(NA_character_, versions[-n]),
+    prev_commit    = c(NA_character_, commits[-n]),
+    deprecated     = vapply(sig, function(s) {
+      as.character(jsonlite::toJSON(as.character(s$symbols %||% character(0L))))
+    }, character(1L)),
+    uses_lifecycle = vapply(sig, function(s) as.integer(isTRUE(s$uses_lifecycle)), integer(1L)),
+    read_at        = rep(read_at, n),
+    stringsAsFactors = FALSE
+  )
+}
+
 #' Analyze all versions of a cloned package repository.
 #'
 #' For each version (oldest first):
@@ -525,12 +571,15 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #' @param limit     The address-space limit each analyzer runs under, an
 #'   .analyzer_limit().
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
-#'   and $binary_versions: the versions whose metrics the analyzer binary
-#'   produced, as opposed to the pure-R fallback.
+#'   $binary_versions: the versions whose metrics the analyzer binary
+#'   produced, as opposed to the pure-R fallback, and $state, the version
+#'   state rows (.version_state_rows).
 analyze_package <- function(repo_dir, package, stamped = character(0L),
                             limit = .analyzer_limit()) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
+  # The version state's read_at: the walk reads the commits listed just now.
+  read_at     <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
 
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
@@ -846,6 +895,8 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
     # tells those summary rows from the ones the pure-R fallback wrote once
     # they are in the same frame. The caller stamps the running build on these
     # and leaves the rest naming nobody.
-    binary_versions = as.character(versions_df$version[from_binary])
+    binary_versions = as.character(versions_df$version[from_binary]),
+    state     = .version_state_rows(repo_dir, package, versions_df, deprecation_series,
+                                    read_at)
   )
 }
