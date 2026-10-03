@@ -506,11 +506,14 @@ test_that("a package whose analyzer keeps failing parks after MAX_TIMEOUT_FAILUR
 # The address-space limit on the analyzer process
 # ---------------------------------------------------------------------------
 
-# A stand-in for prlimit that appends its first argument to `seen` and runs the
-# rest of its command line, so the call can be read where there is no prlimit.
+# A stand-in for prlimit that appends its options, the arguments before the
+# command, to `seen` as one line and runs the command with no limit, so the
+# call can be read where there is no prlimit.
 .af_fake_prlimit <- function(dir, seen) {
   fake <- file.path(dir, "prlimit")
-  writeLines(c("#!/bin/sh", sprintf('echo "$1" >> %s', shQuote(seen)), "shift", 'exec "$@"'),
+  writeLines(c("#!/bin/sh", 'o=""',
+               'while [ "${1#--}" != "$1" ]; do o="$o $1"; shift; done',
+               sprintf('echo "${o# }" >> %s', shQuote(seen)), 'exec "$@"'),
              fake)
   Sys.chmod(fake, mode = "0755")
   fake
@@ -560,7 +563,7 @@ test_that("a build of 0.5.2 or later runs under prlimit when the limit is above 
   expect_identical(.analyzer_limit("0.6.0-test"), limit)
   expect_identical(.analyzer_command("/opt/rpkg analyzer", limit),
                    list(command = "/usr/bin/prlimit",
-                        args = c("--as=1073741824", shQuote("/opt/rpkg analyzer")),
+                        args = c("--as=1073741824", "--core=0", shQuote("/opt/rpkg analyzer")),
                         limit_mb = 1024L))
   # Bytes past the largest integer are still written in full.
   .af_local_limit(8192L)
@@ -609,9 +612,9 @@ test_that("a package and the self-check both run through prlimit with the limit 
                       RPKG_ANALYZER_BIN = .af_stub(withr::local_tempdir(), version = "0.5.2",
                                                    spare_selfcheck = FALSE))
   expect_identical(analyze_with_binary(.af_pkg_dir(), protect = TRUE)$loc_r, 1L)
-  expect_identical(readLines(seen), "--as=1073741824")
+  expect_identical(readLines(seen), "--as=1073741824 --core=0")
   expect_true(rpkg_analyzer_selfcheck())
-  expect_identical(readLines(seen), rep("--as=1073741824", 2L))
+  expect_identical(readLines(seen), rep("--as=1073741824 --core=0", 2L))
   expect_length(readLines(stats), 2L)
 
   # Off, the same calls never reach prlimit.
@@ -749,7 +752,7 @@ test_that("a run with a build before 0.5.2 sets no limit, says why, and never ca
   expect_identical(m$n_fresh, 1L)
   expect_true("analyzer memory limit: 1024 MiB of address space for each analyzer" %in% logged)
   expect_identical(status(out), 1024L)
-  expect_identical(readLines(seen), rep("--as=1073741824", 2L))
+  expect_identical(readLines(seen), rep("--as=1073741824 --core=0", 2L))
 })
 
 test_that("a run looks for prlimit once, not once an analyzer", {
@@ -790,6 +793,14 @@ test_that("prlimit sets the address space of a package's analyzer and of the sel
   expect_true(rpkg_analyzer_selfcheck())
   expect_identical(readLines(seen)[[3L]],
                    system2("/bin/sh", c("-c", shQuote("ulimit -v")), stdout = TRUE))
+})
+
+test_that("the real prlimit holds the analyzer to the limit with no core file", {
+  .af_skip_without_prlimit()
+  run <- .analyzer_command("/bin/sh", list(limit_mb = 1024L, prlimit = .prlimit_bin()))
+  limits <- shQuote("ulimit -v; ulimit -Sc; ulimit -Hc")
+  expect_identical(system2(run$command, c(run$args, "-c", limits), stdout = TRUE),
+                   c(as.character(1024L * 1024L), "0", "0"))
 })
 
 test_that("a build before 0.5.2 keeps the session's address space, the self-check's included", {

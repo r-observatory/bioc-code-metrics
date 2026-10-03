@@ -585,14 +585,16 @@ parse_analyzer_records <- function(lines, memo = NULL) {
 }
 
 # How to run `bin` under `limit`, an .analyzer_limit(): through its prlimit,
-# with its address space, when it is above zero, and as it is otherwise.
-# limit_mb is the limit the run gets, 0 for none.
+# with its address space and no core file, when it is above zero, and as it is
+# otherwise. An analyzer aborted at the limit then leaves no core file of up to
+# the limit's size on the runner. limit_mb is the limit the run gets, 0 for none.
 .analyzer_command <- function(bin, limit = .analyzer_limit()) {
   if (!isTRUE(limit$limit_mb > 0L)) {
     return(list(command = bin, args = character(0L), limit_mb = 0L))
   }
   list(command = limit$prlimit,
-       args = c(sprintf("--as=%.0f", as.numeric(limit$limit_mb) * 1024^2), shQuote(bin)),
+       args = c(sprintf("--as=%.0f", as.numeric(limit$limit_mb) * 1024^2), "--core=0",
+                shQuote(bin)),
        limit_mb = as.integer(limit$limit_mb))
 }
 
