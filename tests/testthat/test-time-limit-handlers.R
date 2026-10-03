@@ -9,7 +9,7 @@
   fn   = c("analyze_package", ".done", ".pkg_worker", ".pkg_worker"),
   call = c("try", "try", "tryCatch", "tryCatch"),
   expr = c(NA, NA, "io$clone(pkg, dest)",
-           "analyze_package(dest, pkg, stamped = shard_stamped[[pkg]])"),
+           "analyze_package(dest, pkg, stamped = shard_stamped[[pkg]], limit = analyzer_limit)"),
   reason = c(
     "the per-release heartbeat only prints a progress line",
     "the worker's completion line only prints",

@@ -385,15 +385,24 @@
           p$timeout, p$legacy, as.integer(n_tried), sum(st$recheck_due))
 }
 
-# The shard plan's line on the analyzer's address-space limit.
-.analyzer_limit_line <- function(limit_mb = .analyzer_limit_mb(),
-                                 configured_mb = ANALYZER_MEMORY_LIMIT_MB) {
+# The shard plan's line on the analyzer's address-space limit: limit_mb is the
+# limit in force and build the analyzer build the run read.
+.analyzer_limit_line <- function(limit_mb, build, configured_mb = ANALYZER_MEMORY_LIMIT_MB) {
   if (limit_mb > 0L) {
     return(sprintf("analyzer memory limit: %d MiB of address space for each analyzer\n",
                    limit_mb))
   }
-  sprintf("analyzer memory limit: none%s (ANALYZER_MEMORY_LIMIT_MB is %d)\n",
-          if (isTRUE(configured_mb > 0L)) ", prlimit was not found" else "",
+  b   <- .build_key(build)
+  why <- if (!isTRUE(configured_mb > 0L)) {
+    ""
+  } else if (!nzchar(b)) {
+    ", no rpkg-analyzer version was read"
+  } else if (!analyzer_at_least(b, "0.5.2")) {
+    sprintf(", rpkg-analyzer %s is older than 0.5.2", b)
+  } else {
+    ", prlimit was not found"
+  }
+  sprintf("analyzer memory limit: none%s (ANALYZER_MEMORY_LIMIT_MB is %d)\n", why,
           as.integer(configured_mb))
 }
 
@@ -1268,12 +1277,15 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   # the rows this shard writes. Asking twice would let a binary swapped
   # mid-run clear markers it then never restores.
   analyzer_version <- rpkg_analyzer_version()
+  # The address-space limit of every analyzer this run starts, the
+  # self-check's included, worked out once from that build.
+  analyzer_limit <- .analyzer_limit(analyzer_version)
   # A build that rejected the flag would exit 2 on every package: a crash for
   # each one with analyzer rows and the R fallback for the rest. So a 0.5.0
   # build proves it reads the flag first.
   if (analyzer_at_least(analyzer_version, "0.5.0") &&
-      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND)) {
-    limit_mb <- .analyzer_limit_mb()
+      !rpkg_analyzer_selfcheck(ANALYZER_INPUT_KIND, analyzer_limit)) {
+    limit_mb <- analyzer_limit$limit_mb
     stop(sprintf(paste0(
       "rpkg-analyzer %s did not answer --input-kind %s with a summary naming it%s; ",
       "stopping before any shard"), analyzer_version, ANALYZER_INPUT_KIND,
@@ -1445,8 +1457,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     file = stdout())
   cat(.verdict_plan_line(analyzer_version, n_released, verdicts, length(tried_pkgs)),
       file = stdout())
-  analyzer_limit_mb <- .analyzer_limit_mb()
-  cat(.analyzer_limit_line(analyzer_limit_mb), file = stdout())
+  cat(.analyzer_limit_line(analyzer_limit$limit_mb, analyzer_version), file = stdout())
   flush(stdout())
 
   # ---- 6. Analyze the shard (parallel) -------------------------------------
@@ -1524,7 +1535,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     if (!isTRUE(ok)) return(.fail(.clone_stage(ok), .clone_reason(ok)))
     err <- NULL
     res <- tryCatch(
-      analyze_package(dest, pkg, stamped = shard_stamped[[pkg]]),
+      analyze_package(dest, pkg, stamped = shard_stamped[[pkg]], limit = analyzer_limit),
       error = function(e) {
         err <<- e
         NULL
@@ -1833,7 +1844,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                       latest_by_build = .latest_by_build(con),
                       run_id = run_id, last_changed = code_manifest$last_changed,
                       data_last_changed = data_manifest$last_changed,
-                      analyzer_memory_limit_mb = analyzer_limit_mb,
+                      analyzer_memory_limit_mb = analyzer_limit$limit_mb,
                       analyzer_stats = telemetry$analyzer,
                       worker_phases = telemetry$phases,
                       worker_memory = telemetry$workers))

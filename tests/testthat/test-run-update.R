@@ -410,7 +410,8 @@ test_that(".parse_bioc_release extracts release_version from config.yaml lines",
   env <- environment(analyze_package)
   old <- get("analyze_with_binary", envir = env)
   assign("analyze_with_binary",
-         function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE) value,
+         function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE,
+                  limit = NULL) value,
          envir = env)
   on.exit(assign("analyze_with_binary", old, envir = env), add = TRUE)
   force(expr)
@@ -486,7 +487,8 @@ test_that("a cap during extraction extracts again into an emptied directory", {
   on.exit(unlink(repo, recursive = TRUE, force = TRUE), add = TRUE)
   .make_fake_clone("pkgX", repo, versions = c("1.0", "1.1"))
   .local_global("analyze_with_binary",
-                function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE) NULL)
+                function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE,
+                         limit = NULL) NULL)
   want <- suppressWarnings(analyze_package(repo, "pkgX"))
 
   real  <- extract_version
@@ -586,7 +588,8 @@ test_that("a cap in a per-release step of analyze_package changes nothing it ret
                        edges     = .empty_edges_df()[, -(1:2), drop = FALSE],
                        datasets  = .datasets_frame(list()))
   .local_global("analyze_with_binary",
-                function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE) metrics)
+                function(dir, kind = ANALYZER_INPUT_KIND, memo = NULL, protect = FALSE,
+                         limit = NULL) metrics)
   # read_at is the clock at each reading, so it differs between any two runs.
   analyse <- function() {
     res <- analyze_package(repo, "pkgCap")
