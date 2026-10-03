@@ -77,11 +77,13 @@ WORKER_TIMEOUT <- as.integer(Sys.getenv("WORKER_TIMEOUT", unset = "2400"))
 # The address space one analyzer process may take, in MiB, set with prlimit
 # where the runner has it. An analyzer past it aborts, which fails its package
 # and leaves the stored rows as they were. 0 is no limit. Overridable via the
-# ANALYZER_MEMORY_LIMIT_MB env var; a value that is empty or not a whole number
-# of zero or more leaves the default.
+# ANALYZER_MEMORY_LIMIT_MB env var: after its spaces are trimmed, a value of
+# decimal digits alone, at most 2147483647, names the limit, and any other
+# value, an empty one included, leaves the default. as.integer would read
+# "0.5" and "NaN" as 0 and "1e3" as 1000.
 ANALYZER_MEMORY_LIMIT_MB <- {
-  mb <- suppressWarnings(as.integer(Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = "")))
-  if (is.na(mb) || mb < 0L) 3072L else mb
+  mb <- trimws(Sys.getenv("ANALYZER_MEMORY_LIMIT_MB", unset = ""))
+  if (grepl("^[0-9]+$", mb) && as.numeric(mb) <= .Machine$integer.max) as.integer(mb) else 3072L
 }
 
 # The most one worker's progress line may be, in bytes. The forks share fd 1,
