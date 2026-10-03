@@ -1323,7 +1323,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   if (isTRUE(force_full)) {
     # Wipe all metric rows so everything is treated as unseen.
     tables <- DBI::dbListTables(con)
-    for (tbl in c("bioc_code_summary", "bioc_code_churn", "bioc_api_history")) {
+    for (tbl in c("bioc_code_summary", "bioc_code_churn", "bioc_api_history",
+                  VERSION_STATE_TABLE)) {
       if (tbl %in% tables) DBI::dbExecute(con, sprintf("DELETE FROM %s", tbl))
     }
     analyzed <- character(0L)
@@ -1468,6 +1469,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   shard_edges_list     <- list()
   shard_datasets_list  <- list()
   shard_text_list      <- list()
+  shard_state_list     <- list()
   shard_failures       <- character(0L)
   shard_stages         <- character(0L)
   # Verdicts this shard wrote. Each is news the next run needs, so the shard
@@ -1551,7 +1553,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     list(package = pkg, ok = TRUE, elapsed = el,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
-         text = res$text, binary_versions = res$binary_versions)
+         text = res$text, binary_versions = res$binary_versions, state = res$state)
   }
 
   results <- parallel::mclapply(shard_pkgs, .with_worker_telemetry(.pkg_worker),
@@ -1587,6 +1589,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
       shard_edges_list[[pkg]]     <- r$edges
       shard_datasets_list[[pkg]]  <- r$datasets
       shard_text_list[[pkg]]      <- r$text
+      shard_state_list[[pkg]]     <- r$state
       shard_binary_keys <- c(shard_binary_keys,
                              .analyzer_row_keys(pkg, r$binary_versions))
       .reset_failure(con, pkg)
@@ -1614,6 +1617,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
   fresh_edges     <- .rbind_union_all(shard_edges_list)     %||% .empty_edges_df()
   fresh_datasets  <- .rbind_union_all(shard_datasets_list)  %||% .empty_datasets_df()
   fresh_text      <- .bind_release_text(shard_text_list)
+  fresh_state     <- .rbind_union_all(shard_state_list)     %||% .empty_version_state()
 
   # Which build scanned these rows is what the next run's staleness check reads,
   # and a scanned row that does not say reads as one an unknown build produced.
@@ -1636,7 +1640,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                  fresh_functions, fresh_edges,
                  description_df = fresh_text$description_latest,
                  release_notes_df = fresh_text$release_notes_latest,
-                 analyzer_version = analyzer_version)
+                 analyzer_version = analyzer_version,
+                 state_df = fresh_state)
   }
 
   # ---- 8. Manifest ---------------------------------------------------------

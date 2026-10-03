@@ -55,6 +55,9 @@ FETCH_RECHECK_DAYS <- 7L
 SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
+# The commit, tree and deprecation signals each stored version was read from.
+# Pipeline state: the merger does not copy it.
+VERSION_STATE_TABLE <- "bioc_version_state"
 
 # Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
 # cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.

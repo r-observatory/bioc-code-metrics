@@ -1223,15 +1223,35 @@ open_or_init_data_db <- function(path) {
   invisible(NULL)
 }
 
+# The commit and tree each stored version was read from, the version and
+# commit before it in that walk, and its deprecation signals. One row per
+# summary row, replaced with them.
+.ensure_version_state_table <- function(con) {
+  DBI::dbExecute(con, sprintf('
+    CREATE TABLE IF NOT EXISTS "%s" (
+      package        TEXT NOT NULL,
+      version        TEXT NOT NULL,
+      commit_sha     TEXT,
+      tree_sha       TEXT,
+      prev_version   TEXT,
+      prev_commit    TEXT,
+      deprecated     TEXT,
+      uses_lifecycle INTEGER,
+      read_at        TEXT,
+      PRIMARY KEY (package, version)
+    ) WITHOUT ROWID', VERSION_STATE_TABLE))
+  invisible(NULL)
+}
+
 #' Open (or create) the pipeline SQLite database.
 #'
-#' If the file does not yet exist it is created. The five non-summary tables
+#' If the file does not yet exist it is created. The six non-summary tables
 #' (bioc_code_churn, bioc_api_history, bioc_metrics_failures,
-#' bioc_analyzer_read_attempts, bioc_over_cap) are created with fixed schemas
-#' and indexes on first open, so a database downloaded from an older release
-#' gains the ones it does not have yet, and its failures table gains the
-#' verdict columns. bioc_code_summary is created lazily by upsert_shard the
-#' first time data is written (its schema is dynamic).
+#' bioc_analyzer_read_attempts, bioc_over_cap, bioc_version_state) are created
+#' with fixed schemas and indexes on first open, so a database downloaded from
+#' an older release gains the ones it does not have yet, and its failures table
+#' gains the verdict columns. bioc_code_summary is created lazily by
+#' upsert_shard the first time data is written (its schema is dynamic).
 #'
 #' @param path File path for the SQLite database.
 #' @return An open DBI connection. The caller is responsible for calling
@@ -1302,6 +1322,8 @@ open_or_init_db <- function(path) {
         last_attempt     TEXT
       )")
   }
+
+  .ensure_version_state_table(con)
 
   DBI::dbExecute(con,
     "CREATE INDEX IF NOT EXISTS idx_churn_pkg_ver ON bioc_code_churn(package, version)")
@@ -1476,11 +1498,15 @@ db_analyzed_state <- function(con) {
 #'   stale rows survive a re-analysis.
 #' @param description_df,release_notes_df Latest-only text rows; NULL leaves both tables untouched.
 #' @param analyzer_version The running analyzer build; gates the 0.5.0 schema steps.
+#' @param state_df   Version state rows (.version_state_rows). The packages'
+#'   state rows are replaced with those of the versions whose summary rows are
+#'   written; NULL leaves the packages with none, so nothing claims a commit
+#'   for rows it did not see read.
 #' @return invisible(NULL)
 upsert_shard <- function(con, summary_df, churn_df, api_df,
                          functions_df = NULL, edges_df = NULL,
                          description_df = NULL, release_notes_df = NULL,
-                         analyzer_version = NA_character_) {
+                         analyzer_version = NA_character_, state_df = NULL) {
   pkgs <- unique(as.character(summary_df$package))
   if (length(pkgs) == 0L) return(invisible(NULL))
 
@@ -1553,8 +1579,26 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
     if (!is.null(description_df) || !is.null(release_notes_df)) {
       .write_latest_text(con, pkgs, description_df, release_notes_df)
     }
+
+    # -- Replace the version state, beside the rows it describes -------------
+    .write_version_state(con, pkgs, summary_df, state_df)
   })
 
+  invisible(NULL)
+}
+
+#' Replace the version state rows of `pkgs` with those of the versions in
+#' summary_df, the last row of a repeated version as upsert_shard keeps it.
+#' Runs inside the caller's transaction.
+.write_version_state <- function(con, pkgs, summary_df, state_df) {
+  .ensure_version_state_table(con)
+  .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
+  if (is.null(state_df) || nrow(state_df) == 0L) return(invisible(NULL))
+  key <- function(df) paste(df$package, df$version, sep = "\x1f")
+  state_df <- state_df[!duplicated(key(state_df), fromLast = TRUE), , drop = FALSE]
+  state_df <- state_df[key(state_df) %in% key(summary_df),
+                       DBI::dbListFields(con, VERSION_STATE_TABLE), drop = FALSE]
+  if (nrow(state_df) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_df)
   invisible(NULL)
 }
 
