@@ -1644,6 +1644,9 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                  state_df = fresh_state)
   }
 
+  # Every run, so any run that publishes carries the whole table.
+  refresh_release_versions(con)
+
   # ---- 8. Manifest ---------------------------------------------------------
   # bioc_code_summary is created lazily by upsert_shard; may not exist yet if
   # this is the first run and every package in the shard failed.
