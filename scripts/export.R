@@ -2223,3 +2223,36 @@ build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
 
   c(headline, "", table_section, "", catalog_section, "", footer)
 }
+
+# ---------------------------------------------------------------------------
+# Release versions table
+# ---------------------------------------------------------------------------
+
+#' Rebuild the table of package versions per analysed release
+#'
+#' One row per (package, release) from the DESCRIPTION `Version` field in the
+#' text history. Blank versions get no row. A full rebuild, so it matches the
+#' history exactly.
+#'
+#' @param con Open DBI connection to the code database.
+#' @return Number of rows written, as an integer.
+refresh_release_versions <- function(con) {
+  DBI::dbExecute(con, sprintf(
+    'CREATE TABLE IF NOT EXISTS "%s" (
+       package TEXT NOT NULL, version TEXT NOT NULL, package_version TEXT NOT NULL,
+       PRIMARY KEY (package, version)) WITHOUT ROWID', RELEASE_VERSIONS_TABLE))
+  has_history <- DESCRIPTION_HISTORY_TABLE %in% DBI::dbListTables(con)
+  DBI::dbWithTransaction(con, {
+    DBI::dbExecute(con, sprintf('DELETE FROM "%s"', RELEASE_VERSIONS_TABLE))
+    if (has_history) {
+      n <- DBI::dbExecute(con, sprintf(
+        'INSERT OR REPLACE INTO "%s" (package, version, package_version)
+         SELECT package, version, trim(value) FROM "%s"
+         WHERE field = \'Version\' AND value IS NOT NULL AND trim(value) <> \'\'',
+        RELEASE_VERSIONS_TABLE, DESCRIPTION_HISTORY_TABLE))
+    } else {
+      n <- 0L
+    }
+    as.integer(n)
+  })
+}
