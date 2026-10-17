@@ -2224,6 +2224,10 @@ build_release_notes <- function(code_manifest, data_manifest, changed_pkgs,
   c(headline, "", table_section, "", catalog_section, "", footer)
 }
 
+# ---------------------------------------------------------------------------
+# Release versions table
+# ---------------------------------------------------------------------------
+
 #' Rebuild the table of package versions per analysed release
 #'
 #' One row per (package, release) from the DESCRIPTION `Version` field in the

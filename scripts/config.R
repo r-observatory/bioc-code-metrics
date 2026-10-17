@@ -165,7 +165,7 @@ RELEASE_TEXT_DB_FILENAME    <- DB_FILENAME
 DESCRIPTION_HISTORY_TABLE   <- "bioc_description_history"
 RELEASE_NOTES_HISTORY_TABLE <- "bioc_release_notes_history"
 RELEASE_TEXT_VERSIONS_TABLE <- "bioc_release_text_versions"
-# The package version of each analysed release, the one text column the merger copies.
+# The package version of each analysed release, the one field of the per-release text history the merger copies.
 RELEASE_VERSIONS_TABLE      <- "bioc_release_versions"
 DESCRIPTION_FIELDS_TABLE    <- "bioc_description_fields"
 RELEASE_NOTES_TABLE         <- "bioc_release_notes"

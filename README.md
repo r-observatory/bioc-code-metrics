@@ -32,6 +32,8 @@ releases are kept; see Retention):
   DESCRIPTION fields, each value capped at 16,384 bytes.
 - `bioc_release_notes` - the NEWS section for the latest analysed release's
   DESCRIPTION Version, when the analyzer found one, capped at 16,384 bytes.
+- `bioc_release_versions` - the DESCRIPTION Version of each package in each
+  analysed Bioconductor release. Merged downstream.
 - `bioc_description_history`, `bioc_release_notes_history` and
   `bioc_release_text_versions` - every DESCRIPTION field and NEWS section of
   every analysed release, and which releases were read. Not merged downstream.
