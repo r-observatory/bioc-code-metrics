@@ -5,7 +5,8 @@
 # NA unsets one. WORKER_TIMEOUT, ANALYSIS_CORES and ANALYZER_MEMORY_LIMIT_MB are
 # unset unless named.
 .config_under <- function(vars = character(0L)) {
-  set <- c(WORKER_TIMEOUT = NA, ANALYSIS_CORES = NA, ANALYZER_MEMORY_LIMIT_MB = NA)
+  set <- c(WORKER_TIMEOUT = NA, ANALYSIS_CORES = NA, ANALYZER_MEMORY_LIMIT_MB = NA,
+           FALLBACK_GIT_TIMEOUT = NA)
   set[names(vars)] <- vars
   env <- new.env(parent = globalenv())
   withr::with_envvar(set, source(test_path("..", "..", "scripts", "config.R"), local = env))

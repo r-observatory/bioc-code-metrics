@@ -542,3 +542,152 @@ test_that("a clone killed at GIT_TIMEOUT returns FALSE with status 124", {
   expect_false(ok)
   expect_identical(attr(ok, "status"), 124L)
 })
+
+# ---------------------------------------------------------------------------
+# clone_with_fallback: Bioconductor's own git server for what github.com/bioc lacks
+# ---------------------------------------------------------------------------
+
+test_that("a package missing from the first server is cloned from the fallback", {
+  base     <- withr::local_tempdir()
+  fallback <- withr::local_tempdir()
+  .one_release_repo(file.path(fallback, "p.git"))
+  dest <- file.path(withr::local_tempdir(), "clone")
+  ok <- clone_with_fallback("p", dest, base = base, fallback = fallback)
+  expect_true(ok)
+  expect_identical(attr(ok, "base"), fallback)
+  expect_true(file.exists(file.path(dest, "DESCRIPTION")))
+})
+
+test_that("a package on the first server is cloned from there", {
+  base     <- withr::local_tempdir()
+  fallback <- withr::local_tempdir()
+  .one_release_repo(file.path(base, "p.git"))
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            base = base, fallback = fallback)
+  expect_true(ok)
+  expect_identical(attr(ok, "base"), base)
+})
+
+test_that("a clone killed at GIT_TIMEOUT is not tried again on the fallback", {
+  .local_global("GIT_TIMEOUT", 1L)
+  calls <- file.path(withr::local_tempdir(), "calls")
+  .local_shim("git", c(sprintf("echo \"$@\" >> '%s'", calls), "sleep 5"))
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            base = "https://first.test", fallback = "https://fallback.test")
+  expect_identical(attr(ok, "status"), 124L)
+  expect_length(readLines(calls), 1L)
+})
+
+test_that("the GitHub token is never sent to the fallback server", {
+  calls <- file.path(withr::local_tempdir(), "calls")
+  .local_shim("git", c(sprintf("echo \"$@\" >> '%s'", calls), "exit 128"))
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            token = "s3cret", base = "https://github.com/bioc",
+                            fallback = "https://git.bioconductor.org/packages")
+  expect_false(ok)
+  urls <- readLines(calls)
+  expect_length(urls, 2L)
+  expect_match(urls[1L], "x-access-token:s3cret@github.com/bioc/p.git", fixed = TRUE)
+  expect_match(urls[2L], "https://git.bioconductor.org/packages/p.git", fixed = TRUE)
+  expect_false(grepl("s3cret", urls[2L], fixed = TRUE))
+  expect_false(grepl("s3cret", attr(ok, "reason"), fixed = TRUE))
+})
+
+test_that("the pipeline's clone still sends GITHUB_TOKEN to github.com/bioc", {
+  calls <- file.path(withr::local_tempdir(), "calls")
+  .local_shim("git", c(sprintf("echo \"$@\" >> '%s'", calls), "exit 128"))
+  .local_global("BIOC_GIT_BASE", "https://github.com/bioc")
+  .local_global("BIOC_GIT_FALLBACK_BASE", "https://fallback.test")
+  withr::local_envvar(GITHUB_TOKEN = "ghs_tok123")
+  default_io()$clone("p", file.path(withr::local_tempdir(), "clone"))
+  urls <- readLines(calls)
+  expect_match(urls[1L], "x-access-token:ghs_tok123@github.com/bioc/p.git", fixed = TRUE)
+  expect_false(grepl("ghs_tok123", urls[2L], fixed = TRUE))
+})
+
+test_that("a clone never waits on a credential prompt", {
+  seen <- file.path(withr::local_tempdir(), "seen")
+  .local_shim("git", c(sprintf("echo \"$GIT_TERMINAL_PROMPT\" >> '%s'", seen), "exit 128"))
+  clone_package("p", file.path(withr::local_tempdir(), "clone"), base = "https://first.test")
+  expect_identical(readLines(seen), "0")
+})
+
+test_that("what the first server left behind is cleared before the fallback clone", {
+  real_git <- unname(Sys.which("git"))
+  fallback <- withr::local_tempdir()
+  .one_release_repo(file.path(fallback, "p.git"))
+  # A clone that fails after writing, as "Clone succeeded, but checkout failed" does.
+  .local_shim("git", c('case "$*" in *first.test*) mkdir -p "$4" && touch "$4/x"; exit 128 ;; esac',
+                       sprintf('exec "%s" "$@"', real_git)))
+  dest <- file.path(withr::local_tempdir(), "clone")
+  ok <- clone_with_fallback("p", dest, base = "https://first.test", fallback = fallback)
+  expect_true(ok)
+  expect_true(file.exists(file.path(dest, "DESCRIPTION")))
+  expect_false(file.exists(file.path(dest, "x")))
+})
+
+test_that("a fallback reason carries each server's first error line, token redacted", {
+  .local_shim("git", c(
+    'case "$*" in',
+    '  *github.com*) echo "fatal: unable to access https://x-access-token:ghs_abc123@github.com/bioc/p.git/" >&2 ;;',
+    '  *) echo "fatal: write error: No space left on device" >&2 ;;',
+    'esac',
+    'exit 128'))
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            token = "ghs_abc123", base = "https://github.com/bioc",
+                            fallback = "https://git.bioconductor.org/packages")
+  expect_identical(attr(ok, "reason"), paste0(
+    "clone from https://github.com/bioc exited 128 ",
+    "(fatal: unable to access https://***github.com/bioc/p.git/); ",
+    "clone from https://git.bioconductor.org/packages exited 128 ",
+    "(fatal: write error: No space left on device)"))
+})
+
+test_that("a fallback clone runs under FALLBACK_GIT_TIMEOUT", {
+  .local_global("GIT_TIMEOUT", 30L)
+  .local_global("FALLBACK_GIT_TIMEOUT", 1L)
+  .local_shim("git", c('case "$*" in *fallback.test*) sleep 5 ;; esac', "exit 128"))
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            base = "https://first.test", fallback = "https://fallback.test")
+  expect_false(ok)
+  expect_identical(attr(ok, "status"), 124L)
+})
+
+test_that("a clone that fails on both servers names both in its reason", {
+  base     <- withr::local_tempdir()
+  fallback <- withr::local_tempdir()
+  ok <- clone_with_fallback("p", file.path(withr::local_tempdir(), "clone"),
+                            base = base, fallback = fallback)
+  expect_false(ok)
+  expect_identical(attr(ok, "base"), fallback)
+  reason <- attr(ok, "reason")
+  expect_true(startsWith(reason, sprintf("clone from %s exited %d (", base, attr(ok, "status"))))
+  expect_match(reason, sprintf("; clone from %s exited %d (", fallback, attr(ok, "status")),
+               fixed = TRUE)
+})
+
+test_that("a package on the skip list is not fetched from the fallback, and says why", {
+  base     <- withr::local_tempdir()
+  fallback <- withr::local_tempdir()
+  .one_release_repo(file.path(fallback, "big.git"))
+  dest <- file.path(withr::local_tempdir(), "clone")
+  ok <- clone_with_fallback("big", dest, base = base, fallback = fallback, skip = "big")
+  expect_false(ok)
+  expect_false(dir.exists(dest))
+  expect_false(identical(attr(ok, "status"), 0L))
+  expect_true(startsWith(attr(ok, "reason"),
+                         sprintf("clone from %s exited %d (", base, attr(ok, "status"))))
+  expect_true(endsWith(attr(ok, "reason"), sprintf("); too big to clone from %s", fallback)))
+})
+
+test_that("the pipeline's clone falls back to Bioconductor's git server", {
+  base     <- withr::local_tempdir()
+  fallback <- withr::local_tempdir()
+  .one_release_repo(file.path(fallback, "p.git"))
+  .local_global("BIOC_GIT_BASE", base)
+  .local_global("BIOC_GIT_FALLBACK_BASE", fallback)
+  withr::local_envvar(GITHUB_TOKEN = "")
+  ok <- default_io()$clone("p", file.path(withr::local_tempdir(), "clone"))
+  expect_true(ok)
+  expect_identical(attr(ok, "base"), fallback)
+})
