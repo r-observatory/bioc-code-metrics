@@ -132,6 +132,22 @@ test_that("each failure in a run is printed with its stage", {
   expect_true(any(grepl("FAIL pkgSlow: timeout after [0-9.]+s: reached elapsed time limit", logged)))
 })
 
+test_that("a package cloned from the fallback server says so on its line", {
+  .local_global("analyze_package", function(dest, pkg, ...) .fv_result(pkg))
+  io <- .fv_io(c("far", "near"))
+  io$clone <- function(pkg, dest) {
+    dir.create(dest, recursive = TRUE, showWarnings = FALSE)
+    structure(TRUE, status = 0L,
+              base = if (pkg == "far") "https://git.bioconductor.org/packages" else BIOC_GIT_BASE)
+  }
+  logged <- capture.output(.fv_run(io, withr::local_tempdir()))
+
+  # far is neither slow nor last, so only where it came from prints its line.
+  expect_true(any(grepl(paste0("^\\[1/2\\] ok far: 1 versions in [0-9.]+s: ",
+                               "cloned from https://git\\.bioconductor\\.org/packages$"), logged)))
+  expect_true(any(grepl("^\\[2/2\\] ok near: 1 versions in [0-9.]+s$", logged)))
+})
+
 # SIGKILL, as the kernel's OOM killer sends it. quit() in a fork would also
 # end it without a result, but it deletes the parent session's tempdir.
 test_that("a fork that dies without a result is printed by the parent as a crash", {

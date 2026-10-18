@@ -2,9 +2,10 @@
 #
 # All functions communicate with git via system2("git", ...).
 # clone_package() never throws on failure; it returns FALSE instead.
-# Dependency: config.R must be sourced first (BIOC_GIT_BASE, %||%).
+# Dependency: config.R must be sourced first (BIOC_GIT_BASE, the fallback
+# settings, GIT_TIMEOUT, .redact_reason, %||%).
 
-#' Clone a Bioconductor repo from github.com/bioc.
+#' Clone a Bioconductor repo, from github.com/bioc unless `base` names another.
 #'
 #' A plain `git clone` fetches all remote branches as `origin/*` refs, so
 #' every RELEASE_X_Y branch becomes accessible as `origin/RELEASE_X_Y`
@@ -16,11 +17,15 @@
 #' @param token Optional GitHub personal access token. When supplied the clone
 #'   URL is rewritten to inject the token so the request authenticates without
 #'   a credential helper or .netrc.
+#' @param timeout Seconds before the clone is killed; defaults to GIT_TIMEOUT.
 #' @return TRUE on success, FALSE on any failure (404, network, etc.), with the
-#'   exit status as attribute "status" (124 when GIT_TIMEOUT killed the clone).
+#'   exit status as attribute "status" (124 when the timeout killed the clone)
+#'   and, on failure, git's first stderr line, redacted, as attribute "stderr".
 #'   The checkout keeps LFS pointers (GIT_LFS_SKIP_SMUDGE=1), so a missing LFS
 #'   object cannot fail it, and churn still reads the checked-out .gitattributes.
-clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
+#'   Git never prompts for credentials (GIT_TERMINAL_PROMPT=0).
+clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL,
+                          timeout = GIT_TIMEOUT) {
   if (!is.null(token) && nzchar(token)) {
     # Convert "https://github.com/bioc" -> "https://x-access-token:<tok>@github.com/bioc"
     url <- sub("^https://", paste0("https://x-access-token:", token, "@"), base)
@@ -28,12 +33,53 @@ clone_package <- function(pkg, dest, base = BIOC_GIT_BASE, token = NULL) {
   } else {
     url <- paste0(base, "/", pkg, ".git")
   }
+  err_file <- tempfile("git_clone_", fileext = ".err")
+  on.exit(unlink(err_file), add = TRUE)
   rc <- suppressWarnings(
     system2("git", c("clone", "--quiet", url, dest),
-            stdout = FALSE, stderr = FALSE, timeout = GIT_TIMEOUT,
-            env = "GIT_LFS_SKIP_SMUDGE=1")
+            stdout = FALSE, stderr = err_file, timeout = timeout,
+            env = c("GIT_LFS_SKIP_SMUDGE=1", "GIT_TERMINAL_PROMPT=0"))
   )
-  structure(identical(rc, 0L), status = as.integer(rc))
+  if (identical(rc, 0L)) return(structure(TRUE, status = 0L))
+  err <- if (file.exists(err_file)) readLines(err_file, warn = FALSE) else character(0L)
+  err <- err[grepl("[^[:space:]]", err, useBytes = TRUE)]
+  structure(FALSE, status = as.integer(rc),
+            stderr = .redact_reason(if (length(err)) err[[1L]] else ""))
+}
+
+# "clone from <base> exited <status>", with git's first stderr line after it.
+.clone_failed_on <- function(base, ok) {
+  err <- attr(ok, "stderr") %||% ""
+  sprintf("clone from %s exited %d%s", base, as.integer(attr(ok, "status")),
+          if (nzchar(err)) sprintf(" (%s)", err) else "")
+}
+
+#' Clone from `base`, and from `fallback` when that clone fails.
+#'
+#' A clone killed at GIT_TIMEOUT is not tried again, and a package in `skip`
+#' is never fetched from `fallback`. The token goes to `base` only.
+#'
+#' @return clone_package()'s value with attribute "base", the server it came
+#'   from or last failed on, and attribute "reason" naming each server tried
+#'   when the fallback failed or was skipped.
+clone_with_fallback <- function(pkg, dest, token = NULL, base = BIOC_GIT_BASE,
+                                fallback = BIOC_GIT_FALLBACK_BASE,
+                                skip = BIOC_GIT_FALLBACK_SKIP) {
+  first <- clone_package(pkg, dest, base = base, token = token)
+  if (isTRUE(first) || identical(attr(first, "status"), 124L)) {
+    return(structure(first, base = base))
+  }
+  if (pkg %in% skip) {
+    return(structure(first, base = base,
+                     reason = sprintf("%s; too big to clone from %s",
+                                      .clone_failed_on(base, first), fallback)))
+  }
+  unlink(dest, recursive = TRUE, force = TRUE)
+  ok <- clone_package(pkg, dest, base = fallback, timeout = FALLBACK_GIT_TIMEOUT)
+  if (isTRUE(ok)) return(structure(ok, base = fallback))
+  structure(ok, base = fallback,
+            reason = paste0(.clone_failed_on(base, first), "; ",
+                            .clone_failed_on(fallback, ok)))
 }
 
 #' List Bioconductor RELEASE_X_Y branches, ordered by release version ascending.

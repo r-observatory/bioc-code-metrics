@@ -268,6 +268,7 @@ jobs:
             shard=$((shard + 1))
             echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="
             free -m || true
+            df -h . || true
             Rscript scripts/update.R out/ ${FORCE} ${RECOLLECT} ${RELEASE[@]+"${RELEASE[@]}"}
             FORCE=""
             RELEASE=()

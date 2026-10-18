@@ -33,3 +33,14 @@ test_that("an analyzer gets the default limit unless ANALYZER_MEMORY_LIMIT_MB na
                      default, info = bad)
   }
 })
+
+test_that("a clone from the fallback server gets 900 s unless FALLBACK_GIT_TIMEOUT names another limit", {
+  expect_identical(.config_under()$FALLBACK_GIT_TIMEOUT, 900L)
+  expect_identical(.config_under(c(FALLBACK_GIT_TIMEOUT = "1200"))$FALLBACK_GIT_TIMEOUT, 1200L)
+})
+
+test_that("a package github.com/bioc lacks comes from git.bioconductor.org, except ChIPXpressData", {
+  cfg <- .config_under()
+  expect_identical(cfg$BIOC_GIT_FALLBACK_BASE, "https://git.bioconductor.org/packages")
+  expect_identical(cfg$BIOC_GIT_FALLBACK_SKIP, "ChIPXpressData")
+})

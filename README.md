@@ -63,17 +63,17 @@ Rscript scripts/update.R out/ --bootstrap   # re-analyze everything from scratch
 
 The update reads the prior databases from `out/`, analyzes a shard of packages
 that are new or have a new release, and writes the updated code and dataset
-databases plus their manifests. Only Bioconductor software and workflow
-packages have release-branch repositories; data packages are not covered. Set
-`GITHUB_TOKEN` so git fetches are authenticated.
+databases plus their manifests. Software, workflow and experiment-data packages
+have release-branch repositories; annotation packages do not and are not
+covered. Set `GITHUB_TOKEN` so git fetches are authenticated.
+
+When a clone from `github.com/bioc` fails for any reason but its time limit, the package is cloned from `git.bioconductor.org` instead, without the token and under `FALLBACK_GIT_TIMEOUT` (900 s). Most packages `github.com/bioc` lacks hold a file over 100 MiB or more than 2 GB of history, which GitHub refuses. `BIOC_GIT_FALLBACK_SKIP` in `scripts/config.R` names packages too big for a runner. A package cloned from the fallback ends its worker line with `cloned from https://git.bioconductor.org/packages`; a failure names each server tried and git's first error line from each. Each shard prints `df -h` beside `free -m`.
 
 `test-record-memo.R` also runs the rpkg-analyzer builds that `RPA_TEST_BIN_040` and `RPA_TEST_BIN_050` name. `test-record-parse-corpus.R` holds the record parse and the dataset memo to the per-line parser over whole corpora of analyzer output when `RPA_PARSE_CORPUS_050` and `RPA_PARSE_CORPUS_040` name them as absolute paths: every `*.ndjson` or `*.ndjson.gz` file below, where the files under `mv/<package>/` are one package's versions in name order. With `RPA_PARSE_CORPUS_REPORT` set it appends one line per corpus, the label, the files read and the files found identical, separated by tabs.
 
 ## Notes
 
-Each package is cloned, analyzed across all its release branches, and deleted
-before the next one, so peak disk stays small. Metrics are computed from git and
-the package source; there is no external `cloc` dependency.
+Each worker clones a package, analyzes it across all its release branches, and deletes it before taking the next, so disk holds at most one package per worker (the largest fallback packages take about 3.6 GB each while they run). Metrics are computed from git and the package source; there is no external `cloc` dependency.
 
 Moving the rpkg-analyzer pin re-queues every package unless `ANALYZER_SAME_OUTPUT` in `scripts/config.R` also names the build the stored rows came from. Add a build there only when the analyzer gate has shown that it reproduces the pinned build record for record, and quote the gate report in the pin PR; to rescan on purpose, set the list to the new pin alone. `test-workflow-analyzer-pin.R` fails while the pinned build is missing from the list, so the choice is made in the PR that moves the pin. Each run prints the output class and how many latest rows it covers, and the manifests carry `analyzer_version`, `output_class` and `n_latest_on_build` under `bootstrap`.
 

@@ -106,10 +106,11 @@ test_that("the core count of a dispatch, or of the repository variable, reaches 
   expect_gt(set, max(src[src < loop]))
 })
 
-test_that("each shard prints free memory before it starts", {
+test_that("each shard prints free memory and free disk before it starts", {
   yml <- readLines(file.path("..", "..", ".github", "workflows", "update.yml"))
   banner <- which(yml == '            echo "=== shard ${shard} (elapsed ${SECONDS}s) ==="')
   expect_length(banner, 1L)
   expect_identical(yml[banner + 1L], "            free -m || true")
-  expect_true(startsWith(yml[banner + 2L], "            Rscript scripts/update.R out/ "))
+  expect_identical(yml[banner + 2L], "            df -h . || true")
+  expect_true(startsWith(yml[banner + 3L], "            Rscript scripts/update.R out/ "))
 })

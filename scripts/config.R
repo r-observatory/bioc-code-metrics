@@ -2,6 +2,13 @@
 # Source this first; all other scripts assume these are defined.
 
 BIOC_GIT_BASE <- "https://github.com/bioc"
+# Bioconductor's own git server, tried when a clone from github.com/bioc fails
+# for any reason but its time limit. Most packages github.com/bioc lacks hold a
+# file over 100 MiB or more than 2 GB of history, which GitHub refuses.
+BIOC_GIT_FALLBACK_BASE <- "https://git.bioconductor.org/packages"
+# Too big for a runner even from there: 3.3 GB of history and a 2.8 GB file
+# the analyzer reads whole.
+BIOC_GIT_FALLBACK_SKIP <- c("ChIPXpressData")
 PUBLISH_REPO  <- "r-observatory/bioc-code-metrics"
 DB_FILENAME   <- "bioc-code-metrics.db"
 DATA_DB_FILENAME <- "bioc-data-metrics.db"
@@ -49,7 +56,7 @@ ANALYZER_SAME_OUTPUT <- c("0.5.0", "0.5.1", "0.5.2")
 MAX_TIMEOUT_FAILURES <- 3L
 
 # Days after which a fetch-parked package with no stored rows is tried once
-# more, for a repository that appears on github.com/bioc later.
+# more, for a repository that appears later on github.com/bioc or the fallback.
 FETCH_RECHECK_DAYS <- 7L
 
 SUMMARY_TABLE <- "bioc_code_summary"
@@ -62,6 +69,11 @@ VERSION_STATE_TABLE <- "bioc_version_state"
 # Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
 # cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.
 GIT_TIMEOUT <- as.integer(Sys.getenv("GIT_TIMEOUT", unset = "300"))
+
+# The cap on a clone from BIOC_GIT_FALLBACK_BASE, whose repositories are the
+# big ones: ELMER.data (2.4 GB) took 371 s on a home connection. Overridable via
+# FALLBACK_GIT_TIMEOUT.
+FALLBACK_GIT_TIMEOUT <- as.integer(Sys.getenv("FALLBACK_GIT_TIMEOUT", unset = "900"))
 
 # Number of parallel workers for the per-package clone+analyze step.
 # Default: all logical cores (overridable via ANALYSIS_CORES env var).

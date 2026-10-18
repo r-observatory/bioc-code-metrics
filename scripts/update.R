@@ -59,8 +59,9 @@
 #' The one line a worker prints when it finishes a package.
 #'
 #' @param elapsed Seconds the worker took; NA for a fork that returned nothing.
-#' @param reason Why it failed, appended after a colon and clipped so the whole
-#'   line fits in one pipe write. NULL or "" leaves it off.
+#' @param reason Why it failed, or on an ok line where its clone came from,
+#'   appended after a colon and clipped so the whole line fits in one pipe
+#'   write. NULL or "" leaves it off.
 #' @param analyzer_exit The analyzer's non-zero exits, from .analyzer_exit_text;
 #'   "" leaves them off.
 #' @return A single string ending in one newline.
@@ -101,9 +102,17 @@
   "analyze"
 }
 
-# The stage of a clone that did not succeed: 124 is system2's kill at GIT_TIMEOUT.
+# The stage of a clone that did not succeed: 124 is system2's kill at GIT_TIMEOUT,
+# or at FALLBACK_GIT_TIMEOUT on the fallback, and both count as git timeouts.
 .clone_stage <- function(ok) {
   if (isTRUE(as.integer(attr(ok, "status")) == 124L)) "git_timeout" else "clone"
+}
+
+# What an ok line says of where its clone came from; NULL for BIOC_GIT_BASE.
+.clone_note <- function(ok) {
+  from <- attr(ok, "base")
+  if (is.null(from) || identical(from, BIOC_GIT_BASE)) return(NULL)
+  sprintf("cloned from %s", from)
 }
 
 # What a clone that did not succeed says: the error it raised, or its exit status.
@@ -961,8 +970,9 @@ default_io <- function() {
     },
 
     clone = function(pkg, dest) {
-      clone_package(pkg, dest, base = BIOC_GIT_BASE,
-                    token = Sys.getenv("GITHUB_TOKEN", ""))
+      clone_with_fallback(pkg, dest, base = BIOC_GIT_BASE,
+                          fallback = BIOC_GIT_FALLBACK_BASE,
+                          token = Sys.getenv("GITHUB_TOKEN", ""))
     }
   )
 }
@@ -1500,7 +1510,8 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     # Thinned per-worker completion line, emitted FROM the fork so it streams live
     # during the otherwise-silent parallel phase. Prints only on every 25th queue
     # position, every failure, every slow (>=30s) package, every package past
-    # the cap, every package whose analyzer exited non-zero, and the last position.
+    # the cap, every package whose analyzer exited non-zero, every package
+    # cloned from the fallback server, and the last position.
     # One fully-formed cat() to stdout, kept under PIPE_BUF by .worker_line:
     # forks reorder whole lines but never byte-interleave, and fd 1 is disjoint
     # from mclapply's result pipe. The emit is wrapped in try() so a
@@ -1508,7 +1519,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
     .done <- function(ok, stage, nver, el, reason = NULL) {
       exits <- .analyzer_exit_text()
       if (isTRUE(ok) && .idx %% 25L != 0L && el < 30 && el < WORKER_TIMEOUT &&
-          !identical(.idx, .n) && !nzchar(exits)) {
+          !identical(.idx, .n) && !nzchar(exits) && is.null(reason)) {
         return(invisible())
       }
       try({
@@ -1549,7 +1560,7 @@ run_update <- function(io, out_dir, shard_size = SHARD_SIZE, force_full = FALSE,
                    else conditionMessage(err)))
     }
     el <- .elapsed()
-    .done(TRUE, "ok", nrow(res$summary), el)
+    .done(TRUE, "ok", nrow(res$summary), el, .clone_note(ok))
     list(package = pkg, ok = TRUE, elapsed = el,
          summary = res$summary, churn = res$churn, api = res$api,
          functions = res$functions, edges = res$edges, datasets = res$datasets,
