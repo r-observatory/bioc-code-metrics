@@ -1,0 +1,6 @@
+{
+  "rows_generation": 1,
+  "output_class": ["0.5.0", "0.5.1", "0.5.2"],
+  "analyzer": "e4b9ae070a5580ad47075f6b1a267dde94ccc6cee7b48af50276048463530027",
+  "fallback": "c4bf268cf5d49f81bee8a1844ecffcdd601e01c775c63a76c3ff00107b8ca0f4"
+}

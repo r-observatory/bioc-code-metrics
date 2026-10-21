@@ -1,124 +1,15 @@
 # tests/testthat/test-version-state.R: the commit, tree and deprecation signals
 # each stored version was read from, kept beside the rows it gave.
 
-# A git identity and dates from the environment, so no repository config is written.
-.vst_git <- function(dir, ..., date = "2025-01-01T00:00:00Z") {
-  out <- suppressWarnings(system2(
-    "git", c("-C", shQuote(dir), ...), stdout = TRUE, stderr = FALSE,
-    env = c("GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@t.test",
-            "GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@t.test",
-            paste0("GIT_AUTHOR_DATE=", date), paste0("GIT_COMMITTER_DATE=", date))))
-  status <- attr(out, "status")
-  if (!is.null(status) && status != 0L) stop("git ", paste(c(...), collapse = " "), " exited ", status)
-  out
-}
-
-.vst_branch <- function(ver) paste0("RELEASE_", gsub(".", "_", ver, fixed = TRUE))
-
-# What each release exports and the R code it carries. 1.1 deprecates through
-# base R, 1.2 through base R and lifecycle, 1.3 through nothing; 1.2 drops b
-# with no warning before it and 1.3 drops a, which 1.2 warned about.
-.VST_RELEASES <- list(
-  "1.0" = list(exports = c("a", "b"),
-               code = c("a <- function() 1", "b <- function() 2")),
-  "1.1" = list(exports = c("a", "b", "c"),
-               code = c("a <- function() 1", "b <- function() .Deprecated('c')",
-                        "c <- function() 3")),
-  "1.2" = list(exports = c("a", "c", "d"),
-               code = c("a <- function() .Defunct('b')", "c <- function() 3",
-                        "d <- function() lifecycle::deprecate_warn('1.2', 'a()')")),
-  "1.3" = list(exports = c("c", "d"),
-               code = c("c <- function() 3", "d <- function() 4")))
-
-# Commit one release on devel and cut its branch there, as Bioconductor does.
-.vst_release <- function(dir, pkg, ver, date) {
-  rel <- .VST_RELEASES[[ver]]
-  writeLines(c(paste("Package:", pkg), paste("Version:", ver), "Title: T",
-               "Description: T.", "Author: T", "Maintainer: T <t@t.test>",
-               "License: MIT"), file.path(dir, "DESCRIPTION"))
-  writeLines(sprintf("export(%s)", rel$exports), file.path(dir, "NAMESPACE"))
-  dir.create(file.path(dir, "R"), showWarnings = FALSE)
-  writeLines(rel$code, file.path(dir, "R", "code.R"))
-  .vst_git(dir, "add", "-A", date = date)
-  .vst_git(dir, "commit", "-q", "-m", shQuote(paste("release", ver)), date = date)
-  .vst_git(dir, "branch", .vst_branch(ver), date = date)
-}
-
-# A source repository at <base>/<pkg>.git with a release branch per version,
-# which clone_package(pkg, dest, base = base) clones as it would github.com/bioc.
-.vst_source <- function(base, pkg, versions) {
-  dir <- file.path(base, paste0(pkg, ".git"))
-  dir.create(dir, recursive = TRUE)
-  .vst_git(dir, "init", "-q")
-  .vst_git(dir, "checkout", "-q", "-b", "devel")
-  writeLines(paste("#", pkg), file.path(dir, "README"))
-  .vst_git(dir, "add", "-A")
-  .vst_git(dir, "commit", "-q", "-m", "init")
-  for (k in seq_along(versions)) {
-    .vst_release(dir, pkg, versions[[k]], sprintf("2025-0%d-01T00:00:00Z", k + 1L))
-  }
-  dir
-}
-
-# A fix committed on a release branch after it was cut.
-.vst_move_branch <- function(dir, ver) {
-  .vst_git(dir, "checkout", "-q", .vst_branch(ver))
-  cat("e <- function() 5\n", file = file.path(dir, "R", "code.R"), append = TRUE)
-  .vst_git(dir, "commit", "-q", "-am", "fix", date = "2025-09-01T00:00:00Z")
-  .vst_git(dir, "checkout", "-q", "devel")
-}
-
-.vst_rev_parse <- function(dir, refs) .vst_git(dir, "rev-parse", shQuote(refs))
-
-# One run_update over packages cloned from `base`, each at its `latest`.
-.vst_run <- function(base, out_dir, pkgs, latest, shard_size = 10L, ...,
-                     frame = parent.frame()) {
-  .local_global("WORK_DIR", withr::local_tempdir("vst_work_", .local_envir = frame), frame)
-  .local_global("ANALYSIS_CORES", 1L, frame)
-  io <- list(
-    package_list = function() data.frame(package = pkgs, latest_version = latest,
-                                         stringsAsFactors = FALSE),
-    clone = function(pkg, dest) clone_package(pkg, dest, base = base))
-  out <- NULL
-  utils::capture.output(out <- suppressWarnings(run_update(io, out_dir, shard_size = shard_size,
-                                                           ...)))
-  out
-}
-
-.vst_query <- function(out_dir, sql, params = NULL) {
-  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
-  on.exit(DBI::dbDisconnect(con))
-  DBI::dbGetQuery(con, sql, params = params)
-}
-
-# A package's state rows in release order.
-.vst_state <- function(out_dir, pkg = "vstpkg") {
-  st <- .vst_query(out_dir, sprintf('SELECT * FROM "%s" WHERE package = ?', VERSION_STATE_TABLE),
-                   params = list(pkg))
-  st[order(numeric_version(st$version)), , drop = FALSE]
-}
-
-# Each version's deprecation signals as the walk takes them: the release
-# extracted with extract_version and read by deprecation_signals.
-.vst_walk_signals <- function(dir, ver) {
-  tmp <- withr::local_tempdir("vst_sig_")
-  files <- extract_version(dir, .vst_branch(ver), tmp)
-  read_fn <- function(path) {
-    full <- file.path(tmp, path)
-    if (!file.exists(full)) "" else paste(readLines(full, warn = FALSE), collapse = "\n")
-  }
-  deprecation_signals(build_context(package = "vstpkg", version = ver, ref = .vst_branch(ver),
-                                    date = NA_character_, files = files, read_fn = read_fn))
-}
-
 # ---- The table --------------------------------------------------------------
 
 .VST_COLUMNS <- data.frame(
   name = c("package", "version", "commit_sha", "tree_sha", "prev_version",
-           "prev_commit", "deprecated", "uses_lifecycle", "read_at"),
-  type = c("TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "TEXT"),
-  notnull = c(1L, 1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L),
-  pk = c(1L, 2L, 0L, 0L, 0L, 0L, 0L, 0L, 0L),
+           "prev_commit", "deprecated", "uses_lifecycle", "read_at", "rows_generation"),
+  type = c("TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "TEXT",
+           "INTEGER"),
+  notnull = c(1L, 1L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L),
+  pk = c(1L, 2L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L),
   stringsAsFactors = FALSE)
 
 .vst_expect_schema <- function(con) {
@@ -165,11 +56,11 @@ test_that("a commit's tree comes from git, and is NA rather than misplaced when 
   base <- withr::local_tempdir("vst_src_")
   src <- .vst_source(base, "vstpkg", c("1.0", "1.1"))
   commits <- .vst_rev_parse(src, .vst_branch(c("1.0", "1.1")))
-  expect_identical(commit_trees(src, commits),
+  expect_identical(.version_trees(src, commits),
                    .vst_rev_parse(src, paste0(.vst_branch(c("1.0", "1.1")), "^{tree}")))
-  expect_identical(commit_trees(src, character(0L)), character(0L))
-  expect_identical(commit_trees(src, c(commits[[1L]], strrep("0", 40L))),
-                   c(NA_character_, NA_character_))
+  expect_identical(.version_trees(src, character(0L)), character(0L))
+  expect_identical(.version_trees(src, c(commits[[1L]], strrep("0", 40L)), chunk = 1L),
+                   c(.vst_rev_parse(src, paste0(.vst_branch("1.0"), "^{tree}")), NA_character_))
 })
 
 test_that("analyze_package returns a state row for each listed version", {
@@ -282,9 +173,9 @@ test_that("a package that fails keeps its rows and its state rows as they were",
   .vst_move_branch(src, "1.0")
   .vst_release(src, "vstpkg", "1.2", "2025-10-01T00:00:00Z")
   real <- extract_version
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (grepl("RELEASE_1_2$", ref)) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
-    real(repo, ref, dest)
+    real(repo, ref, dest, ...)
   })
   m <- .vst_run(base, out_dir, "vstpkg", "1.2")
   expect_identical(m$shard_failures$packages, "vstpkg")
@@ -371,6 +262,60 @@ test_that("upsert_shard writes state rows for exactly the versions whose summary
   expect_identical(got$commit_sha, c("x1", "new", "c2.0"))
 })
 
+test_that("a code database from before rows_generation gains it on open and keeps its rows", {
+  path <- withr::local_tempfile(fileext = ".db")
+  con <- DBI::dbConnect(RSQLite::SQLite(), path)
+  DBI::dbExecute(con, 'CREATE TABLE bioc_version_state (package TEXT NOT NULL,
+    version TEXT NOT NULL, commit_sha TEXT, tree_sha TEXT, prev_version TEXT,
+    prev_commit TEXT, deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+    PRIMARY KEY (package, version)) WITHOUT ROWID')
+  DBI::dbExecute(con, "INSERT INTO bioc_version_state (package, version, commit_sha)
+                       VALUES ('p', '1.0', 'c1')")
+  DBI::dbDisconnect(con)
+  con <- open_or_init_db(path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  .vst_expect_schema(con)
+  got <- DBI::dbGetQuery(con, "SELECT commit_sha, rows_generation FROM bioc_version_state")
+  expect_identical(got$commit_sha, "c1")
+  expect_true(is.na(got$rows_generation))
+})
+
+test_that("every state row a walk writes carries the running ROWS_GENERATION", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, "vstpkg", "1.1")
+  expect_identical(.vst_state(out_dir)$rows_generation, rep(ROWS_GENERATION, 2L))
+})
+
+test_that("read_at is taken when the walk lists the versions, before any version is extracted", {
+  clock <- new.env()
+  clock$t <- as.POSIXct("2026-10-01 00:00:00", tz = "UTC")
+  .local_global("Sys.time", function() { clock$t <- clock$t + 60; clock$t })
+  real <- extract_version
+  .local_global("extract_version", function(repo, ref, dest, ...) {
+    if (is.null(clock$extracted)) clock$extracted <- format(clock$t, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    real(repo, ref, dest, ...)
+  })
+  base <- withr::local_tempdir("vst_src_")
+  src <- .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  res <- suppressWarnings(analyze_package(src, "vstpkg"))
+  expect_length(unique(res$state$read_at), 1L)
+  expect_true(res$state$read_at[[1L]] < clock$extracted)
+})
+
+test_that("a deprecation series shorter than the listing pads the state rows", {
+  v <- data.frame(version = c("1.0", "1.1"), ref = c("1.0", "1.1"), date = "2026-01-01",
+                  commit = c("c1", "c2"), stringsAsFactors = FALSE)
+  st <- .version_state_rows("p", v, c("t1", "t2"),
+                            list(list(symbols = "a", uses_lifecycle = TRUE)),
+                            "2026-10-01T00:00:00Z")
+  expect_identical(st$deprecated, c('["a"]', "[]"))
+  expect_identical(st$uses_lifecycle, c(1L, 0L))
+  expect_identical(st$rows_generation, c(ROWS_GENERATION, ROWS_GENERATION))
+  expect_identical(names(st), .VERSION_STATE_COLS)
+})
+
 test_that("a write with no state rows leaves the package with none", {
   path <- withr::local_tempfile(fileext = ".db")
   con <- open_or_init_db(path)
@@ -400,4 +345,47 @@ test_that("a state write that fails rolls back the package's other rows with it"
                    "1.0")
   expect_identical(DBI::dbGetQuery(con, sprintf('SELECT version FROM "%s"',
                                                 VERSION_STATE_TABLE))$version, "1.0")
+})
+
+test_that("a requeue deletes the requeued package's state rows and no other's", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_source(base, "okpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, c("vstpkg", "okpkg"), c("1.1", "1.1"))
+  con <- open_or_init_db(file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.requeue(con, "vstpkg"), "vstpkg")
+  n <- function(p) DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s" WHERE package = ?',
+                                                VERSION_STATE_TABLE), params = list(p))$n
+  expect_identical(c(n("vstpkg"), n("okpkg")), c(0L, 2L))
+})
+
+test_that("the stored versions with no recorded commit are counted", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_source(base, "okpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, c("vstpkg", "okpkg"), c("1.1", "1.1"))
+  con <- open_or_init_db(file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.n_versions_unrecorded(con), 0L)
+  DBI::dbExecute(con, sprintf("UPDATE \"%s\" SET commit_sha = NULL
+                               WHERE package = 'vstpkg' AND version = '1.0'", VERSION_STATE_TABLE))
+  DBI::dbExecute(con, sprintf("DELETE FROM \"%s\"
+                               WHERE package = 'okpkg' AND version = '1.1'", VERSION_STATE_TABLE))
+  expect_identical(.n_versions_unrecorded(con), 2L)
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  expect_identical(.n_versions_unrecorded(con2), 0L)
+})
+
+test_that("the code manifest and run status carry n_versions_unrecorded, the data manifest does not", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, "vstpkg", "1.1")
+  expect_identical(jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"))$bootstrap$n_versions_unrecorded, 0L)
+  expect_identical(jsonlite::fromJSON(file.path(out_dir, "run-status.json"))$n_versions_unrecorded, 0L)
+  expect_null(jsonlite::fromJSON(file.path(out_dir, "data-manifest.json"))$bootstrap$n_versions_unrecorded)
 })

@@ -63,8 +63,20 @@ SUMMARY_TABLE <- "bioc_code_summary"
 CHURN_TABLE   <- "bioc_code_churn"
 API_TABLE     <- "bioc_api_history"
 # The commit, tree and deprecation signals each stored version was read from.
-# Pipeline state: the merger does not copy it.
+# Pipeline state: the merger does not copy it, and the code manifest counts the
+# summary rows it lacks.
 VERSION_STATE_TABLE <- "bioc_version_state"
+
+# A pull request that changes the rows R writes for one version bumps this and
+# regenerates tests/testthat/fixtures/rows-golden.json.
+ROWS_GENERATION <- 1L
+
+# Read only the stored releases whose rows are not current, unless VERSION_SKIP is
+# 0, false, off or no, in any case. Any other value, empty included, leaves it on.
+.version_skip_on <- function(value = Sys.getenv("VERSION_SKIP", unset = "")) {
+  !tolower(trimws(value)) %in% c("0", "false", "off", "no")
+}
+VERSION_SKIP <- .version_skip_on()
 
 # Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
 # cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.

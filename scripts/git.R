@@ -193,25 +193,6 @@ list_versions <- function(repo) {
   )
 }
 
-#' The tree of each commit, in order, from one git rev-parse.
-#'
-#' @param repo    Path to a local git repository.
-#' @param commits Commit SHAs, as list_versions() gives them.
-#' @return Character vector as long as commits. All NA when git cannot resolve
-#'   every one, so a tree is never paired with the wrong commit.
-commit_trees <- function(repo, commits) {
-  commits <- as.character(commits)
-  if (length(commits) == 0L) return(character(0L))
-  out <- suppressWarnings(
-    system2("git", c("-C", repo, "rev-parse", shQuote(paste0(commits, "^{tree}"))),
-            stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
-  )
-  ok <- is.null(attr(out, "status")) && length(out) == length(commits) &&
-    all(grepl("^[0-9a-f]{40}([0-9a-f]{24})?$", out))
-  if (!ok) return(rep(NA_character_, length(commits)))
-  as.character(out)
-}
-
 #' The condition extract_version raises when git archive or tar exits non-zero.
 #'
 #' @param step   "archive" or "tar".
@@ -243,10 +224,11 @@ commit_trees <- function(repo, commits) {
 #'   For Bioconductor RELEASE branches, use the ref from list_versions()
 #'   (e.g. "origin/RELEASE_3_18" or a commit SHA).
 #' @param dest  Destination directory for the extracted tree.
+#' @param paths Optional paths to extract alone; each must exist at <ref>.
 #' @return Character vector of extracted file paths, relative to dest, and
 #'   character(0) for a tree that is empty. A non-zero exit of git archive or
 #'   tar raises an `extract_failure` (see .extract_failure).
-extract_version <- function(repo, ref, dest) {
+extract_version <- function(repo, ref, dest, paths = character(0L)) {
   if (!dir.exists(dest)) dir.create(dest, recursive = TRUE)
   # Write the archive to a temp file so each stage gets its own timeout.
   archive_file <- tempfile("git_archive_", fileext = ".tar")
@@ -260,7 +242,8 @@ extract_version <- function(repo, ref, dest) {
   rc1 <- suppressWarnings(
     system2("git", c("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
                      "-c", "filter.lfs.required=false",
-                     "-C", repo, "archive", ref),
+                     "-C", repo, "archive", ref,
+                     if (length(paths)) c("--", paths)),
             stdout = archive_file, stderr = err_file, timeout = GIT_TIMEOUT)
   )
   if (!identical(rc1, 0L)) stop(.extract_failure("archive", ref, rc1, first_err()))
@@ -317,7 +300,8 @@ extract_version <- function(repo, ref, dest) {
 #'   file    - repository-relative file path (character)
 #'   added   - integer lines added, NA for binary files
 #'   deleted - integer lines deleted, NA for binary files
-#'   Returns the zero-row frame when no RELEASE branches are found.
+#'   Returns the zero-row frame when no RELEASE branches are found. Attribute
+#'   "failed", when any, names the releases whose diff git did not finish.
 package_churn <- function(repo) {
   empty <- data.frame(
     commit  = character(0L), version = character(0L),
@@ -345,6 +329,7 @@ package_churn <- function(repo) {
 
   results   <- vector("list", nrow(vers) * 20L)
   n_results <- 0L
+  failed    <- character(0L)
 
   for (i in seq_len(nrow(vers))) {
     curr_ver    <- vers$version[i]
@@ -357,8 +342,11 @@ package_churn <- function(repo) {
               stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT)
     )
     # On timeout the status attribute is non-zero; skip this release's diff
-    # rather than recording partial or absent churn data.
-    if (!is.null(attr(raw, "status")) && attr(raw, "status") != 0L) next
+    # rather than recording partial or absent churn data, and name it.
+    if (!is.null(attr(raw, "status")) && attr(raw, "status") != 0L) {
+      failed <- c(failed, curr_ver)
+      next
+    }
 
     for (line in raw) {
       line <- trimws(line)
@@ -382,17 +370,19 @@ package_churn <- function(repo) {
     }
   }
 
-  if (n_results == 0L) return(empty)
-  results <- results[seq_len(n_results)]
-
-  data.frame(
-    commit  = vapply(results, `[[`, character(1L), "commit"),
-    version = vapply(results, `[[`, character(1L), "version"),
-    file    = vapply(results, `[[`, character(1L), "file"),
-    added   = vapply(results, `[[`, integer(1L),   "added"),
-    deleted = vapply(results, `[[`, integer(1L),   "deleted"),
-    stringsAsFactors = FALSE
-  )
+  out <- if (n_results == 0L) empty else {
+    results <- results[seq_len(n_results)]
+    data.frame(
+      commit  = vapply(results, `[[`, character(1L), "commit"),
+      version = vapply(results, `[[`, character(1L), "version"),
+      file    = vapply(results, `[[`, character(1L), "file"),
+      added   = vapply(results, `[[`, integer(1L),   "added"),
+      deleted = vapply(results, `[[`, integer(1L),   "deleted"),
+      stringsAsFactors = FALSE
+    )
+  }
+  if (length(failed)) attr(out, "failed") <- failed
+  out
 }
 
 #' Read the content of a file at a specific git ref.

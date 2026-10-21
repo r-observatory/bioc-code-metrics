@@ -411,6 +411,30 @@ test_that("clone_package returns FALSE for a non-existent repo (offline-safe)", 
   path
 }
 
+test_that("package_churn names the releases whose diff git did not finish, and keeps the others' rows", {
+  repo <- withr::local_tempdir()
+  system2("git", c("init", "-q", repo), stdout = FALSE, stderr = FALSE)
+  for (v in c("3_16", "3_17")) {
+    writeLines(v, file.path(repo, paste0("r", v, ".R")))
+    .git(repo, "add", ".")
+    .gitc(repo, "commit", "-q", "-m", paste0("release-", v))
+    .git(repo, "branch", paste0("RELEASE_", v))
+  }
+  whole <- package_churn(repo)
+  expect_null(attr(whole, "failed"))
+  expect_identical(sort(unique(whole$version)), c("3.16", "3.17"))
+  vers <- list_versions(repo)
+  tip  <- vers$commit[vers$version == "3.17"]
+  real <- Sys.which("git")
+  # git as it is, except that 3.17's diff exits as a timeout does.
+  .local_shim("git", c(sprintf('case "$*" in *"diff --numstat "*"..%s") exit 124 ;; esac', tip),
+                       sprintf('exec %s "$@"', shQuote(real))))
+  ch <- package_churn(repo)
+  expect_identical(attr(ch, "failed"), "3.17")
+  attr(ch, "failed") <- NULL
+  expect_identical(ch, whole[whole$version == "3.16", , drop = FALSE])
+})
+
 test_that("an LFS-tracked file that cannot be smudged extracts as its pointer", {
   .local_fake_lfs()
   repo <- .lfs_repo(withr::local_tempdir())
@@ -690,4 +714,18 @@ test_that("the pipeline's clone falls back to Bioconductor's git server", {
   ok <- default_io()$clone("p", file.path(withr::local_tempdir(), "clone"))
   expect_true(ok)
   expect_identical(attr(ok, "base"), fallback)
+})
+
+test_that("extract_version with paths extracts only those paths", {
+  repo <- withr::local_tempdir()
+  system2("git", c("init", "-q", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+  writeLines("a <- 1", file.path(repo, "R", "a.R"))
+  writeLines("export(a)", file.path(repo, "NAMESPACE"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-q", "-m", "v1")
+  .git(repo, "tag", "1.0")
+  tmp <- withr::local_tempdir()
+  expect_identical(extract_version(repo, "1.0", tmp, paths = "NAMESPACE"), "NAMESPACE")
+  expect_false(file.exists(file.path(tmp, "R", "a.R")))
 })
