@@ -273,3 +273,229 @@ test_that("the prior is the same whatever the chunk size", {
   expect_identical(.prior_state(con, con, pkgs, "0.5.2", chunk = 1L),
                    .prior_state(con, con, pkgs, "0.5.2"))
 })
+
+# ---- A walk with a prior ------------------------------------------------------
+
+# One run over `versions` under the stub, and the prior it leaves.
+.vs_walked <- function(versions = c("1.0", "1.1", "1.2"), frame = parent.frame()) {
+  .vs_stub(frame = frame)
+  root <- withr::local_tempdir(.local_envir = frame)
+  src  <- .vst_source(root, "vstpkg", versions)
+  out  <- withr::local_tempdir(.local_envir = frame)
+  .vst_run(root, out, "vstpkg", versions[[length(versions)]])
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con))
+  list(root = root, src = src, prior = .prior_state(con, con, "vstpkg", "0.4.0-test")[["vstpkg"]])
+}
+
+# A fresh clone of the fixture's source, as the next run makes it.
+.vs_clone <- function(w, frame = parent.frame()) {
+  dest <- file.path(withr::local_tempdir(.local_envir = frame), "vstpkg")
+  stopifnot(isTRUE(clone_package("vstpkg", dest, base = w$root)))
+  dest
+}
+
+.vs_no_rownames <- function(df) {
+  rownames(df) <- NULL
+  df
+}
+
+# Calls to .exports_at() in the calling test, by version.
+.vs_spy_exports <- function(frame = parent.frame()) {
+  seen <- new.env()
+  seen$v <- character(0L)
+  real <- .exports_at
+  .local_global(".exports_at", function(repo, ref, package, version) {
+    seen$v <- c(seen$v, version)
+    real(repo, ref, package, version)
+  }, frame = frame)
+  seen
+}
+
+test_that("a new release is read alone, and the rest come back as a full walk's derived columns", {
+  w <- .vs_walked(); p <- w$prior
+  .vst_release(w$src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  clone <- .vs_clone(w)
+  res  <- analyze_package(clone, "vstpkg", prior = p)
+  full <- analyze_package(clone, "vstpkg")
+  expect_true(res$skip$partial); expect_false(res$skip$unchanged)
+  expect_identical(res$summary$version, "1.3")
+  expect_identical(res$skip$row_keys, "1.3"); expect_identical(res$skip$api_keys, "1.3")
+  expect_identical(names(res$skip$derived), c("package", "version", .CROSS_VERSION_COLS))
+  expect_identical(res$skip$derived$version, c("1.0", "1.1", "1.2"))
+  k <- match(res$skip$derived$version, full$summary$version)
+  expect_identical(.vs_no_rownames(res$skip$derived[, .CROSS_VERSION_COLS]),
+                   .vs_no_rownames(full$summary[k, .CROSS_VERSION_COLS]))
+  expect_identical(.vs_no_rownames(res$summary),
+                   .vs_no_rownames(full$summary[full$summary$version == "1.3", ]))
+  expect_identical(.vs_no_rownames(res$api), .vs_no_rownames(full$api[full$api$version == "1.3", ]))
+  # A release's churn is its diff from the release before, so only 1.3's is new.
+  expect_identical(unique(res$churn$version), "1.3")
+  expect_identical(.vs_no_rownames(res$churn),
+                   .vs_no_rownames(full$churn[full$churn$version == "1.3", ]))
+  expect_identical(res$state$version, "1.3")
+  expect_identical(res$state$rows_generation, ROWS_GENERATION)
+})
+test_that("a skipped release carries its stored deprecation signals and API row into the package columns", {
+  w <- .vs_walked(); p <- w$prior
+  .vst_release(w$src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  clone <- .vs_clone(w)
+  full <- analyze_package(clone, "vstpkg")
+  pkg_cols <- c("exports_removed_n", "cold_removal_rate", "deprecation_infrastructure_maturity")
+  # 1.2 uses lifecycle and warned about a, which 1.3 drops; 1.2 dropped b cold.
+  expect_identical(full$summary$deprecation_infrastructure_maturity[[4L]], 2L)
+  expect_identical(full$summary$cold_removal_rate[[4L]], 0.5)
+  res <- analyze_package(clone, "vstpkg", prior = p)
+  expect_identical(.vs_no_rownames(res$summary[, pkg_cols]),
+                   .vs_no_rownames(full$summary[4L, pkg_cols]))
+  # Stored values that a read would not give are the ones the walk takes.
+  p$state$deprecated <- "[]"
+  p$state$uses_lifecycle <- 0L
+  p$api$exports_removed[p$api$version == "1.2"] <- '["b","q"]'
+  res <- analyze_package(clone, "vstpkg", prior = p)
+  expect_identical(res$summary$deprecation_infrastructure_maturity, 0L)
+  expect_identical(res$skip$derived$exports_removed_n[res$skip$derived$version == "1.2"], 2L)
+  expect_identical(res$summary$cold_removal_rate, 1)
+})
+test_that("a moved release is read, and its successor's diff is redone from the two NAMESPACE files", {
+  w <- .vs_walked(); p <- w$prior; src <- w$src
+  .vst_move_branch(src, "1.1")
+  # A stored diff of 1.2 that the redo must not reuse.
+  p$api$exports_removed[p$api$version == "1.2"] <- '["zz"]'
+  clone <- .vs_clone(w)
+  seen <- .vs_spy_exports()
+  res  <- analyze_package(clone, "vstpkg", prior = p)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(res$skip$plan$reason, c(NA, "moved", NA))
+  expect_identical(res$skip$plan$pred_changed, c(FALSE, FALSE, TRUE))
+  expect_identical(res$summary$version, "1.1")
+  # 1.0's exports for the diff of 1.1 read after it, then 1.2's for its own.
+  expect_identical(seen$v, c("1.0", "1.2"))
+  expect_setequal(res$skip$api_keys, c("1.1", "1.2"))
+  expect_identical(res$skip$row_keys, "1.1")
+  expect_identical(.vs_no_rownames(res$api),
+                   .vs_no_rownames(full$api[full$api$version %in% c("1.1", "1.2"), ]))
+  expect_identical(res$api$exports_removed[res$api$version == "1.2"], '["b"]')
+  # 1.2's churn is a diff from 1.1's tip, which moved.
+  expect_identical(.vs_no_rownames(res$churn),
+                   .vs_no_rownames(full$churn[full$churn$version %in% c("1.1", "1.2"), ]))
+  expect_true("1.2" %in% res$churn$version)
+  st <- res$state[res$state$version == "1.2", ]
+  expect_identical(st$prev_commit, .vst_rev_parse(src, .vst_branch("1.1")))
+  for (cn in c("commit_sha", "tree_sha", "deprecated", "uses_lifecycle", "read_at",
+               "rows_generation")) {
+    expect_identical(st[[cn]], p$state[[cn]][p$state$version == "1.2"], info = cn)
+  }
+})
+test_that("a package with nothing to read comes back unchanged", {
+  w <- .vs_walked()
+  res <- analyze_package(.vs_clone(w), "vstpkg", prior = w$prior)
+  expect_true(res$skip$unchanged); expect_false(res$skip$partial)
+  expect_false(any(res$skip$plan$read))
+  expect_identical(nrow(res$summary), 0L)
+  frames <- c("churn", "api", "state", "functions", "edges", "datasets")
+  expect_identical(vapply(res[frames], nrow, integer(1L)), stats::setNames(integer(6L), frames))
+  expect_true(all(vapply(res$text, nrow, integer(1L)) == 0L))
+  expect_identical(res$skip$row_keys, character(0L)); expect_identical(res$skip$api_keys, character(0L))
+  expect_identical(res$skip$derived$version, c("1.0", "1.1", "1.2"))
+})
+test_that("an empty listing deletes nothing", {
+  repo <- withr::local_tempdir()
+  .vst_git(repo, "init", "-q")
+  writeLines("x", file.path(repo, "README"))
+  .vst_git(repo, "add", "-A")
+  .vst_git(repo, "commit", "-q", "-m", "init")
+  res <- analyze_package(repo, "vstpkg", prior = .vs_prior(c("1.0", "1.1")))
+  expect_identical(res$skip$row_keys, character(0L)); expect_true(res$skip$unchanged)
+  expect_identical(res$skip$api_keys, character(0L))
+  expect_identical(res$skip$newest, NA_character_)
+  expect_identical(names(res$skip$derived), c("package", "version", .CROSS_VERSION_COLS))
+})
+test_that("a release gone from the listing is deleted with its rows", {
+  w <- .vs_walked()
+  .vst_git(w$src, "branch", "-D", .vst_branch("1.0"))
+  clone <- .vs_clone(w)
+  res  <- analyze_package(clone, "vstpkg", prior = w$prior)
+  full <- analyze_package(clone, "vstpkg")
+  expect_true("1.0" %in% res$skip$row_keys); expect_true("1.0" %in% res$skip$api_keys)
+  expect_false(res$skip$unchanged); expect_true(res$skip$partial)
+  expect_identical(res$skip$plan$version, c("1.1", "1.2"))
+  # 1.1 is now first, so its diff is from nothing; 1.2 keeps its stored churn.
+  expect_identical(res$skip$plan$pred_changed, c(TRUE, FALSE))
+  expect_identical(.vs_no_rownames(res$churn),
+                   .vs_no_rownames(full$churn[full$churn$version == "1.1", ]))
+  expect_identical(.vs_no_rownames(res$api), .vs_no_rownames(full$api[full$api$version == "1.1", ]))
+})
+test_that("a redone diff after a release skipped with its stored diff reads that release's exports first", {
+  w <- .vs_walked()
+  .vst_git(w$src, "branch", "-D", .vst_branch("1.1"))
+  clone <- .vs_clone(w)
+  seen <- .vs_spy_exports()
+  res  <- analyze_package(clone, "vstpkg", prior = w$prior)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(res$skip$plan$pred_changed, c(FALSE, TRUE))
+  expect_identical(nrow(res$summary), 0L)
+  expect_identical(seen$v, c("1.0", "1.2"))
+  expect_identical(.vs_no_rownames(res$api), .vs_no_rownames(full$api[full$api$version == "1.2", ]))
+  expect_identical(.vs_no_rownames(res$churn),
+                   .vs_no_rownames(full$churn[full$churn$version == "1.2", ]))
+  expect_identical(res$state$prev_version, "1.0")
+  expect_identical(res$skip$row_keys, "1.1"); expect_setequal(res$skip$api_keys, c("1.1", "1.2"))
+})
+test_that("without a prior the result has no skip part and every release is read", {
+  .vs_stub()
+  src <- .vst_source(withr::local_tempdir(), "vstpkg", c("1.0", "1.1", "1.2"))
+  res <- analyze_package(src, "vstpkg")
+  expect_null(res$skip); expect_false("skip" %in% names(res))
+  expect_identical(nrow(res$summary), 3L)
+  expect_identical(res$binary_versions, c("1.0", "1.1", "1.2"))
+})
+test_that("a walk with a prior counts the releases it reads", {
+  w <- .vs_walked()
+  .vst_move_branch(w$src, "1.1")
+  clone <- .vs_clone(w)
+  .tally_reset()
+  withr::defer(.tally_reset())
+  analyze_package(clone, "vstpkg", prior = w$prior)
+  tally <- .tally_snapshot()
+  expect_identical(tally$versions_read, 1)
+  expect_true(tally$skip_s >= 0)
+})
+test_that("the read marker is the stored newest's dataset marker when the newest is skipped", {
+  w <- .vs_walked()
+  .vst_move_branch(w$src, "1.1")
+  clone <- .vs_clone(w)
+  # The stub no longer reads 1.2, so a read of it would leave no dataset marker.
+  .vs_stub(c("1.0", "1.1"))
+  full <- suppressWarnings(analyze_package(clone, "vstpkg"))
+  expect_false(isTRUE(full$summary$datasets_scanned[[3L]]))
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$skip$newest, "1.2")
+  expect_false(res$skip$newest_read); expect_true(res$skip$read_marker)
+})
+test_that("assessed_at and assessed_with are not among the columns written back", {
+  w <- .vs_walked()
+  .vst_release(w$src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  res <- analyze_package(.vs_clone(w), "vstpkg", prior = w$prior)
+  expect_identical(nrow(res$skip$derived), 3L)
+  expect_true(all(c("assessed_at", "assessed_with") %in% names(res$summary)))
+  expect_false(any(c("assessed_at", "assessed_with") %in% names(res$skip$derived)))
+})
+test_that("functions and edges come from every release read, and from no release skipped", {
+  w <- .vs_walked()
+  .vst_move_branch(w$src, "1.1")
+  clone <- .vs_clone(w)
+  .vs_stub(detail = TRUE)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(full$functions$version, c("1.0", "1.1", "1.2"))
+  expect_identical(full$edges$version, c("1.0", "1.1", "1.2"))
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$summary$version, "1.1"); expect_true(res$skip$partial)
+  expect_identical(.vs_no_rownames(res$functions),
+                   .vs_no_rownames(full$functions[full$functions$version == "1.1", ]))
+  expect_identical(.vs_no_rownames(res$edges),
+                   .vs_no_rownames(full$edges[full$edges$version == "1.1", ]))
+  expect_identical(.vs_no_rownames(res$datasets),
+                   .vs_no_rownames(full$datasets[full$datasets$version == "1.1", ]))
+  expect_identical(res$datasets$is_current, 0L)
+})

@@ -698,17 +698,28 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #'   package, so the R fallback never replaces that row.
 #' @param limit     The address-space limit each analyzer runs under, an
 #'   .analyzer_limit().
+#' @param prior     The package's stored rows from .prior_state(). The walk then
+#'   reads only the versions .read_plan() names; NULL reads every version.
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
 #'   $binary_versions: the versions whose metrics the analyzer binary
 #'   produced, as opposed to the pure-R fallback, and $state, the version
-#'   state rows (.version_state_rows).
+#'   state rows (.version_state_rows). With a prior, also $skip: the plan, the
+#'   newest version and whether it was read, its dataset marker, whether the
+#'   package is unchanged or partly read, the derived columns of the versions
+#'   skipped, and the versions whose rows (row_keys) and API, churn and state
+#'   rows (api_keys) the write replaces. A partly read package's frames hold
+#'   only what the write needs: the versions read and the diffs redone. An
+#'   unchanged package's frames are empty.
 analyze_package <- function(repo_dir, package, stamped = character(0L),
-                            limit = .analyzer_limit()) {
+                            limit = .analyzer_limit(), prior = NULL) {
   versions_df <- list_versions(repo_dir)
   churn_all   <- package_churn(repo_dir)
   # The version state's read_at: the walk reads the commits listed just now.
   read_at     <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  t_plan      <- proc.time()[["elapsed"]]
   trees       <- .version_trees(repo_dir, versions_df$commit)
+  plan        <- .read_plan(versions_df, trees, prior)
+  .tally_add("skip_s", .secs_since(t_plan))
 
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
@@ -726,6 +737,9 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
   # in one frame nothing about a row says which path wrote it.
   from_binary        <- logical(nrow(versions_df))
   prev_exports       <- NULL
+  # FALSE after a version skipped with its stored diff, until a later version
+  # needs its exports.
+  prev_loaded        <- TRUE
   deprecation_series <- vector("list", nrow(versions_df))
   # Time-gated per-version heartbeat. A single package with thousands of versions
   # would otherwise grind silently after its worker's siblings have finished; this
@@ -751,6 +765,52 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
         flush(stdout())
       }, silent = TRUE)
     }
+
+    if (!plan$read[[i]]) {
+      # Skipped: the stored row stands, and the walk carries what the versions
+      # after it and the cross-version columns need from it.
+      t_skip <- proc.time()[["elapsed"]]
+      st <- prior$stored[match(v, prior$stored$version), , drop = FALSE]
+      ss <- prior$state[match(v, prior$state$version), , drop = FALSE]
+      if (plan$pred_changed[[i]]) {
+        if (!prev_loaded) {
+          prev_exports <- .exports_at(repo_dir, versions_df$ref[[i - 1L]], package,
+                                      versions_df$version[[i - 1L]])
+        }
+        curr          <- .exports_at(repo_dir, ref, package, v)
+        api_rows[[i]] <- .api_row(package, v, curr, prev_exports)
+        prev_exports  <- curr
+        prev_loaded   <- TRUE
+      } else {
+        a <- prior$api[match(v, prior$api$version), , drop = FALSE]
+        api_rows[[i]] <- data.frame(package = package, version = v,
+                                    exports_added = as.character(a$exports_added),
+                                    exports_removed = as.character(a$exports_removed),
+                                    n_exports = as.integer(a$n_exports),
+                                    stringsAsFactors = FALSE)
+        prev_loaded <- FALSE
+      }
+      summary_rows[[i]] <- stats::setNames(lapply(.CROSS_VERSION_INPUTS, function(cn) {
+        x <- switch(cn, package = package, version = v, st[[cn]])
+        if (is.null(x) || length(x) != 1L) NA else x
+      }), .CROSS_VERSION_INPUTS)
+      functions_rows[[i]] <- .empty_functions_df()
+      edges_rows[[i]]     <- .empty_edges_df()
+      datasets_rows[[i]]  <- .empty_datasets_df()
+      datasets_read[[i]]  <- isTRUE(as.logical(st$datasets_scanned))
+      deprecation_series[[i]] <- list(symbols = .xv_json_to_chr(ss$deprecated),
+                                      uses_lifecycle = isTRUE(as.logical(ss$uses_lifecycle)))
+      .tally_add("skip_s", .secs_since(t_skip))
+      next
+    }
+    if (!prev_loaded) {
+      t_skip <- proc.time()[["elapsed"]]
+      prev_exports <- .exports_at(repo_dir, versions_df$ref[[i - 1L]], package,
+                                  versions_df$version[[i - 1L]])
+      prev_loaded  <- TRUE
+      .tally_add("skip_s", .secs_since(t_skip))
+    }
+    .tally_add("versions_read", 1)
 
     # Per-version work is wrapped in local() so on.exit fires per iteration
     # rather than accumulating in the outer function's exit handlers.
@@ -929,10 +989,14 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
     deprecation_series[[i]] <- iter$dep_sig
   }
 
+  # The columns of the versions read. They lead the frame, and a column only a
+  # skipped version's inputs-only row carries is not written.
+  read_cols <- unique(unlist(lapply(summary_rows[plan$read], names)))
+
   # Assemble summary data.frame from list of named lists
   summary_df <- if (length(summary_rows) > 0L) {
     # Collect all column names across rows (groups may differ if some fail)
-    all_cols <- unique(unlist(lapply(summary_rows, names)))
+    all_cols <- unique(c(read_cols, unlist(lapply(summary_rows, names))))
     rows_df  <- lapply(summary_rows, function(r) {
       row <- lapply(all_cols, function(cn) {
         v <- r[[cn]]
@@ -998,7 +1062,9 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
     datasets_read = length(datasets_read) > 0L &&
       isTRUE(datasets_read[[length(datasets_read)]]))
 
-  list(
+  state_df <- .version_state_rows(package, versions_df, trees, deprecation_series, read_at)
+
+  out <- list(
     summary   = summary_df,
     churn     = churn_df,
     api       = api_df,
@@ -1013,7 +1079,50 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
     # they are in the same frame. The caller stamps the running build on these
     # and leaves the rest naming nobody.
     binary_versions = as.character(versions_df$version[from_binary]),
-    state     = .version_state_rows(package, versions_df, trees, deprecation_series,
-                                    read_at)
+    state     = state_df
   )
+  if (is.null(prior)) return(out)
+
+  n    <- nrow(versions_df)
+  read <- plan$version[plan$read]
+  redo <- plan$version[plan$pred_changed]
+  # An empty listing says more about the clone than about the package, so it
+  # deletes nothing, as upsert_shard keeps a package that yields no rows.
+  gone <- if (n > 0L) setdiff(as.character(prior$stored$version), plan$version) else character(0L)
+  unchanged <- !length(read) && !length(redo) && !length(gone)
+  partial   <- !unchanged && !all(plan$read)
+  skipped   <- !plan$read
+  if (partial || unchanged) {
+    # What the write needs: the versions read and the diffs redone. A churn row
+    # is a diff from the release before, so a redone diff's churn is new too.
+    # Skipped versions added no detail, dataset or text rows.
+    drop <- setdiff(.CROSS_VERSION_INPUTS, c("package", "version", read_cols))
+    out$summary <- summary_df[plan$read, setdiff(names(summary_df), drop), drop = FALSE]
+    out$api     <- api_df[api_df$version %in% c(read, redo), , drop = FALSE]
+    out$churn   <- churn_df[churn_df$version %in% c(read, redo), , drop = FALSE]
+    # A redone diff's state row keeps what its version was read from.
+    state  <- state_df[state_df$version %in% c(read, redo), , drop = FALSE]
+    redone <- state$version %in% redo
+    k      <- match(state$version[redone], prior$state$version)
+    for (cn in c("commit_sha", "tree_sha", "deprecated", "uses_lifecycle", "read_at",
+                 "rows_generation")) {
+      state[[cn]][redone] <- prior$state[[cn]][k]
+    }
+    out$state <- state
+    for (f in c("summary", "api", "churn", "state")) rownames(out[[f]]) <- NULL
+  }
+  out$skip <- list(
+    plan        = plan,
+    newest      = if (n > 0L) versions_df$version[[n]] else NA_character_,
+    newest_read = n > 0L && isTRUE(plan$read[[n]]),
+    read_marker = n > 0L && isTRUE(as.logical(summary_df$datasets_scanned[[n]])),
+    unchanged   = unchanged,
+    partial     = partial,
+    derived     = data.frame(package = rep(package, sum(skipped)),
+                             version = plan$version[skipped],
+                             summary_df[skipped, .CROSS_VERSION_COLS, drop = FALSE],
+                             stringsAsFactors = FALSE, row.names = NULL),
+    row_keys    = unique(c(read, gone)),
+    api_keys    = unique(c(read, redo, gone)))
+  out
 }
