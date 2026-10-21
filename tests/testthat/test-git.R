@@ -691,3 +691,17 @@ test_that("the pipeline's clone falls back to Bioconductor's git server", {
   expect_true(ok)
   expect_identical(attr(ok, "base"), fallback)
 })
+
+test_that("extract_version with paths extracts only those paths", {
+  repo <- withr::local_tempdir()
+  system2("git", c("init", "-q", repo), stdout = FALSE, stderr = FALSE)
+  dir.create(file.path(repo, "R"))
+  writeLines("a <- 1", file.path(repo, "R", "a.R"))
+  writeLines("export(a)", file.path(repo, "NAMESPACE"))
+  .git(repo, "add", ".")
+  .gitc(repo, "commit", "-q", "-m", "v1")
+  .git(repo, "tag", "1.0")
+  tmp <- withr::local_tempdir()
+  expect_identical(extract_version(repo, "1.0", tmp, paths = "NAMESPACE"), "NAMESPACE")
+  expect_false(file.exists(file.path(tmp, "R", "a.R")))
+})

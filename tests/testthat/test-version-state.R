@@ -283,9 +283,9 @@ test_that("a package that fails keeps its rows and its state rows as they were",
   .vst_move_branch(src, "1.0")
   .vst_release(src, "vstpkg", "1.2", "2025-10-01T00:00:00Z")
   real <- extract_version
-  .local_global("extract_version", function(repo, ref, dest) {
+  .local_global("extract_version", function(repo, ref, dest, ...) {
     if (grepl("RELEASE_1_2$", ref)) stop(.extract_failure("archive", ref, 128L, "fatal: bad object"))
-    real(repo, ref, dest)
+    real(repo, ref, dest, ...)
   })
   m <- .vst_run(base, out_dir, "vstpkg", "1.2")
   expect_identical(m$shard_failures$packages, "vstpkg")

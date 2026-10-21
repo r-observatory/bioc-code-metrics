@@ -224,10 +224,11 @@ list_versions <- function(repo) {
 #'   For Bioconductor RELEASE branches, use the ref from list_versions()
 #'   (e.g. "origin/RELEASE_3_18" or a commit SHA).
 #' @param dest  Destination directory for the extracted tree.
+#' @param paths Optional paths to extract alone; each must exist at <ref>.
 #' @return Character vector of extracted file paths, relative to dest, and
 #'   character(0) for a tree that is empty. A non-zero exit of git archive or
 #'   tar raises an `extract_failure` (see .extract_failure).
-extract_version <- function(repo, ref, dest) {
+extract_version <- function(repo, ref, dest, paths = character(0L)) {
   if (!dir.exists(dest)) dir.create(dest, recursive = TRUE)
   # Write the archive to a temp file so each stage gets its own timeout.
   archive_file <- tempfile("git_archive_", fileext = ".tar")
@@ -241,7 +242,8 @@ extract_version <- function(repo, ref, dest) {
   rc1 <- suppressWarnings(
     system2("git", c("-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
                      "-c", "filter.lfs.required=false",
-                     "-C", repo, "archive", ref),
+                     "-C", repo, "archive", ref,
+                     if (length(paths)) c("--", paths)),
             stdout = archive_file, stderr = err_file, timeout = GIT_TIMEOUT)
   )
   if (!identical(rc1, 0L)) stop(.extract_failure("archive", ref, rc1, first_err()))
