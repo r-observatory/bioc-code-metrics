@@ -763,3 +763,221 @@ test_that("a run with the skip off says so where the version skip line goes, and
   log <- attr(.vs_run(out, root, c(vstpkg = "1.1")), "log")
   expect_identical(grep("^version skip: off$", log), integer(0L))
 })
+
+# ---- The skip against upstream changes ------------------------------------------
+
+# A copy of out_dir, for the full walk a skip run is compared with.
+.vs_copy <- function(out_dir, frame = parent.frame()) {
+  dest <- withr::local_tempdir(.local_envir = frame)
+  file.copy(list.files(out_dir, full.names = TRUE, all.files = TRUE, no.. = TRUE),
+            dest, recursive = TRUE)
+  dest
+}
+
+.vs_exec <- function(out_dir, sql) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con))
+  for (s in sql) DBI::dbExecute(con, s)
+  invisible(NULL)
+}
+
+.vs_versions_read <- function(out_dir) {
+  as.integer(jsonlite::fromJSON(file.path(out_dir, "run-status.json"))$worker_phases$versions_read)
+}
+
+# Every read plan the calling test's walks make, in order; workers run in this process.
+.vs_plans <- function(frame = parent.frame()) {
+  seen <- new.env()
+  seen$plans <- list()
+  real <- .read_plan
+  .local_global(".read_plan", function(...) {
+    p <- real(...)
+    seen$plans[[length(seen$plans) + 1L]] <- p
+    p
+  }, frame = frame)
+  seen
+}
+
+# The dataset rows that name the newest: the links marked current, the
+# identity row's release and the content that row points at.
+.vs_links <- function(out_dir) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out_dir, DATA_DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con))
+  c(current = DBI::dbGetQuery(con, paste("SELECT version FROM bioc_dataset_versions",
+                                         "WHERE is_current = 1"))$version,
+    identity = DBI::dbGetQuery(con, "SELECT current_version FROM bioc_datasets")$current_version,
+    content = DBI::dbGetQuery(con, paste(
+      "SELECT c.content_fp FROM bioc_datasets d JOIN bioc_dataset_contents c",
+      "ON c.content_id = d.current_content_id"))$content_fp)
+}
+
+test_that("moved, deleted, out-of-class and requeued versions give a full walk's rows", {
+  .vs_stub()
+  root <- withr::local_tempdir()
+  pkgs <- c("apkg", "bpkg", "cpkg", "dpkg")
+  src  <- vapply(pkgs, function(p) .vst_source(root, p, c("1.0", "1.1", "1.2")), character(1L))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, stats::setNames(rep("1.2", 4L), pkgs))
+  full <- .vs_copy(skip)
+  # apkg, bpkg and cpkg gain 1.3; dpkg is queued by a NULL n_fns_r on 1.0.
+  for (p in pkgs[1:3]) .vst_release(src[[p]], p, "1.3", "2025-05-01T00:00:00Z")
+  .vst_move_branch(src[["apkg"]], "1.1")
+  .vst_git(src[["bpkg"]], "branch", "-D", .vst_branch("1.1"))
+  .vst_move_branch(src[["dpkg"]], "1.2")
+  for (out in c(skip, full)) {
+    .vs_exec(out, c(
+      paste("UPDATE bioc_code_summary SET analyzer_version = '0.3.0-test'",
+            "WHERE package = 'bpkg' AND version = '1.0'"),
+      "UPDATE bioc_code_summary SET n_fns_r = NULL WHERE package = 'dpkg' AND version = '1.0'"))
+  }
+  latest <- c(apkg = "1.3", bpkg = "1.3", cpkg = "1.3", dpkg = "1.2")
+  seen <- .vs_plans()
+  .vs_run(skip, root, latest, requeue = "cpkg")
+  .vs_run(full, root, latest, requeue = "cpkg", skip = FALSE)
+  plans <- stats::setNames(seen$plans[1:4], pkgs)
+  expect_identical(plans$apkg$reason, c(NA, "moved", NA, "new"))
+  expect_identical(plans$apkg$pred_changed, c(FALSE, FALSE, TRUE, FALSE))
+  expect_identical(plans$bpkg$version, c("1.0", "1.2", "1.3"))
+  expect_identical(plans$bpkg$reason, c("class", NA, "new"))
+  expect_identical(plans$bpkg$pred_changed, c(FALSE, TRUE, FALSE))
+  expect_identical(plans$cpkg$reason, c(rep("unrecorded", 3L), "new"))
+  expect_identical(plans$dpkg$reason, c("metrics", NA, "moved"))
+  # apkg reads 1.1 and 1.3, bpkg 1.0 and 1.3, cpkg all four, dpkg 1.0 and 1.2;
+  # the full walk reads 14.
+  expect_identical(.vs_versions_read(skip), 10L)
+  expect_identical(.vs_versions_read(full), 14L)
+  for (p in pkgs) expect_identical(.vs_rows(skip, p), .vs_rows(full, p), info = p)
+})
+test_that("dataset is_current flips and identity rows come only from a read newest", {
+  .vs_stub(detail = TRUE)
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.1", "1.2"))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.2"))
+  expect_identical(.vs_links(skip), c(current = "1.2", identity = "1.2", content = "cf-1.2"))
+  full <- .vs_copy(skip)
+  .vst_release(src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  .vs_run(skip, root, c(vstpkg = "1.3"))
+  .vs_run(full, root, c(vstpkg = "1.3"), skip = FALSE)
+  expect_identical(.vs_versions_read(skip), 1L)
+  data_q <- function(sql) {
+    con <- DBI::dbConnect(RSQLite::SQLite(), file.path(skip, DATA_DB_FILENAME))
+    on.exit(DBI::dbDisconnect(con))
+    DBI::dbGetQuery(con, sql)
+  }
+  expect_identical(data_q("SELECT version FROM bioc_dataset_versions WHERE is_current = 1")$version, "1.3")
+  expect_identical(data_q("SELECT COUNT(*) n FROM bioc_dataset_versions")$n, 4L)
+  expect_identical(data_q("SELECT current_version FROM bioc_datasets")$current_version, "1.3")
+  expect_identical(.vs_links(skip), c(current = "1.3", identity = "1.3", content = "cf-1.3"))
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+  # A NULL n_fns_r on 1.1 reads 1.1 alone, and the newest is skipped.
+  for (out in c(skip, full)) {
+    .vs_exec(out, paste("UPDATE bioc_code_summary SET n_fns_r = NULL",
+                        "WHERE package = 'vstpkg' AND version = '1.1'"))
+  }
+  identity <- function() .package_rows(skip, "vstpkg")[[paste(DATA_DB_FILENAME, "bioc_datasets")]]
+  before <- identity()
+  .vs_run(skip, root, c(vstpkg = "1.3"))
+  .vs_run(full, root, c(vstpkg = "1.3"), skip = FALSE)
+  expect_identical(.vs_versions_read(skip), 1L)
+  expect_identical(.vs_links(skip), c(current = "1.3", identity = "1.3", content = "cf-1.3"))
+  expect_identical(identity(), before)
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+})
+test_that("a deleted branch goes and the skipped newest keeps its current links", {
+  .vs_stub(detail = TRUE)
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.1", "1.2", "1.3"))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.3"))
+  full <- .vs_copy(skip)
+  # 1.1's rows in each table that holds them, the text history last.
+  gone <- c(SUMMARY_TABLE, CHURN_TABLE, API_TABLE, "bioc_functions", "bioc_call_edges",
+            VERSION_STATE_TABLE, "bioc_dataset_versions")
+  kept <- c(DESCRIPTION_HISTORY_TABLE, RELEASE_TEXT_VERSIONS_TABLE)
+  of_1_1 <- function() {
+    data_con <- DBI::dbConnect(RSQLite::SQLite(), file.path(skip, DATA_DB_FILENAME))
+    on.exit(DBI::dbDisconnect(data_con))
+    vapply(c(gone, kept), function(tbl) {
+      sql <- sprintf('SELECT COUNT(*) n FROM "%s" WHERE package = ? AND version = ?', tbl)
+      key <- list("vstpkg", "1.1")
+      if (tbl == "bioc_dataset_versions") DBI::dbGetQuery(data_con, sql, params = key)$n
+      else .vst_query(skip, sql, params = key)$n
+    }, integer(1L))
+  }
+  before <- of_1_1()
+  expect_true(all(before > 0L))
+  identity <- function() .package_rows(skip, "vstpkg")[[paste(DATA_DB_FILENAME, "bioc_datasets")]]
+  identity_before <- identity()
+  .vst_git(src, "branch", "-D", .vst_branch("1.1"))
+  for (out in c(skip, full)) {
+    .vs_exec(out, paste("UPDATE bioc_code_summary SET n_fns_r = NULL",
+                        "WHERE package = 'vstpkg' AND version = '1.0'"))
+  }
+  seen <- .vs_plans()
+  .vs_run(skip, root, c(vstpkg = "1.3"))
+  .vs_run(full, root, c(vstpkg = "1.3"), skip = FALSE)
+  # 1.0 is read; 1.2's diff is redone against 1.0; the newest is skipped.
+  plan <- seen$plans[[1L]]
+  expect_identical(plan$version, c("1.0", "1.2", "1.3"))
+  expect_identical(plan$reason, c("metrics", NA, NA))
+  expect_identical(plan$pred_changed, c(FALSE, TRUE, FALSE))
+  expect_identical(.vs_versions_read(skip), 1L)
+  after <- of_1_1()
+  expect_identical(after[gone], stats::setNames(integer(length(gone)), gone))
+  expect_identical(after[kept], before[kept])
+  expect_identical(.vs_links(skip), c(current = "1.3", identity = "1.3", content = "cf-1.3"))
+  expect_identical(identity(), identity_before)
+  expect_identical(.vs_rows(skip, "vstpkg"), .vs_rows(full, "vstpkg"))
+})
+test_that("the first skip run on a database from before rows_generation skips its recorded versions", {
+  .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.1", "1.2"))
+  skip <- withr::local_tempdir()
+  .vs_run(skip, root, c(vstpkg = "1.2"))
+  # The table as it was before rows_generation, with the rows it held.
+  kept <- paste(setdiff(.VERSION_STATE_COLS, "rows_generation"), collapse = ", ")
+  .vs_exec(skip, c(
+    sprintf('ALTER TABLE "%s" RENAME TO old_state', VERSION_STATE_TABLE),
+    sprintf('CREATE TABLE "%s" (
+      package TEXT NOT NULL, version TEXT NOT NULL,
+      commit_sha TEXT, tree_sha TEXT, prev_version TEXT, prev_commit TEXT,
+      deprecated TEXT, uses_lifecycle INTEGER, read_at TEXT,
+      PRIMARY KEY (package, version)) WITHOUT ROWID', VERSION_STATE_TABLE),
+    sprintf('INSERT INTO "%s" (%s) SELECT %s FROM old_state', VERSION_STATE_TABLE, kept, kept),
+    "DROP TABLE old_state"))
+  expect_false("rows_generation" %in% names(.vst_state(skip, "vstpkg")))
+  expect_identical(nrow(.vst_state(skip, "vstpkg")), 3L)
+  full <- .vs_copy(skip)
+  .vst_release(src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  .vs_run(skip, root, c(vstpkg = "1.3"))
+  .vs_run(full, root, c(vstpkg = "1.3"), skip = FALSE)
+  rs <- jsonlite::fromJSON(file.path(skip, "run-status.json"))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  # The skipped rows keep their NULL generation, which counts as 1; a full walk writes 1.
+  st <- .vst_state(skip, "vstpkg")
+  expect_identical(st$rows_generation[st$version != "1.3"], rep(NA_integer_, 3L))
+  expect_identical(st$rows_generation[st$version == "1.3"], ROWS_GENERATION)
+  rows <- .vs_rows(skip, "vstpkg")
+  k <- paste(DB_FILENAME, VERSION_STATE_TABLE)
+  rows[[k]]$rows_generation[is.na(rows[[k]]$rows_generation)] <- 1L
+  expect_identical(rows, .vs_rows(full, "vstpkg"))
+})
+test_that("a package read for a backfill marker leaves the queue", {
+  .vs_stub()
+  root <- withr::local_tempdir()
+  .vst_source(root, "vstpkg", c("1.0", "1.1", "1.2"))
+  out <- withr::local_tempdir()
+  .vs_run(out, root, c(vstpkg = "1.2"))
+  .vs_exec(out, "UPDATE bioc_code_summary SET n_fns_r = NULL WHERE package = 'vstpkg' AND version = '1.0'")
+  seen <- .vs_plans()
+  .vs_run(out, root, c(vstpkg = "1.2"))
+  rs <- jsonlite::fromJSON(file.path(out, "run-status.json"))
+  expect_identical(c(rs$n_shard, rs$n_fresh), c(1L, 1L))
+  expect_identical(as.integer(rs$worker_phases$versions_read), 1L)
+  expect_identical(seen$plans[[1L]]$reason, c("metrics", NA, NA))
+  expect_false(anyNA(.vst_query(out, "SELECT n_fns_r FROM bioc_code_summary")$n_fns_r))
+  .vs_run(out, root, c(vstpkg = "1.2"))
+  expect_identical(jsonlite::fromJSON(file.path(out, "run-status.json"))$n_shard, 0L)
+})
