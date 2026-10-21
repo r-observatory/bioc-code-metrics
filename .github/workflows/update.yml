@@ -67,6 +67,10 @@ jobs:
           "$HOME/.local/bin/rpkg-analyzer" --sexp <(echo 'x <- 1') >/dev/null && echo "rpkg-analyzer ready"
 
       - name: Run unit tests
+        # The rows golden is enforced by the Test workflow on pull requests.
+        # Here a digest that moved skips with its note instead of stopping the run.
+        env:
+          ROWS_GOLDEN_ADVISORY: "1"
         run: Rscript tests/testthat.R
 
       - name: Download the latest databases
