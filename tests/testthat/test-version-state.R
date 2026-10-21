@@ -456,3 +456,46 @@ test_that("a state write that fails rolls back the package's other rows with it"
   expect_identical(DBI::dbGetQuery(con, sprintf('SELECT version FROM "%s"',
                                                 VERSION_STATE_TABLE))$version, "1.0")
 })
+
+test_that("a requeue deletes the requeued package's state rows and no other's", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_source(base, "okpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, c("vstpkg", "okpkg"), c("1.1", "1.1"))
+  con <- open_or_init_db(file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.requeue(con, "vstpkg"), "vstpkg")
+  n <- function(p) DBI::dbGetQuery(con, sprintf('SELECT COUNT(*) n FROM "%s" WHERE package = ?',
+                                                VERSION_STATE_TABLE), params = list(p))$n
+  expect_identical(c(n("vstpkg"), n("okpkg")), c(0L, 2L))
+})
+
+test_that("the stored versions with no recorded commit are counted", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_source(base, "okpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, c("vstpkg", "okpkg"), c("1.1", "1.1"))
+  con <- open_or_init_db(file.path(out_dir, DB_FILENAME))
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(.n_versions_unrecorded(con), 0L)
+  DBI::dbExecute(con, sprintf("UPDATE \"%s\" SET commit_sha = NULL
+                               WHERE package = 'vstpkg' AND version = '1.0'", VERSION_STATE_TABLE))
+  DBI::dbExecute(con, sprintf("DELETE FROM \"%s\"
+                               WHERE package = 'okpkg' AND version = '1.1'", VERSION_STATE_TABLE))
+  expect_identical(.n_versions_unrecorded(con), 2L)
+  con2 <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+  on.exit(DBI::dbDisconnect(con2), add = TRUE)
+  expect_identical(.n_versions_unrecorded(con2), 0L)
+})
+
+test_that("the code manifest and run status carry n_versions_unrecorded, the data manifest does not", {
+  base <- withr::local_tempdir("vst_src_")
+  out_dir <- withr::local_tempdir("vst_out_")
+  .vst_source(base, "vstpkg", c("1.0", "1.1"))
+  .vst_run(base, out_dir, "vstpkg", "1.1")
+  expect_identical(jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"))$bootstrap$n_versions_unrecorded, 0L)
+  expect_identical(jsonlite::fromJSON(file.path(out_dir, "run-status.json"))$n_versions_unrecorded, 0L)
+  expect_null(jsonlite::fromJSON(file.path(out_dir, "data-manifest.json"))$bootstrap$n_versions_unrecorded)
+})
