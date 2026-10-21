@@ -884,7 +884,8 @@ test_that("the shard sums the analyzer's statistics lines and prints them with t
   expect_true(all(unlist(st$worker_phases) >= 0))
   expect_setequal(names(st$worker_phases),
                   c("packages", "clone_s", "extract_s", "analyzer_s", "parse_s", "metrics_s",
-                    "other_s", "dataset_memo_hits", "dataset_memo_misses"))
+                    "other_s", "dataset_memo_hits", "dataset_memo_misses", "skip_s",
+                    "versions_read"))
   published <- jsonlite::fromJSON(file.path(out_dir, "code-manifest.json"), simplifyVector = FALSE)
   expect_false(any(c("analyzer_stats", "worker_phases") %in%
                      c(names(published), names(published$bootstrap))))

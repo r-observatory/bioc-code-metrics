@@ -69,7 +69,8 @@
 
 .vst_rev_parse <- function(dir, refs) .vst_git(dir, "rev-parse", shQuote(refs))
 
-# One run_update over packages cloned from `base`, each at its `latest`.
+# One run_update over packages cloned from `base`, each at its `latest`. Its
+# manifest, with what it printed as the "log" attribute.
 .vst_run <- function(base, out_dir, pkgs, latest, shard_size = 10L, ...,
                      frame = parent.frame()) {
   .local_global("WORK_DIR", withr::local_tempdir("vst_work_", .local_envir = frame), frame)
@@ -79,9 +80,9 @@
                                          stringsAsFactors = FALSE),
     clone = function(pkg, dest) clone_package(pkg, dest, base = base))
   out <- NULL
-  utils::capture.output(out <- suppressWarnings(run_update(io, out_dir, shard_size = shard_size,
-                                                           ...)))
-  out
+  log <- utils::capture.output(out <- suppressWarnings(run_update(io, out_dir,
+                                                                  shard_size = shard_size, ...)))
+  structure(out, log = log)
 }
 
 .vst_query <- function(out_dir, sql, params = NULL) {

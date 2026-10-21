@@ -214,6 +214,8 @@ jobs:
           UNPARK: ${{ inputs.unpark }}
           REQUEUE: ${{ inputs.requeue }}
           CORES_INPUT: ${{ inputs.analysis_cores || vars.ANALYSIS_CORES }}
+          # Empty runs the version skip. 0, false, off or no turns it off.
+          VERSION_SKIP: ${{ vars.VERSION_SKIP }}
         run: |
           set -euo pipefail
           BUDGET="${{ inputs.time_budget_seconds || '16800' }}"
