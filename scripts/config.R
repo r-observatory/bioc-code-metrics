@@ -66,6 +66,10 @@ API_TABLE     <- "bioc_api_history"
 # Pipeline state: the merger does not copy it.
 VERSION_STATE_TABLE <- "bioc_version_state"
 
+# A pull request that changes the rows R writes for one version bumps this and
+# regenerates tests/testthat/fixtures/rows-golden.json.
+ROWS_GENERATION <- 1L
+
 # Per-git-subprocess timeout in seconds. A hard cap so a pathological repo
 # cannot stall a parallel shard. Overridable via GIT_TIMEOUT env var.
 GIT_TIMEOUT <- as.integer(Sys.getenv("GIT_TIMEOUT", unset = "300"))

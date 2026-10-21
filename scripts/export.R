@@ -1226,6 +1226,10 @@ open_or_init_data_db <- function(path) {
 # The commit and tree each stored version was read from, the version and
 # commit before it in that walk, and its deprecation signals. One row per
 # summary row, replaced with them.
+.VERSION_STATE_COLS <- c("package", "version", "commit_sha", "tree_sha",
+                         "prev_version", "prev_commit", "deprecated",
+                         "uses_lifecycle", "read_at", "rows_generation")
+
 .ensure_version_state_table <- function(con) {
   DBI::dbExecute(con, sprintf('
     CREATE TABLE IF NOT EXISTS "%s" (
@@ -1238,9 +1242,25 @@ open_or_init_data_db <- function(path) {
       deprecated     TEXT,
       uses_lifecycle INTEGER,
       read_at        TEXT,
+      rows_generation INTEGER,
       PRIMARY KEY (package, version)
     ) WITHOUT ROWID', VERSION_STATE_TABLE))
+  # A table from before rows_generation gains it, its rows keeping NULL.
+  if (!"rows_generation" %in% DBI::dbListFields(con, VERSION_STATE_TABLE)) {
+    DBI::dbExecute(con, sprintf('ALTER TABLE "%s" ADD COLUMN rows_generation INTEGER',
+                                VERSION_STATE_TABLE))
+  }
   invisible(NULL)
+}
+
+# The state rows of the keys a write keeps (any frame with package and version),
+# one per (package, version), with every column of the table.
+.version_state_write <- function(state_df, keys) {
+  key <- function(df) paste(df$package, df$version, sep = "\x1f")
+  out <- state_df[key(state_df) %in% key(keys), , drop = FALSE]
+  out <- out[!duplicated(key(out), fromLast = TRUE), , drop = FALSE]
+  for (col in setdiff(.VERSION_STATE_COLS, names(out))) out[[col]] <- rep(NA, nrow(out))
+  out[, .VERSION_STATE_COLS, drop = FALSE]
 }
 
 #' Open (or create) the pipeline SQLite database.
@@ -1594,11 +1614,8 @@ upsert_shard <- function(con, summary_df, churn_df, api_df,
   .ensure_version_state_table(con)
   .delete_by_package(con, VERSION_STATE_TABLE, pkgs)
   if (is.null(state_df) || nrow(state_df) == 0L) return(invisible(NULL))
-  key <- function(df) paste(df$package, df$version, sep = "\x1f")
-  state_df <- state_df[!duplicated(key(state_df), fromLast = TRUE), , drop = FALSE]
-  state_df <- state_df[key(state_df) %in% key(summary_df),
-                       DBI::dbListFields(con, VERSION_STATE_TABLE), drop = FALSE]
-  if (nrow(state_df) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_df)
+  state_write <- .version_state_write(state_df, summary_df)
+  if (nrow(state_write) > 0L) DBI::dbAppendTable(con, VERSION_STATE_TABLE, state_write)
   invisible(NULL)
 }
 

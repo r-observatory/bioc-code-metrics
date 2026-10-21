@@ -497,7 +497,29 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
              commit_sha = character(0L), tree_sha = character(0L),
              prev_version = character(0L), prev_commit = character(0L),
              deprecated = character(0L), uses_lifecycle = integer(0L),
-             read_at = character(0L), stringsAsFactors = FALSE)
+             read_at = character(0L), rows_generation = integer(0L),
+             stringsAsFactors = FALSE)
+}
+
+#' The tree of each commit, NA where git cannot say.
+#'
+#' One `git rev-parse` per chunk of commits. Nothing here can fail a package:
+#' a call that does not answer every commit leaves its chunk NA.
+.version_trees <- function(repo, commits, chunk = 500L) {
+  out <- rep(NA_character_, length(commits))
+  todo <- which(!is.na(commits) & nzchar(commits))
+  starts <- if (length(todo)) seq(1L, length(todo), by = chunk) else integer(0L)
+  for (s in starts) {
+    i <- todo[s:min(s + chunk - 1L, length(todo))]
+    got <- suppressWarnings(
+      system2("git", c("-C", shQuote(repo), "rev-parse",
+                       shQuote(paste0(commits[i], "^{tree}"))),
+              stdout = TRUE, stderr = FALSE, timeout = GIT_TIMEOUT))
+    if (is.null(attr(got, "status")) && length(got) == length(i)) {
+      out[i] <- ifelse(grepl("^[0-9a-f]{40,64}$", got), got, NA_character_)
+    }
+  }
+  out
 }
 
 #' The version state rows of one walk, built after it from what it holds.
@@ -507,13 +529,15 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #' its deprecation signals, the symbols as a JSON array and uses_lifecycle as
 #' 0 or 1.
 #'
-#' @param repo_dir           The clone the walk read.
 #' @param versions_df        list_versions() of the clone, in walk order.
-#' @param deprecation_series The walk's deprecation_signals(), one per version.
+#' @param trees              The tree of each version's commit, from .version_trees().
+#' @param deprecation_series The walk's deprecation_signals(), one per version;
+#'   a shorter series is padded with empty signals.
 #' @param read_at            UTC timestamp of the walk.
-#' @return A data.frame shaped as .empty_version_state().
-.version_state_rows <- function(repo_dir, package, versions_df, deprecation_series,
-                                read_at) {
+#' @param generation         The ROWS_GENERATION the rows were written under.
+#' @return A data.frame with .VERSION_STATE_COLS.
+.version_state_rows <- function(package, versions_df, trees, deprecation_series,
+                                read_at, generation = ROWS_GENERATION) {
   n <- nrow(versions_df)
   if (n == 0L) return(.empty_version_state())
   versions <- as.character(versions_df$version)
@@ -525,7 +549,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
     package        = rep(package, n),
     version        = versions,
     commit_sha     = commits,
-    tree_sha       = commit_trees(repo_dir, commits),
+    tree_sha       = as.character(trees),
     prev_version   = c(NA_character_, versions[-n]),
     prev_commit    = c(NA_character_, commits[-n]),
     deprecated     = vapply(sig, function(s) {
@@ -533,6 +557,7 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
     }, character(1L)),
     uses_lifecycle = vapply(sig, function(s) as.integer(isTRUE(s$uses_lifecycle)), integer(1L)),
     read_at        = rep(read_at, n),
+    rows_generation = rep(as.integer(generation), n),
     stringsAsFactors = FALSE
   )
 }
@@ -580,6 +605,7 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
   churn_all   <- package_churn(repo_dir)
   # The version state's read_at: the walk reads the commits listed just now.
   read_at     <- format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  trees       <- .version_trees(repo_dir, versions_df$commit)
 
   summary_rows       <- vector("list", nrow(versions_df))
   api_rows           <- vector("list", nrow(versions_df))
@@ -896,7 +922,7 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
     # they are in the same frame. The caller stamps the running build on these
     # and leaves the rest naming nobody.
     binary_versions = as.character(versions_df$version[from_binary]),
-    state     = .version_state_rows(repo_dir, package, versions_df, deprecation_series,
+    state     = .version_state_rows(package, versions_df, trees, deprecation_series,
                                     read_at)
   )
 }
