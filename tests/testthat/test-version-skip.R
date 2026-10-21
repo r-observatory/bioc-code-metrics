@@ -499,3 +499,42 @@ test_that("functions and edges come from every release read, and from no release
                    .vs_no_rownames(full$datasets[full$datasets$version == "1.1", ]))
   expect_identical(res$datasets$is_current, 0L)
 })
+
+# git as it is, except that the churn diff ending at `commit` exits as a timeout does.
+.vs_fail_diff <- function(commit, frame = parent.frame()) {
+  real <- Sys.which("git")
+  dir  <- withr::local_tempdir(.local_envir = frame)
+  writeLines(c("#!/bin/sh",
+               sprintf('case "$*" in *"diff --numstat "*"..%s") exit 124 ;; esac', commit),
+               sprintf('exec %s "$@"', shQuote(real))), file.path(dir, "git"))
+  Sys.chmod(file.path(dir, "git"), mode = "0755")
+  withr::local_envvar(PATH = paste(dir, Sys.getenv("PATH"), sep = .Platform$path.sep),
+                      .local_envir = frame)
+}
+
+test_that("a release read whose churn diff git did not finish gets no state row, with a prior or without", {
+  w <- .vs_walked()
+  .vst_release(w$src, "vstpkg", "1.3", "2025-05-01T00:00:00Z")
+  clone <- .vs_clone(w)
+  .vs_fail_diff(.vst_rev_parse(w$src, .vst_branch("1.3")))
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$summary$version, "1.3")
+  expect_identical(res$skip$row_keys, "1.3"); expect_identical(res$skip$api_keys, "1.3")
+  expect_identical(nrow(res$churn), 0L)
+  expect_identical(nrow(res$state), 0L)
+  full <- analyze_package(clone, "vstpkg")
+  expect_identical(full$summary$version, c("1.0", "1.1", "1.2", "1.3"))
+  expect_false("1.3" %in% full$churn$version)
+  expect_identical(full$state$version, c("1.0", "1.1", "1.2"))
+})
+test_that("a redone diff whose churn git did not finish gets no state row", {
+  w <- .vs_walked()
+  .vst_move_branch(w$src, "1.1")
+  clone <- .vs_clone(w)
+  .vs_fail_diff(.vst_rev_parse(w$src, .vst_branch("1.2")))
+  res <- analyze_package(clone, "vstpkg", prior = w$prior)
+  expect_identical(res$skip$plan$pred_changed, c(FALSE, FALSE, TRUE))
+  expect_setequal(res$skip$api_keys, c("1.1", "1.2"))
+  expect_identical(unique(res$churn$version), "1.1")
+  expect_identical(res$state$version, "1.1")
+})

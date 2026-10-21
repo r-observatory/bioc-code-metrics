@@ -703,7 +703,8 @@ add_cross_version_metrics <- function(summary_df, api_df, deprecation_series,
 #' @return Named list: $summary, $churn, $api, $functions, $edges, $datasets,
 #'   $binary_versions: the versions whose metrics the analyzer binary
 #'   produced, as opposed to the pure-R fallback, and $state, the version
-#'   state rows (.version_state_rows). With a prior, also $skip: the plan, the
+#'   state rows (.version_state_rows), none for a version whose churn diff
+#'   git did not finish. With a prior, also $skip: the plan, the
 #'   newest version and whether it was read, its dataset marker, whether the
 #'   package is unchanged or partly read, the derived columns of the versions
 #'   skipped, and the versions whose rows (row_keys) and API, churn and state
@@ -1063,6 +1064,10 @@ analyze_package <- function(repo_dir, package, stamped = character(0L),
       isTRUE(datasets_read[[length(datasets_read)]]))
 
   state_df <- .version_state_rows(package, versions_df, trees, deprecation_series, read_at)
+  # A release whose churn diff git did not finish gets no state row, so the
+  # next run reads it again rather than skipping it without its churn.
+  no_churn <- attr(churn_all, "failed")
+  if (length(no_churn)) state_df <- state_df[!state_df$version %in% no_churn, , drop = FALSE]
 
   out <- list(
     summary   = summary_df,
