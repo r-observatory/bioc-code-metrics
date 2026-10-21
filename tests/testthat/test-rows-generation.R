@@ -251,7 +251,10 @@ test_that("the walk reads the fixture the same whatever git config is around", {
   cfg <- withr::local_tempfile(lines = c("[diff]", "  renames = false"))
   withr::local_envvar(GIT_CONFIG_GLOBAL = cfg)
   # The config reaches churn when nothing keeps it out: it splits 1.3's rename in two.
-  no_config <- withr::with_envvar(c(GIT_CONFIG_GLOBAL = "/dev/null"), package_churn(src))
+  no_config <- withr::with_envvar(
+    c(GIT_CONFIG_GLOBAL = "/dev/null", GIT_CONFIG_NOSYSTEM = "1"),
+    package_churn(src)
+  )
   expect_false(identical(package_churn(src), no_config))
   expect_identical(.rg_digest(.rg_walk(src)), plain)
 })

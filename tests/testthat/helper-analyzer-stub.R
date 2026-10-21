@@ -1,9 +1,7 @@
 # tests/testthat/helper-analyzer-stub.R: a stand-in for the rpkg-analyzer
 # binary, shared by every test that needs one installed.
 #
-# Three files grew their own copy of this, two of them byte for byte, and each
-# carried an argument nothing read. One copy here instead, with the argument
-# doing the job its name promised.
+# The version skip tests use it; older files keep their own local stubs.
 
 #' Write a stub analyzer binary and return its path.
 #'
