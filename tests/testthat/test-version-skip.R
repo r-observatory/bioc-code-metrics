@@ -178,3 +178,98 @@ test_that("a ref git cannot read fails as an extraction does", {
   src <- .vs_repo(file.path(withr::local_tempdir(), "src"), list("1.0" = "export(a)"))
   expect_error(.exports_at(src, "no-such-ref", "p", "x"), class = "extract_failure")
 })
+
+# ---- The stored state a plan reads ------------------------------------------
+
+# The code database, which holds the text history too, in a fresh directory.
+.vs_db <- function(frame = parent.frame()) {
+  dir <- withr::local_tempdir(.local_envir = frame)
+  con <- open_or_init_db(file.path(dir, DB_FILENAME))
+  open_or_init_release_text_db(NULL, con = con)
+  withr::defer(DBI::dbDisconnect(con), envir = frame)
+  con
+}
+
+test_that("the prior holds a package's stored rows, API rows, state rows and text readings", {
+  .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.1", "1.2"))
+  out <- withr::local_tempdir()
+  .vst_run(root, out, "vstpkg", "1.2")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  withr::defer(DBI::dbDisconnect(con))
+  p <- .prior_state(con, con, "vstpkg", "0.4.0-test")[["vstpkg"]]
+  o <- order(numeric_version(p$stored$version))
+  expect_identical(p$stored$version[o], c("1.0", "1.1", "1.2"))
+  expect_identical(as.logical(p$stored$latest[o]), c(FALSE, FALSE, TRUE))
+  expect_false(any(as.logical(p$stored$n_fns_r_null)))
+  expect_identical(sort(p$state$commit_sha), sort(.vst_rev_parse(src, .vst_branch(c("1.0", "1.1", "1.2")))))
+  expect_identical(p$state$rows_generation, rep(1L, 3L))
+  expect_identical(sort(p$api$version), sort(c("1.0", "1.1", "1.2")))
+  expect_identical(p$class, "0.4.0-test")
+  lv <- list_versions(src)
+  expect_false(any(.read_plan(lv, .version_trees(src, lv$commit), p)$read))
+})
+test_that("a package with nothing stored gets an empty prior, and every version reads as new", {
+  .vs_stub()
+  root <- withr::local_tempdir()
+  src <- .vst_source(root, "vstpkg", c("1.0", "1.1"))
+  out <- withr::local_tempdir()
+  .vst_run(root, out, "vstpkg", "1.1")
+  con <- DBI::dbConnect(RSQLite::SQLite(), file.path(out, DB_FILENAME))
+  withr::defer(DBI::dbDisconnect(con))
+  prior <- .prior_state(con, con, c("vstpkg", "newpkg"), "0.4.0-test")
+  expect_named(prior, c("vstpkg", "newpkg"))
+  e <- prior[["newpkg"]]
+  expect_identical(vapply(e[c("stored", "api", "state")], nrow, integer(1L)),
+                   c(stored = 0L, api = 0L, state = 0L))
+  expect_identical(names(e$state), setdiff(.VERSION_STATE_COLS, "package"))
+  expect_identical(e$text_ok, character(0L))
+  lv <- list_versions(src)
+  expect_identical(.read_plan(lv, .version_trees(src, lv$commit), e)$reason,
+                   rep("new", nrow(lv)))
+})
+test_that("a summary column the database lacks reads as NULL", {
+  con <- .vs_db()
+  DBI::dbWriteTable(con, SUMMARY_TABLE, data.frame(
+    package = "p", version = c("1.0", "1.1"), analyzer_version = "0.5.2",
+    released = "2026-01-01", stringsAsFactors = FALSE))
+  p <- .prior_state(con, con, "p", "0.5.2")[["p"]]
+  expect_identical(p$stored$version, c("1.0", "1.1"))
+  expect_identical(p$stored$released, c("2026-01-01", "2026-01-01"))
+  expect_true(all(is.na(p$stored$detail_scanned)))
+  expect_true(all(is.na(p$stored$datasets_scanned)))
+  expect_false(any(p$stored$latest))
+  expect_true(all(as.logical(p$stored$n_fns_r_null)))
+  # With state rows matching the listing, the metrics rule is the first one they fail.
+  DBI::dbAppendTable(con, VERSION_STATE_TABLE, data.frame(
+    package = "p", version = c("1.0", "1.1"), commit_sha = c("c1", "c2"),
+    tree_sha = c("t1", "t2"), rows_generation = 1L, stringsAsFactors = FALSE))
+  p <- .prior_state(con, con, "p", "0.5.2")[["p"]]
+  expect_identical(.vs_plan(c("1.0", "1.1"), p)$reason, c("metrics", "metrics"))
+})
+test_that("only text readings by 0.5.0 or later count", {
+  con <- .vs_db()
+  DBI::dbAppendTable(con, RELEASE_TEXT_VERSIONS_TABLE, data.frame(
+    package = "p", version = c("1.0", "1.1"), analyzer_version = c("0.4.0", "0.5.2"),
+    n_fields = 5L, has_release_notes = 0L, read_at = "2026-09-01T00:00:00Z",
+    stringsAsFactors = FALSE))
+  p <- .prior_state(con, con, "p", "0.5.2")[["p"]]
+  expect_identical(p$text_ok, "1.1")
+})
+test_that("the prior is the same whatever the chunk size", {
+  con <- .vs_db()
+  for (k in c("a", "b", "c")) {
+    DBI::dbWriteTable(con, SUMMARY_TABLE, data.frame(
+      package = k, version = c("1.0", "1.1"), analyzer_version = "0.5.2",
+      stringsAsFactors = FALSE), append = (k != "a"))
+  }
+  DBI::dbAppendTable(con, VERSION_STATE_TABLE, data.frame(
+    package = "b", version = "1.1", commit_sha = "c1", stringsAsFactors = FALSE))
+  DBI::dbAppendTable(con, RELEASE_TEXT_VERSIONS_TABLE, data.frame(
+    package = "c", version = "1.0", analyzer_version = "0.5.2", n_fields = 5L,
+    stringsAsFactors = FALSE))
+  pkgs <- c("a", "b", "c", "d")
+  expect_identical(.prior_state(con, con, pkgs, "0.5.2", chunk = 1L),
+                   .prior_state(con, con, pkgs, "0.5.2"))
+})

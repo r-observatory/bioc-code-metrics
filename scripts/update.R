@@ -879,6 +879,83 @@
   out
 }
 
+# One table's rows for `pkgs`, typed as `types` says. A column the table lacks
+# reads as NULL; `exprs` names the expression a column is computed from, the
+# table column it needs, and what it reads as without it.
+.prior_table <- function(con, table, types, pkgs, exprs = list()) {
+  empty <- as.data.frame(c(list(package = character(0L)),
+                           lapply(types, function(t) vector(t, 0L))),
+                         stringsAsFactors = FALSE)
+  if (!table %in% DBI::dbListTables(con)) return(empty)
+  have <- DBI::dbListFields(con, table)
+  sel <- vapply(names(types), function(n) {
+    e <- exprs[[n]] %||% list(n, n, "NULL")
+    if (e[[2L]] %in% have) sprintf("%s AS %s", e[[1L]], n) else sprintf("%s AS %s", e[[3L]], n)
+  }, character(1L))
+  df <- DBI::dbGetQuery(con, sprintf(
+    'SELECT package, %s FROM "%s" WHERE package IN (%s) ORDER BY package, version',
+    paste(sel, collapse = ", "), table, paste(rep("?", length(pkgs)), collapse = ", ")),
+    params = as.list(pkgs))
+  for (n in names(types)) df[[n]] <- match.fun(paste0("as.", types[[n]]))(df[[n]])
+  df
+}
+
+# One package's rows of a .prior_table() frame, without the package column.
+.prior_rows <- function(df, pkg) {
+  out <- df[df$package == pkg, setdiff(names(df), "package"), drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+# The stored rows a plan reads, per package, taken before the fork because a
+# worker has no database. A list named by `pkgs`; a package with nothing stored
+# gets zero-row frames. `text_ok` is the versions a 0.5.0 or later build read.
+.prior_state <- function(con, text_con, pkgs, output_class, chunk = 500L) {
+  pkgs <- as.character(pkgs)
+  summary_types <- c(version = "character", analyzer_version = "character",
+                     n_fns_r_null = "logical", detail_scanned = "integer",
+                     datasets_scanned = "integer", latest = "logical",
+                     released = "character", dep_list = "character", authors = "character")
+  summary_exprs <- list(n_fns_r_null = list("n_fns_r IS NULL", "n_fns_r", "1"),
+                        latest = list("latest_release_date IS NOT NULL", "latest_release_date", "0"))
+  api_types <- c(version = "character", exports_added = "character",
+                 exports_removed = "character", n_exports = "integer")
+  state_types <- c(version = "character", commit_sha = "character", tree_sha = "character",
+                   prev_version = "character", prev_commit = "character",
+                   deprecated = "character", uses_lifecycle = "integer",
+                   read_at = "character", rows_generation = "integer")
+  text_builds <- character(0L)
+  if (RELEASE_TEXT_VERSIONS_TABLE %in% DBI::dbListTables(text_con)) {
+    read_by <- DBI::dbGetQuery(text_con, sprintf(
+      'SELECT DISTINCT analyzer_version FROM "%s" WHERE analyzer_version IS NOT NULL',
+      RELEASE_TEXT_VERSIONS_TABLE))$analyzer_version
+    text_builds <- read_by[vapply(read_by, analyzer_at_least, logical(1L), min = "0.5.0")]
+  }
+  out <- list()
+  for (p in split(pkgs, ceiling(seq_along(pkgs) / chunk))) {
+    stored <- .prior_table(con, SUMMARY_TABLE, summary_types, p, summary_exprs)
+    api    <- .prior_table(con, API_TABLE, api_types, p)
+    state  <- .prior_table(con, VERSION_STATE_TABLE, state_types, p)
+    text <- if (length(text_builds)) {
+      DBI::dbGetQuery(text_con, sprintf(
+        'SELECT package, version FROM "%s" WHERE analyzer_version IN (%s) AND package IN (%s)',
+        RELEASE_TEXT_VERSIONS_TABLE, paste(rep("?", length(text_builds)), collapse = ", "),
+        paste(rep("?", length(p)), collapse = ", ")),
+        params = c(as.list(text_builds), as.list(p)))
+    } else {
+      data.frame(package = character(0L), version = character(0L))
+    }
+    for (k in p) {
+      out[[k]] <- list(
+        stored = .prior_rows(stored, k), api = .prior_rows(api, k),
+        state = .prior_rows(state, k),
+        text_ok = as.character(text$version[text$package == k]),
+        class = as.character(output_class))
+    }
+  }
+  out[pkgs]
+}
+
 # ---------------------------------------------------------------------------
 # default_io
 # ---------------------------------------------------------------------------
